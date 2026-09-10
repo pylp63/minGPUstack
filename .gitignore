@@ -1,0 +1,19 @@
+# 排除上游官方 git 元数据 (这是二开版本, 不携带官方历史)
+gpustack/.git/
+
+# Python
+**/__pycache__/
+**/*.pyc
+*.pyo
+
+# 构建产物
+gpustack/dist/
+gpustack/gpustack/ui/
+gpustack/*.egg-info/
+
+# 部署敏感配置
+deploy/.env
+
+# 编辑器/系统
+.DS_Store
+*.swp

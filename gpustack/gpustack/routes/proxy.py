@@ -1,0 +1,197 @@
+import os
+from urllib.parse import urlparse
+import aiohttp
+from fastapi.responses import JSONResponse
+import logging
+from typing import Callable, Optional
+from functools import partial
+
+from fastapi import APIRouter, Request, Response
+
+from gpustack.api.exceptions import (
+    BadRequestException,
+    ForbiddenException,
+)
+from gpustack.config.config import get_global_config
+from gpustack.utils.network import use_proxy_env_for_url
+
+router = APIRouter()
+
+logger = logging.getLogger(__name__)
+
+
+ALLOWED_SITES = [
+    "https://modelscope.cn",
+    "https://www.modelscope.cn",
+    "https://huggingface.co",
+]
+
+HEADER_FORWARDED_PREFIX = "x-forwarded-"
+HEADER_SKIPPED = [
+    "date",
+    "set-cookie",
+    "host",
+    "port",
+    "proto",
+    "referer",
+    "server",
+    "content-length",
+    "transfer-encoding",
+    "content-encoding",
+    "cookie",
+    "x-forwarded-host",
+    "x-forwarded-port",
+    "x-forwarded-proto",
+    "x-forwarded-server",
+]
+
+HF_ENDPOINT = os.getenv("HF_ENDPOINT")
+
+
+def is_huggingface_url(url: str) -> bool:
+    """Whether url points at the huggingface.co host (exact host match)."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    return parsed.scheme == "https" and parsed.hostname == "huggingface.co"
+
+
+def replace_hf_endpoint(url: str) -> str:
+    """
+    Replace the huggingface.co domain with HF_ENDPOINT when set (mirror).
+    """
+    if HF_ENDPOINT and is_huggingface_url(url):
+        return url.replace("https://huggingface.co", HF_ENDPOINT, 1)
+    return url
+
+
+def apply_hf_token_to_headers(url: str, headers: dict) -> dict:
+    """
+    Add Authorization Bearer when a token is configured (same rules as the proxy route).
+    """
+    global_config = get_global_config()
+    is_hf = is_huggingface_url(url) or bool(HF_ENDPOINT and url.startswith(HF_ENDPOINT))
+    if global_config.huggingface_token and is_hf:
+        headers["Authorization"] = f"Bearer {global_config.huggingface_token}"
+    return headers
+
+
+def hf_hub_api_headers(url: str) -> dict:
+    """Headers for JSON calls to the Hub HTTP API (after replace_hf_endpoint)."""
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "identity",
+    }
+    return apply_hf_token_to_headers(url, headers)
+
+
+timeout = aiohttp.ClientTimeout(
+    connect=15.0,
+    sock_read=60.0,
+    sock_connect=10.0,
+)
+
+
+@router.api_route("", methods=["GET", "POST", "PUT", "DELETE"])
+async def proxy(request: Request, url: str):
+
+    validate_http_method(request.method)
+    validate_url(url)
+
+    url = replace_hf_endpoint(url)
+    return await proxy_to(
+        request, url, header_func=partial(apply_hf_token_to_headers, url)
+    )
+
+
+async def proxy_to(
+    request: Request, url: str, header_func: Optional[Callable[[dict], dict]] = None
+):
+    forwarded_headers = process_headers(request.headers)
+    if header_func is not None:
+        forwarded_headers = header_func(forwarded_headers)
+    try:
+        data = (
+            await request.body()
+            if request.method in ["POST", "PUT", "DELETE"]
+            else None
+        )
+
+        use_proxy_env = use_proxy_env_for_url(url)
+        async with aiohttp.ClientSession(
+            timeout=timeout, trust_env=use_proxy_env
+        ) as session:
+            async with session.request(
+                method=request.method,
+                url=url,
+                headers=forwarded_headers,
+                data=data,
+            ) as resp:
+                content = await resp.read()
+                headers = {
+                    k: v
+                    for k, v in resp.headers.items()
+                    if k.lower() not in HEADER_SKIPPED
+                }
+                return Response(
+                    status_code=resp.status,
+                    content=content,
+                    headers=headers,
+                    media_type=headers.get("Content-Type"),
+                )
+    except Exception as e:
+        logger.error(f"Error proxying request to {url}: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Failed to proxy the request."},
+            media_type="application/json",
+        )
+
+
+def validate_http_method(method: str):
+    allowed_methods = ["GET", "POST", "PUT", "DELETE"]
+    if method not in allowed_methods:
+        raise BadRequestException(message=f"HTTP method '{method}' is not allowed")
+
+
+def validate_url(url: str):
+    if not url:
+        raise BadRequestException(message="Missing 'url' query parameter")
+
+    try:
+        parsed_url = urlparse(url)
+    except Exception:
+        raise BadRequestException(message="Invalid 'url' query parameter")
+
+    if not parsed_url.netloc or not parsed_url.scheme:
+        raise BadRequestException(message="Invalid 'url' query parameter")
+
+    for allowed_site in ALLOWED_SITES:
+        parsed_allowed_site_url = urlparse(allowed_site)
+        if (
+            parsed_url.netloc == parsed_allowed_site_url.netloc
+            and parsed_url.scheme == parsed_allowed_site_url.scheme
+        ):
+            return
+
+    raise ForbiddenException(message="This site is not allowed")
+
+
+def process_headers(headers: dict) -> dict:
+    processed_headers = {}
+    for key, value in headers.items():
+        if key.lower() in HEADER_SKIPPED:
+            continue
+        elif key.lower().startswith(HEADER_FORWARDED_PREFIX):
+            new_key = key[len(HEADER_FORWARDED_PREFIX) :]
+            processed_headers[new_key] = value
+        # set accept-encoding to identity to avoid decompression
+        # httpx automatically decodes the content and we want to keep it raw
+        # See https://www.python-httpx.org/quickstart/#binary-response-content
+        elif key.lower() == "accept-encoding":
+            processed_headers[key] = "identity"
+        else:
+            processed_headers[key] = value
+
+    return processed_headers

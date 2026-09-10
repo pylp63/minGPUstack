@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# GPUStack 二开版 — 一键部署脚本
+#
+# 用法:
+#   ./deploy.sh                        # 构建镜像并启动 (单机)
+#   ./deploy.sh --skip-build           # 跳过构建直接启动
+#   ./deploy.sh --add-worker NAME TOKEN # 输出 worker 节点 compose 片段
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_DIR="${SCRIPT_DIR}/../gpustack"   # 上游源码 (含二开改动)
+
+SKIP_BUILD=false
+ACTION="up"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --skip-build) SKIP_BUILD=true; shift ;;
+    --add-worker) ACTION="add-worker"; shift ;;
+    *) echo "Unknown option: $1"; exit 1 ;;
+  esac
+done
+
+if [[ "$ACTION" == "add-worker" ]]; then
+  cat <<'EOF'
+# 把以下片段加入 docker-compose.yml 的 services: 下,替换 <NAME> 与 <TOKEN>
+  gpustack-worker-<NAME>:
+    image: gpustack-custom:latest
+    restart: unless-stopped
+    command: >
+      gpustack start --worker-only
+      --server-url http://<SERVER_IP>:8080
+      --token <TOKEN>
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - worker-<NAME>-data:/var/lib/gpustack
+EOF
+  exit 0
+fi
+
+cd "$SCRIPT_DIR"
+
+if [[ "$SKIP_BUILD" != "true" ]]; then
+  echo "==> 构建 gpustack-custom 镜像 (首次构建较慢)..."
+  docker build -t gpustack-custom:latest -f Dockerfile "$(dirname "$SCRIPT_DIR")"
+fi
+
+echo "==> 启动 GPUStack..."
+docker compose up -d
+
+echo ""
+echo "==> 完成. 访问 http://localhost:${GPUSTACK_PORT:-8080}"
+echo "    初始管理员: admin / admin"

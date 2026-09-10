@@ -1,0 +1,413 @@
+"""Unit tests for TenantContext resolution and role guards."""
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gpustack.api.exceptions import ForbiddenException, InvalidException
+from gpustack.api.tenant import (
+    _resolve_requested_principal_id,
+    resolve_tenant_context,
+    require_org_role,
+    require_platform_admin,
+)
+from gpustack.schemas import principals as principals_module
+from gpustack.schemas.principals import (
+    OrgRole,
+    PrincipalType,
+)
+
+
+# Pre-seed the cached ``system/authenticated`` principal id so the
+# ``get_authenticated_principal_id`` async helper short-circuits via
+# its cache and doesn't try to query the mock session (which only
+# queues canned results for the specific calls the tests model).
+principals_module._AUTHENTICATED_PRINCIPAL_ID = 9999
+principals_module._AUTHENTICATED_PRINCIPAL_ID_INITIALIZED = True
+
+
+def _request(api_key=None):
+    request = MagicMock()
+    request.state = MagicMock(spec=[])
+    if api_key is not None:
+        request.state.api_key = api_key
+    return request
+
+
+def _user(id: int = 7, is_admin: bool = False):
+    """``user.id`` IS the principal id after identity consolidation."""
+    user = MagicMock()
+    user.id = id
+    user.is_admin = is_admin
+    user.kind = PrincipalType.USER
+    user.is_active = True
+    return user
+
+
+def _api_key(owner_principal_id: int):
+    key = MagicMock()
+    key.owner_principal_id = owner_principal_id
+    return key
+
+
+def _principal(
+    id: int = 99,
+    kind: PrincipalType = PrincipalType.ORG,
+    deleted_at=None,
+):
+    p = MagicMock()
+    p.id = id
+    p.kind = kind
+    p.deleted_at = deleted_at
+    return p
+
+
+def _session_returning(*scalar_lists):
+    """Build a mock session whose successive `exec(...)` calls yield the given
+    result sets. Each item in `scalar_lists` is either:
+      - a list -> wrapped in `.scalars().all()` and `.all()`
+      - any other value -> returned by `.scalar_one_or_none()` and `.first()`
+    """
+    session = MagicMock()
+    results = []
+    for value in scalar_lists:
+        result = MagicMock()
+        if isinstance(value, list):
+            scalars = MagicMock()
+            scalars.all = MagicMock(return_value=value)
+            result.scalars = MagicMock(return_value=scalars)
+            result.all = MagicMock(return_value=value)
+        else:
+            result.scalar_one_or_none = MagicMock(return_value=value)
+            result.first = MagicMock(return_value=value)
+        results.append(result)
+    session.exec = AsyncMock(side_effect=results)
+    return session
+
+
+def _cluster_rows(*pairs):
+    """Helper for ``_accessible_clusters`` mock results: pass tuples of
+    ``(cluster_id, owner_principal_id)`` matching the joined-row shape
+    the function unpacks.
+    """
+    return list(pairs)
+
+
+# ---- _resolve_requested_principal_id ---------------------------------------
+
+
+def test_resolve_principal_id_prefers_api_key():
+    user = _user(id=1)
+    request = _request(api_key=_api_key(owner_principal_id=42))
+    assert _resolve_requested_principal_id(request, user, "999") == 42
+
+
+def test_resolve_principal_id_null_owner_key_falls_through_for_admin():
+    """An admin-created ``All`` mode key carries ``owner_principal_id=None``
+    (no tenant pinning). The resolver must fall through to the
+    user-based path so admin lands at ``current_principal_id=None``
+    and ``bypass_tenant_filter`` triggers — same reach as the admin
+    cookie session."""
+    user = _user(id=1, is_admin=True)
+    request = _request(api_key=_api_key(owner_principal_id=None))
+    assert _resolve_requested_principal_id(request, user, None) is None
+
+
+def test_resolve_principal_id_null_owner_key_falls_through_for_non_admin():
+    """If a NULL-owner key were somehow tied to a non-admin user
+    (e.g. demoted after key creation), the fall-through resolves to
+    their USER-principal id — personal scope — not None / bypass.
+    Guards against accidental cross-tenant reach when admin loses
+    their flag."""
+    user = _user(id=7, is_admin=False)
+    request = _request(api_key=_api_key(owner_principal_id=None))
+    assert _resolve_requested_principal_id(request, user, None) == 7
+
+
+def test_resolve_principal_id_uses_header_when_no_api_key():
+    user = _user(id=1)
+    request = _request()
+    assert _resolve_requested_principal_id(request, user, "999") == 999
+
+
+def test_resolve_principal_id_falls_back_to_user_principal():
+    user = _user(id=1)
+    request = _request()
+    assert _resolve_requested_principal_id(request, user, None) == 1
+
+
+def test_resolve_principal_id_invalid_header_raises():
+    user = _user(id=1)
+    request = _request()
+    with pytest.raises(InvalidException):
+        _resolve_requested_principal_id(request, user, "not-an-int")
+
+
+# ---- get_tenant_context -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_platform_admin_without_header_has_no_org_filter():
+    user = _user(id=1, is_admin=True)
+    request = _request()
+    session = _session_returning()  # no DB calls expected
+
+    ctx = await resolve_tenant_context(
+        request=request,
+        session=session,
+        user=user,
+        x_organization_id=None,
+    )
+
+    assert ctx.is_platform_admin is True
+    assert ctx.current_principal_id is None
+    assert ctx.org_role is None
+    assert ctx.accessible_cluster_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_member_uses_team_org_via_header():
+    """Non-admin sends X-Organization-Id pointing at an Org they belong to."""
+    user = _user(id=100, is_admin=False)
+    request = _request()
+    session = _session_returning(
+        [OrgRole.MEMBER],  # _resolve_effective_org_role (direct ∪ via-group)
+        [11, 12],  # _user_group_principal_ids (all groups, no org filter)
+        _cluster_rows((101, 5), (102, 5)),  # _accessible_clusters
+        _principal(id=5, kind=PrincipalType.ORG),  # org existence check
+    )
+
+    ctx = await resolve_tenant_context(
+        request=request,
+        session=session,
+        user=user,
+        x_organization_id="5",
+    )
+
+    assert ctx.is_platform_admin is False
+    assert ctx.current_principal_id == 5
+    assert ctx.org_role == OrgRole.MEMBER
+    assert ctx.accessible_cluster_ids == {101, 102}
+    assert ctx.accessible_cluster_owner_ids == {5}
+    assert ctx.current_is_personal_scope is False
+
+
+@pytest.mark.asyncio
+async def test_member_inherits_role_via_group_membership():
+    """User joins Org transitively through a Group that is a Member of
+    the Org — the resolver hands back the Group-membership's role.
+    """
+    user = _user(id=100, is_admin=False)
+    request = _request()
+    session = _session_returning(
+        # direct ∪ via-group — only via-group has a row.
+        [OrgRole.OWNER],
+        [42],  # _user_group_principal_ids
+        _cluster_rows((101, 5)),  # _accessible_clusters
+        _principal(id=5, kind=PrincipalType.ORG),
+    )
+
+    ctx = await resolve_tenant_context(
+        request=request,
+        session=session,
+        user=user,
+        x_organization_id="5",
+    )
+
+    assert ctx.org_role == OrgRole.OWNER
+
+
+@pytest.mark.asyncio
+async def test_personal_scope_short_circuits():
+    """When current_principal_id == user.principal_id we treat it as
+    personal scope — no org membership lookup. Groups still resolve
+    so cluster_access grants against them apply.
+    """
+    user = _user(id=100, is_admin=False)
+    request = _request()
+    session = _session_returning(
+        [],  # _user_group_principal_ids
+        _cluster_rows(),  # _accessible_clusters
+    )
+
+    ctx = await resolve_tenant_context(
+        request=request,
+        session=session,
+        user=user,
+        x_organization_id=None,
+    )
+
+    assert ctx.current_principal_id == 100
+    assert ctx.current_is_personal_scope is True
+    assert ctx.org_role is None
+    assert ctx.accessible_cluster_owner_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_non_member_request_to_other_org_is_rejected():
+    user = _user(id=100, is_admin=False)
+    request = _request()
+    session = _session_returning([])  # union: no membership at all
+
+    with pytest.raises(ForbiddenException):
+        await resolve_tenant_context(
+            request=request,
+            session=session,
+            user=user,
+            x_organization_id="2",
+        )
+
+
+@pytest.mark.asyncio
+async def test_platform_admin_can_act_in_org_without_membership():
+    user = _user(id=1, is_admin=True)
+    request = _request()
+    session = _session_returning(
+        [],  # union: no membership; admin still passes
+        [],  # _user_group_principal_ids
+        _cluster_rows(),  # _accessible_clusters
+        _principal(id=7, kind=PrincipalType.ORG),
+    )
+
+    ctx = await resolve_tenant_context(
+        request=request,
+        session=session,
+        user=user,
+        x_organization_id="7",
+    )
+
+    assert ctx.is_platform_admin is True
+    assert ctx.current_principal_id == 7
+    assert ctx.org_role is None
+
+
+@pytest.mark.asyncio
+async def test_api_key_overrides_header():
+    user = _user(id=100, is_admin=False)
+    request = _request(api_key=_api_key(owner_principal_id=42))
+    session = _session_returning(
+        [OrgRole.MEMBER],  # union: direct membership in org 42
+        [],
+        _cluster_rows(),  # _accessible_clusters
+        _principal(id=42, kind=PrincipalType.ORG),
+    )
+
+    ctx = await resolve_tenant_context(
+        request=request,
+        session=session,
+        user=user,
+        x_organization_id="999",  # ignored when api_key is set
+    )
+
+    assert ctx.current_principal_id == 42
+
+
+# ---- require_platform_admin / require_org_role ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_require_platform_admin_blocks_regular_user():
+    ctx = MagicMock()
+    ctx.is_platform_admin = False
+    with pytest.raises(ForbiddenException):
+        await require_platform_admin(ctx)
+
+
+@pytest.mark.asyncio
+async def test_require_platform_admin_allows_admin():
+    ctx = MagicMock()
+    ctx.is_platform_admin = True
+    assert await require_platform_admin(ctx) is ctx
+
+
+@pytest.mark.asyncio
+async def test_require_org_role_admin_passthrough():
+    dep = require_org_role(OrgRole.OWNER)
+    ctx = MagicMock()
+    ctx.is_platform_admin = True
+    assert await dep(ctx) is ctx
+
+
+@pytest.mark.asyncio
+async def test_require_org_role_blocks_when_no_org_context():
+    dep = require_org_role(OrgRole.OWNER)
+    ctx = MagicMock()
+    ctx.is_platform_admin = False
+    ctx.current_principal_id = None
+    with pytest.raises(ForbiddenException):
+        await dep(ctx)
+
+
+@pytest.mark.asyncio
+async def test_require_org_role_blocks_insufficient_role():
+    dep = require_org_role(OrgRole.OWNER)
+
+    def _assert_role(*allowed):
+        if OrgRole.MEMBER not in allowed:
+            raise ForbiddenException(message="nope")
+
+    ctx = MagicMock()
+    ctx.is_platform_admin = False
+    ctx.current_principal_id = 1
+    ctx.org_role = OrgRole.MEMBER
+    ctx.assert_org_role = _assert_role
+    with pytest.raises(ForbiddenException):
+        await dep(ctx)
+
+
+@pytest.mark.asyncio
+async def test_require_org_role_passes_for_matching_role():
+    dep = require_org_role(OrgRole.OWNER, OrgRole.OWNER)
+
+    def _assert_role(*allowed):
+        if OrgRole.OWNER not in allowed:
+            raise AssertionError("did not pass owner role through")
+
+    ctx = MagicMock()
+    ctx.is_platform_admin = False
+    ctx.current_principal_id = 1
+    ctx.org_role = OrgRole.OWNER
+    ctx.assert_org_role = _assert_role
+    assert await dep(ctx) is ctx
+
+
+@pytest.mark.asyncio
+async def test_require_org_role_blocks_personal_scope():
+    """Personal-scope callers (regular user without ``X-Organization-Id``)
+    land here with ``current_principal_id == user.id`` and ``org_role=None``.
+    They must NOT reach the management surfaces gated by this dep, even
+    though they have a non-null principal context.
+    """
+    dep = require_org_role(OrgRole.OWNER)
+
+    def _assert_role(*allowed):
+        # Mirrors TenantContext.assert_org_role for org_role=None.
+        raise ForbiddenException(message="Insufficient organization role")
+
+    ctx = MagicMock()
+    ctx.user.kind = PrincipalType.USER
+    ctx.is_platform_admin = False
+    ctx.current_principal_id = 7  # user.id — personal scope
+    ctx.current_is_personal_scope = True
+    ctx.org_role = None
+    ctx.assert_org_role = _assert_role
+    with pytest.raises(ForbiddenException):
+        await dep(ctx)
+
+
+@pytest.mark.asyncio
+async def test_require_org_role_passes_system_principal():
+    """SYSTEM principals (worker / cluster callbacks reaching shared
+    routers like benchmark ``/metrics``) bypass the Org Owner gate via
+    ``bypass_tenant_filter`` — they aren't users and have no Org role.
+    """
+    dep = require_org_role(OrgRole.OWNER)
+    ctx = MagicMock()
+    ctx.user.kind = PrincipalType.SYSTEM
+    ctx.is_platform_admin = False
+    ctx.current_principal_id = None
+    ctx.org_role = None
+    ctx.assert_org_role = MagicMock(
+        side_effect=AssertionError("assert_org_role should not be reached for SYSTEM")
+    )
+    assert await dep(ctx) is ctx

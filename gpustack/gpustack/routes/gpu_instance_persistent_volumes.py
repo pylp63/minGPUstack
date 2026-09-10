@@ -1,0 +1,407 @@
+from contextlib import asynccontextmanager
+from typing import Dict, List, Optional
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.responses import StreamingResponse
+
+from gpustack.api.exceptions import (
+    AlreadyExistsException,
+    InternalServerErrorException,
+    InvalidException,
+    NotFoundException,
+)
+from gpustack.api.tenant import (
+    bypass_tenant_filter,
+    TenantContext,
+    assert_org_owned_writable,
+    validate_owner_principal,
+)
+from sqlmodel import select
+from gpustack.gpu_instances import validate_k8s_object_name
+
+from gpustack.schemas import (
+    GPUInstance,
+    GPUInstancePersistentVolume,
+    GPUInstancePersistentVolumeType,
+    GPUInstancePersistentVolumeUpdate,
+    GPUInstancePersistentVolumePublic,
+    GPUInstancePersistentVolumeListParams,
+    GPUInstancePersistentVolumesPublic,
+    GPUInstancePersistentVolumeCreate,
+    GPUInstancePersistentVolumeStatus,
+    GPUInstancePersistentVolumePhase,
+)
+from gpustack.schemas.gpu_instance_persistent_volumes import (
+    GPUInstancePersistentVolumeAttachment,
+)
+from gpustack.schemas.principals import platform_principal_id
+from gpustack.server.bus import EventType
+from gpustack.routes.gpu_instances_helper import (
+    display_name_label,
+    order_by_display_label,
+)
+from gpustack.server.db import async_session
+from gpustack.server.deps import SessionDep, TenantContextDep
+
+router = APIRouter()
+
+
+@router.get("", response_model=GPUInstancePersistentVolumesPublic)
+async def get_gpu_instance_persistent_volumes(
+    ctx: TenantContextDep,
+    params: GPUInstancePersistentVolumeListParams = Depends(),
+    search: Optional[str] = None,
+):
+    owner_principal_id = ctx.current_principal_id or platform_principal_id()
+    if bypass_tenant_filter(ctx):
+        owner_principal_id = None
+
+    fields: dict = {}
+    if owner_principal_id is not None:
+        fields["owner_principal_id"] = owner_principal_id
+
+    fuzzy_fields: dict = {}
+    if search:
+        # The Name column renders ``display_name || name``, so searching only
+        # ``name`` hid rows behind the label the list actually shows (#6104).
+        fuzzy_fields["name"] = search
+        fuzzy_fields["display_name"] = search
+
+    if params.watch:
+        return StreamingResponse(
+            GPUInstancePersistentVolume.streaming(
+                fields=fields,
+                fuzzy_fields=fuzzy_fields,
+                event_transform=_inject_attachments_into_event,
+            ),
+            media_type="text/event-stream",
+        )
+
+    async with async_session() as session:
+        paginated = await GPUInstancePersistentVolume.paginated_by_query(
+            session=session,
+            fields=fields,
+            fuzzy_fields=fuzzy_fields,
+            order_by=order_by_display_label(
+                params.order_by, display_name_label(GPUInstancePersistentVolume)
+            ),
+            page=params.page,
+            per_page=params.perPage,
+        )
+        attachments = await _attachments_by_volume(
+            session, [pv.id for pv in paginated.items]
+        )
+        items = [_to_public(pv, attachments.get(pv.id, [])) for pv in paginated.items]
+        return GPUInstancePersistentVolumesPublic(
+            items=items, pagination=paginated.pagination
+        )
+
+
+@router.get("/{id}", response_model=GPUInstancePersistentVolumePublic)
+async def get_gpu_instance_persistent_volume(
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+):
+    pv = ensure_visible(
+        await GPUInstancePersistentVolume.one_by_id(
+            session=session,
+            id=id,
+        ),
+        ctx,
+    )
+    attachments = await _attachments_by_volume(session, [pv.id])
+    return _to_public(pv, attachments.get(pv.id, []))
+
+
+@router.post("", response_model=GPUInstancePersistentVolumePublic)
+async def create_gpu_instance_persistent_volume(
+    session: SessionDep,
+    ctx: TenantContextDep,
+    create_obj: GPUInstancePersistentVolumeCreate,
+):
+    if create_obj.owner_principal_id is None:
+        create_obj.owner_principal_id = (
+            ctx.current_principal_id or platform_principal_id()
+        )
+    validate_owner_principal(
+        create_obj.owner_principal_id,
+        ctx,
+        resource_label="GPU instance persistent volume",
+        allow_member=True,
+    )
+
+    persistent_volume_type_id = await _validate_create_obj(session, ctx, create_obj)
+
+    existed = await GPUInstancePersistentVolume.exist_by_fields(
+        session=session,
+        fields={
+            "owner_principal_id": create_obj.owner_principal_id,
+            "name": create_obj.name,
+        },
+    )
+    if existed:
+        raise AlreadyExistsException(
+            message=(f"Storage with name '{create_obj.name}' already exists."),
+        )
+
+    source = _build_create_source(create_obj, ctx.user.id, persistent_volume_type_id)
+    async with handle_error(
+        message="Failed to create GPU instance persistent volume",
+    ):
+        return await GPUInstancePersistentVolume.create(
+            session=session,
+            source=source,
+        )
+
+
+@router.put("/{id}", response_model=GPUInstancePersistentVolumePublic)
+async def update_gpu_instance_persistent_volume(
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+    update_obj: GPUInstancePersistentVolumeUpdate,
+):
+    ret = ensure_writable(
+        await GPUInstancePersistentVolume.one_by_id(
+            session=session,
+            id=id,
+        ),
+        ctx,
+    )
+
+    async with handle_error(
+        message="Failed to update GPU instance persistent volume",
+    ):
+        await ret.update(
+            session=session,
+            source=update_obj,
+        )
+        return ret
+
+
+@router.delete(
+    "/{id}", status_code=202, response_model=GPUInstancePersistentVolumePublic
+)
+async def delete_gpu_instance_persistent_volume(
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+):
+    """Mark the persistent volume for deletion (soft delete).
+
+    Stamps ``status.phase = Deleting`` and retains the row; the PV
+    finalizer controller cleans up the downstream CRs across clusters and
+    then hard-deletes the row.
+    """
+    ret = ensure_writable(
+        await GPUInstancePersistentVolume.one_by_id(
+            session=session,
+            id=id,
+        ),
+        ctx,
+    )
+
+    source = _build_delete_phase_source(ret)
+    async with handle_error(
+        message="Failed to delete GPU instance persistent volume",
+    ):
+        await ret.update(
+            session=session,
+            source=source,
+        )
+        return ret
+
+
+async def _attachments_by_volume(
+    session: AsyncSession, volume_ids: List[int]
+) -> Dict[int, List[GPUInstancePersistentVolumeAttachment]]:
+    """``{pv_id: [attachment, ...]}`` for the given volumes, in one query.
+
+    ``GPUInstance.persistent_volume_id`` is the only record of the mount, and it
+    is NOT phase-filtered — a Stopped instance holds the volume exactly as a
+    running one does (and blocks its reclaim). So every referencing instance is
+    reported with its phase, rather than filtering to "active" ones and telling
+    the user nothing holds a volume that is in fact held.
+    """
+    if not volume_ids:
+        return {}
+    rows = (
+        await session.exec(
+            select(
+                GPUInstance.persistent_volume_id,
+                GPUInstance.id,
+                GPUInstance.name,
+                GPUInstance.status,
+            ).where(GPUInstance.persistent_volume_id.in_(volume_ids))
+        )
+    ).all()
+    out: Dict[int, List[GPUInstancePersistentVolumeAttachment]] = {}
+    for pv_id, instance_id, name, status in rows:
+        phase = status.phase if status is not None else None
+        out.setdefault(pv_id, []).append(
+            GPUInstancePersistentVolumeAttachment(
+                id=instance_id, name=name, phase=phase
+            )
+        )
+    return out
+
+
+def _to_public(
+    pv: GPUInstancePersistentVolume,
+    attachments: List[GPUInstancePersistentVolumeAttachment],
+) -> GPUInstancePersistentVolumePublic:
+    public = GPUInstancePersistentVolumePublic.model_validate(pv, from_attributes=True)
+    # Always set it, even when empty: an empty list is the meaningful answer
+    # "nothing is attached" (so the volume is billed while idle), which is
+    # different from ``None`` = "not resolved".
+    public.attached_instances = attachments
+    return public
+
+
+async def _inject_attachments_into_event(event) -> None:
+    """Populate ``attached_instances`` on a watch event so the streamed payload
+    matches the REST response — otherwise a UI in watch mode would show the
+    column as empty on every update."""
+    if event.type == EventType.DELETED:
+        return
+    pv = event.data
+    if not isinstance(pv, GPUInstancePersistentVolumePublic) or pv.id is None:
+        return
+    async with async_session() as session:
+        attachments = await _attachments_by_volume(session, [pv.id])
+    pv.attached_instances = attachments.get(pv.id, [])
+
+
+def ensure_visible(obj, ctx: TenantContext):
+    if obj and is_visible(obj, ctx):
+        return obj
+    raise NotFoundException(message="GPU instance persistent volume not found")
+
+
+def ensure_writable(obj, ctx: TenantContext):
+    if obj is None:
+        raise NotFoundException(message="GPU instance persistent volume not found")
+    assert_org_owned_writable(
+        ctx,
+        obj,
+        resource_label="GPU instance persistent volume",
+        allow_member=True,
+    )
+    return obj
+
+
+def is_visible(obj, ctx: TenantContext) -> bool:
+    if bypass_tenant_filter(ctx):
+        return True
+    return ctx.current_principal_id == obj.owner_principal_id
+
+
+@asynccontextmanager
+async def handle_error(message: str):
+    try:
+        yield
+    except Exception as e:
+        raise InternalServerErrorException(
+            message=message,
+        ) from e
+
+
+async def _validate_create_obj(
+    session: AsyncSession,
+    ctx: TenantContext,
+    create_obj: GPUInstancePersistentVolumeCreate,
+) -> int:
+    validate_k8s_object_name(create_obj.name)
+
+    pvt = await resolve_pv_type_for_ctx(
+        session,
+        ctx,
+        owner_principal_id=create_obj.owner_principal_id,
+        name=create_obj.spec.type_,
+    )
+    if pvt is None or pvt.is_deleting():
+        raise InvalidException(
+            message=(
+                f"GPU instance persistent volume type "
+                f"'{create_obj.spec.type_}' not found or is being deleted"
+            ),
+        )
+
+    return pvt.id
+
+
+async def resolve_pv_type_for_ctx(
+    session: AsyncSession,
+    ctx: TenantContext,
+    *,
+    owner_principal_id: int,
+    name: str,
+) -> Optional[GPUInstancePersistentVolumeType]:
+    """Resolve a PV type by name from any Org the caller can use:
+
+    - the PV's own owner principal (caller's own types), and
+    - any Org that owns a cluster the caller has access to
+      (covers Default-Org "Everyone" grants and cross-Org cluster
+      grants — Org1 grants its cluster to Org2 → Org2's user can
+      reference Org1's PV types by name when provisioning).
+
+    Returns the first matching row, or ``None`` if no Org in the
+    accessible set defines a type with that name. ``ctx`` may bypass
+    tenant scoping (admin / SYSTEM); in that case lookup is unscoped.
+    """
+    # Always scope by ``owner_principal_id`` — even for admin in
+    # "All" mode. Two Orgs can independently define a PV type with
+    # the same name; without the scope the lookup picks an
+    # arbitrary one and the resulting PV would silently bind to the
+    # wrong Org's storage backend. Tenant scoping is otherwise
+    # unbounded here (admin / SYSTEM bypass): they may resolve a
+    # type from any Org, but only the one matching the PV being
+    # created.
+    if bypass_tenant_filter(ctx):
+        stmt = select(GPUInstancePersistentVolumeType).where(
+            GPUInstancePersistentVolumeType.name == name,
+            GPUInstancePersistentVolumeType.owner_principal_id == owner_principal_id,
+        )
+        return (await session.exec(stmt)).first()
+
+    owner_ids = set(ctx.accessible_cluster_owner_ids)
+    owner_ids.add(owner_principal_id)
+    if not owner_ids:
+        return None
+    stmt = select(GPUInstancePersistentVolumeType).where(
+        GPUInstancePersistentVolumeType.name == name,
+        GPUInstancePersistentVolumeType.owner_principal_id.in_(owner_ids),
+    )
+    return (await session.exec(stmt)).first()
+
+
+def _build_create_source(
+    create_obj: GPUInstancePersistentVolumeCreate,
+    creator_id: int,
+    persistent_volume_type_id: int,
+) -> dict:
+    source: dict = create_obj.model_dump()
+    source["creator_id"] = creator_id
+    source["persistent_volume_type_id"] = persistent_volume_type_id
+    source["status"] = GPUInstancePersistentVolumeStatus(
+        phase=GPUInstancePersistentVolumePhase.READY,
+    )
+    return source
+
+
+def _build_delete_phase_source(existing: GPUInstancePersistentVolume) -> dict:
+    """Stamp the soft-delete phase onto status, clearing any prior
+    ``phase_message`` while preserving ``finalizing`` so a re-issued delete
+    stays idempotent. The finalizer controller fills ``finalizing`` and
+    hard-deletes the row once downstream cleanup completes."""
+    base = existing.status or GPUInstancePersistentVolumeStatus()
+    return {
+        "status": base.model_copy(
+            update={
+                "phase": GPUInstancePersistentVolumePhase.DELETING,
+                "phase_message": None,
+            },
+        ),
+    }

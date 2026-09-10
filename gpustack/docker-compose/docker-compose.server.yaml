@@ -1,0 +1,12 @@
+services:
+  gpustack-server:
+    image: ${IMAGE_REGISTRY:-docker.io}/${IMAGE_NAMESPACE:-gpustack}/gpustack:${GPUSTACK_TAG:-latest}
+    container_name: gpustack-server
+    restart: unless-stopped
+    volumes:
+      - gpustack-data:/var/lib/gpustack
+    ports:
+      - "80:80"
+
+volumes:
+  gpustack-data: {}

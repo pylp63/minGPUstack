@@ -1,0 +1,1619 @@
+import json
+import types
+
+import pytest
+
+from gpustack.schemas.inference_backend import (
+    InferenceBackend,
+    ParameterFormatEnum,
+    VersionConfig,
+    VersionConfigDict,
+)
+from gpustack.schemas.cache_services import CacheConfigSnapshot
+from gpustack.schemas.models import (
+    BackendEnum,
+    ExtendedKVCacheConfig,
+    KVCacheModeEnum,
+)
+from gpustack.utils.config import apply_registry_override_to_image
+from gpustack.envs import ENABLE_CUDA_MINOR_VERSION_COMPATIBILITY_ENV as _KNOB
+from gpustack.worker.backends.base import (
+    InferenceServer,
+    is_ascend,
+    is_ascend_310p,
+    read_lora_max_rank,
+    _parse_image_cuda_version,
+)
+from gpustack.worker.backends.custom import CustomServer
+from gpustack.worker.backends.sglang import (
+    SGLangServer,
+    extend_sglang_mounted_lora_arguments,
+    get_access_log_arguments as get_sglang_access_log_arguments,
+    get_auto_parallelism_arguments as get_sglang_auto_parallelism_arguments,
+    get_cache_report_arguments as get_sglang_cache_report_arguments,
+)
+from gpustack.worker.backends.vllm import (
+    VLLMServer,
+    extend_vllm_mounted_lora_arguments,
+    _round_up_vllm_lora_rank,
+    get_access_log_arguments as get_vllm_access_log_arguments,
+    get_cache_report_arguments as get_vllm_cache_report_arguments,
+)
+from gpustack.worker.backends.vox_box import VoxBoxServer
+
+
+@pytest.mark.parametrize(
+    "image_name, container_registry, expect_image_name, fallback_registry",
+    [
+        (
+            "ghcr.io/ggml-org/llama.cpp:server",
+            "test-registry.io",
+            "ghcr.io/ggml-org/llama.cpp:server",
+            None,
+        ),
+        (
+            "gpustack/runner:cuda12.8-vllm0.10.2",
+            "test-registry.io",
+            "test-registry.io/gpustack/runner:cuda12.8-vllm0.10.2",
+            None,
+        ),
+        (
+            "foo/bar",
+            "test-registry.io",
+            "test-registry.io/foo/bar",
+            None,
+        ),
+        ("ubuntu:24.04", "test-registry.io", "test-registry.io/ubuntu:24.04", None),
+        (
+            "gpustack/runner:cuda12.8-vllm0.10.2",
+            None,
+            "quay.io/gpustack/runner:cuda12.8-vllm0.10.2",
+            "quay.io",
+        ),
+        (
+            "lmsysorg/sglang:v0.5.5",
+            "",
+            "lmsysorg/sglang:v0.5.5",
+            None,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_apply_registry_override(
+    image_name,
+    container_registry,
+    expect_image_name,
+    fallback_registry,
+    monkeypatch,
+):
+    backend = CustomServer.__new__(CustomServer)
+    # CustomServer inherits _apply_registry_override from InferenceServer,
+    # and _apply_registry_override accesses self._config.system_default_container_registry.
+    # Since we constructed the instance via __new__ (without __init__),
+    # the _config attribute does not exist. We attach a minimal stub config here.
+    backend._config = types.SimpleNamespace(
+        system_default_container_registry=container_registry,
+    )
+    backend._fallback_registry = fallback_registry
+
+    assert (
+        apply_registry_override_to_image(
+            backend._config, image_name, backend._fallback_registry
+        )
+        == expect_image_name
+    )
+
+    if container_registry:
+        backend._config = types.SimpleNamespace(system_default_container_registry=None)
+        assert (
+            apply_registry_override_to_image(
+                backend._config, image_name, backend._fallback_registry
+            )
+            == image_name
+        )
+
+
+@pytest.mark.parametrize(
+    "backend_parameters, expected",
+    [
+        (
+            ["--ctx-size 1024"],
+            ["--ctx-size", "1024"],
+        ),
+        (
+            ["--served-model-name foo"],
+            ["--served-model-name", "foo"],
+        ),
+        (
+            ['--served-model-name "foo bar"'],
+            ["--served-model-name", "foo bar"],
+        ),
+        (
+            ['--arg1', '--arg2 "val with spaces"'],
+            ['--arg1', '--arg2', 'val with spaces'],
+        ),
+        (
+            ['--arg1 "val with spaces"', '--arg2="val with spaces"'],
+            ['--arg1', 'val with spaces', '--arg2=val with spaces'],
+        ),
+        (
+            [
+                """--hf-overrides '{"architectures": ["NewModel"]}'""",
+                """--hf-overrides={"architectures": ["NewModel"]}""",
+            ],
+            [
+                '--hf-overrides',
+                '{"architectures": ["NewModel"]}',
+                """--hf-overrides={"architectures": ["NewModel"]}""",
+            ],
+        ),
+        # Test cases for whitespace handling
+        (
+            [" --ctx-size=1024"],
+            ["--ctx-size=1024"],
+        ),
+        (
+            ["  --ctx-size 1024"],
+            ["--ctx-size", "1024"],
+        ),
+        (
+            [" --max-model-len=8192"],
+            ["--max-model-len=8192"],
+        ),
+        (
+            ["--foo bar=baz"],
+            ["--foo", "bar=baz"],
+        ),
+        # Test negative number values
+        (
+            ["--temperature -0.5"],
+            ["--temperature", "-0.5"],
+        ),
+        # Issue #5209: shell line-continuation backslashes pasted from docs
+        (
+            ["--tp 2 \\"],
+            ["--tp", "2"],
+        ),
+        (
+            ["--tp 2 \\", "--max-model-len 8192 \\"],
+            ["--tp", "2", "--max-model-len", "8192"],
+        ),
+        (
+            ["--tp 2 \\\n"],
+            ["--tp", "2"],
+        ),
+        (
+            None,
+            [],
+        ),
+    ],
+)
+def test_flatten_backend_param(backend_parameters, expected):
+    backend = CustomServer.__new__(CustomServer)
+    backend._model = types.SimpleNamespace(backend_parameters=backend_parameters)
+    backend.inference_backend = None
+    assert backend._flatten_backend_param() == expected
+
+
+@pytest.mark.parametrize(
+    "backend_parameters, parameter_format, expected",
+    [
+        # Test space format conversion
+        (["--ctx-size=1024"], ParameterFormatEnum.SPACE, ["--ctx-size", "1024"]),
+        # llama.cpp short options like -n, -ngl, -m must keep single-dash form;
+        # we never auto-coerce dash count even when normalizing format.
+        (["-n-gpu-layers=0"], ParameterFormatEnum.SPACE, ["-n-gpu-layers", "0"]),
+        (["-ngl 99"], ParameterFormatEnum.EQUAL, ["-ngl=99"]),
+        # Test equal format conversion
+        (["--ctx-size 1024"], ParameterFormatEnum.EQUAL, ["--ctx-size=1024"]),
+        (["-ctx-size 1024"], ParameterFormatEnum.EQUAL, ["-ctx-size=1024"]),
+        # Test no conversion (None)
+        (["--ctx-size 1024"], None, ["--ctx-size", "1024"]),
+        (["--ctx-size=1024"], None, ["--ctx-size=1024"]),
+        # Test flag parameters (no value)
+        (["--verbose"], ParameterFormatEnum.SPACE, ["--verbose"]),
+        (["--verbose"], ParameterFormatEnum.EQUAL, ["--verbose"]),
+        (["--verbose"], None, ["--verbose"]),
+        # Test parameters with spaces in value
+        (['--name "my model"'], ParameterFormatEnum.SPACE, ["--name", "my model"]),
+        (['--name "my model"'], ParameterFormatEnum.EQUAL, ["--name=my model"]),
+        # Test multiple parameters
+        (
+            ["--ctx-size=1024", "--n-gpu-layers=0"],
+            ParameterFormatEnum.SPACE,
+            ["--ctx-size", "1024", "--n-gpu-layers", "0"],
+        ),
+        (
+            ["--ctx-size 1024", "--n-gpu-layers 0"],
+            ParameterFormatEnum.EQUAL,
+            ["--ctx-size=1024", "--n-gpu-layers=0"],
+        ),
+        # Test mixed formats with conversion
+        (
+            ["--ctx-size=1024", "--n-gpu-layers 0"],
+            ParameterFormatEnum.SPACE,
+            ["--ctx-size", "1024", "--n-gpu-layers", "0"],
+        ),
+        (
+            ["--ctx-size 1024", "--n-gpu-layers=0"],
+            ParameterFormatEnum.EQUAL,
+            ["--ctx-size=1024", "--n-gpu-layers=0"],
+        ),
+        # Test parameters with multiple values
+        (
+            ['--arg "value1 value2 value3"'],
+            ParameterFormatEnum.SPACE,
+            ["--arg", "value1 value2 value3"],
+        ),
+        (
+            ['--arg "value1 value2 value3"'],
+            ParameterFormatEnum.EQUAL,
+            ["--arg=value1 value2 value3"],
+        ),
+        # Test negative number values
+        (
+            ["--temperature -0.5"],
+            ParameterFormatEnum.SPACE,
+            ["--temperature", "-0.5"],
+        ),
+        (
+            ["--temperature -0.5"],
+            ParameterFormatEnum.EQUAL,
+            ["--temperature=-0.5"],
+        ),
+        (
+            ["--temperature=-0.5"],
+            ParameterFormatEnum.SPACE,
+            ["--temperature", "-0.5"],
+        ),
+        # ----- issue #5200: multiple --key in a single slot -----
+        # Space form, no enforced target format: keep original separators.
+        (
+            ["--gpu-memory-utilization 0.8 --max-model-len 8192"],
+            None,
+            ["--gpu-memory-utilization", "0.8", "--max-model-len", "8192"],
+        ),
+        # Equal form previously folded into the first key's value.
+        (
+            ["--gpu-memory-utilization=0.8 --max-model-len=8192"],
+            None,
+            ["--gpu-memory-utilization=0.8", "--max-model-len=8192"],
+        ),
+        # Mixed forms; parameter_format=SPACE normalizes them all.
+        (
+            ["--gpu-memory-utilization 0.8 --max-model-len=8192"],
+            ParameterFormatEnum.SPACE,
+            ["--gpu-memory-utilization", "0.8", "--max-model-len", "8192"],
+        ),
+        # Mixed forms; parameter_format=EQUAL normalizes them all.
+        (
+            ["--gpu-memory-utilization 0.8 --max-model-len=8192"],
+            ParameterFormatEnum.EQUAL,
+            ["--gpu-memory-utilization=0.8", "--max-model-len=8192"],
+        ),
+        # Flag-only mixed with valued params in one slot.
+        (
+            ["--enable-prefix-caching --tp 8 --trust-remote-code"],
+            ParameterFormatEnum.SPACE,
+            ["--enable-prefix-caching", "--tp", "8", "--trust-remote-code"],
+        ),
+        # Negative value inside a multi-param slot stays bound to its key.
+        (
+            ["--temperature -0.5 --top-p 0.9"],
+            ParameterFormatEnum.EQUAL,
+            ["--temperature=-0.5", "--top-p=0.9"],
+        ),
+        # JSON value (equal form) followed by another --key — JSON masking
+        # keeps the JSON intact across the split.
+        (
+            [
+                '--compilation-config={"cudagraph_mode": "FULL_DECODE_ONLY"} '
+                '--max-model-len 65536'
+            ],
+            None,
+            [
+                '--compilation-config={"cudagraph_mode": "FULL_DECODE_ONLY"}',
+                '--max-model-len',
+                '65536',
+            ],
+        ),
+        # Quoted JSON value (space form) followed by another --key.
+        (
+            ['--speculative-config \'{"num_speculative_tokens": 2}\' --tp 8'],
+            None,
+            [
+                '--speculative-config',
+                '{"num_speculative_tokens": 2}',
+                '--tp',
+                '8',
+            ],
+        ),
+        # Shell line-continuation in the middle of a single slot.
+        (
+            ["--tp 2 \\\n--max-model-len 8192"],
+            ParameterFormatEnum.SPACE,
+            ["--tp", "2", "--max-model-len", "8192"],
+        ),
+        # vLLM --lora-modules with multiple JSON values (flat-token form).
+        # parameter_format=EQUAL must NOT fold multi-value into --key=v1=v2;
+        # the cluster stays in space form because equal form is unsafe here.
+        (
+            [
+                "--lora-modules",
+                '{"name": "x1", "path": "/p1"}',
+                '{"name": "x2", "path": "/p2"}',
+            ],
+            ParameterFormatEnum.EQUAL,
+            [
+                "--lora-modules",
+                '{"name": "x1", "path": "/p1"}',
+                '{"name": "x2", "path": "/p2"}',
+            ],
+        ),
+        # Same multi-value cluster, SPACE target — passes through.
+        (
+            [
+                "--lora-modules",
+                '{"name": "x1"}',
+                '{"name": "x2"}',
+            ],
+            ParameterFormatEnum.SPACE,
+            [
+                "--lora-modules",
+                '{"name": "x1"}',
+                '{"name": "x2"}',
+            ],
+        ),
+    ],
+)
+def test_flatten_backend_param_with_format_conversion(
+    backend_parameters, parameter_format, expected
+):
+    backend = CustomServer.__new__(CustomServer)
+    backend._model = types.SimpleNamespace(backend_parameters=backend_parameters)
+
+    # Mock the inference backend with parameter_format configuration
+    if parameter_format is not None:
+        inference_backend = types.SimpleNamespace(parameter_format=parameter_format)
+        backend.inference_backend = inference_backend
+    else:
+        backend.inference_backend = None
+
+    assert backend._flatten_backend_param() == expected
+
+
+@pytest.mark.parametrize(
+    "backend_parameters, backend_version, expected",
+    [
+        (None, None, []),
+        ([], "0.15.2", []),
+        ([], "0.16.0", ["--disable-access-log-for-endpoints", "/metrics"]),
+        (
+            ["--disable-access-log-for-endpoints=/health,/metrics"],
+            "0.16.0",
+            [],
+        ),
+        (
+            ["--disable-access-log-for-endpoints", "/health,/metrics"],
+            "0.16.0",
+            [],
+        ),
+    ],
+)
+def test_vllm_access_log_arguments(backend_parameters, backend_version, expected):
+    assert (
+        get_vllm_access_log_arguments(backend_parameters, backend_version) == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "backend_parameters, backend_version, expected",
+    [
+        (None, None, []),
+        ([], "0.5.8", []),
+        ([], "0.5.8.post1", ["--uvicorn-access-log-exclude-prefixes", "/metrics"]),
+        (
+            ["--uvicorn-access-log-exclude-prefixes=/health"],
+            "0.5.8.post1",
+            [],
+        ),
+        (
+            ["--uvicorn-access-log-exclude-prefixes", "/health"],
+            "0.5.8.post1",
+            [],
+        ),
+    ],
+)
+def test_sglang_access_log_arguments(backend_parameters, backend_version, expected):
+    assert (
+        get_sglang_access_log_arguments(backend_parameters, backend_version) == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "backend_parameters, backend_version, expected",
+    [
+        # Unknown version: do not inject (we cannot version-gate it).
+        (None, None, []),
+        # Below the v0.9.0.1 cutoff: skipped (V1 silently dropped the field).
+        ([], "0.9.0", []),
+        # At/after the cutoff: injected.
+        ([], "0.9.0.1", ["--enable-prompt-tokens-details"]),
+        ([], "0.10.0", ["--enable-prompt-tokens-details"]),
+        # User explicitly opted in: do not duplicate.
+        (["--enable-prompt-tokens-details"], "0.10.0", []),
+        # User explicitly opted out: respect their choice.
+        (["--no-enable-prompt-tokens-details"], "0.10.0", []),
+        # Prefix-caching flags are not GPUStack's responsibility — left to the user.
+        (["--enable-prefix-caching"], "0.10.0", ["--enable-prompt-tokens-details"]),
+    ],
+)
+def test_vllm_cache_report_arguments(backend_parameters, backend_version, expected):
+    assert (
+        get_vllm_cache_report_arguments(backend_parameters, backend_version) == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "backend_parameters, backend_version, expected",
+    [
+        # Unknown version: do not inject (we cannot version-gate it).
+        (None, None, []),
+        # Below the v0.3.4 cutoff: skipped.
+        ([], "0.3.3", []),
+        # At/after the cutoff: injected.
+        ([], "0.3.4", ["--enable-cache-report"]),
+        ([], "0.5.8.post1", ["--enable-cache-report"]),
+        # User already passed it: do not duplicate.
+        (["--enable-cache-report"], "0.5.8.post1", []),
+    ],
+)
+def test_sglang_cache_report_arguments(backend_parameters, backend_version, expected):
+    assert (
+        get_sglang_cache_report_arguments(backend_parameters, backend_version)
+        == expected
+    )
+
+
+CACHE_ENV_BACKENDS = [
+    (VLLMServer, "VLLM_CACHE_ROOT", "vllm"),
+    (SGLangServer, "SGLANG_CACHE_DIR", "sglang"),
+]
+
+
+@pytest.mark.parametrize("backend_class, variable, subdirectory", CACHE_ENV_BACKENDS)
+def test_set_cache_env_defaults_to_config_cache_dir(
+    tmp_path, backend_class, variable, subdirectory
+):
+    backend = backend_class.__new__(backend_class)
+    backend._config = types.SimpleNamespace(cache_dir=str(tmp_path))
+
+    env = {}
+    backend._set_cache_env(env, variable, subdirectory)
+
+    expected = tmp_path / subdirectory
+    assert env[variable] == str(expected)
+    assert expected.is_dir()
+
+    # Without a config there is nothing to point at.
+    backend._config = None
+    env = {}
+    backend._set_cache_env(env, variable, subdirectory)
+    assert env == {}
+
+
+@pytest.mark.parametrize("backend_class, variable, subdirectory", CACHE_ENV_BACKENDS)
+def test_set_cache_env_respects_user_override(
+    tmp_path, backend_class, variable, subdirectory
+):
+    backend = backend_class.__new__(backend_class)
+    backend._config = types.SimpleNamespace(cache_dir=str(tmp_path))
+
+    env = {variable: "/custom/cache"}
+    backend._set_cache_env(env, variable, subdirectory)
+
+    assert env[variable] == "/custom/cache"
+    # Default cache dir should not be created when the user overrode it.
+    assert not (tmp_path / subdirectory).exists()
+
+
+def _vllm_backend_with_kv_cache(extended_kv_cache, cache_config=None):
+    backend = VLLMServer.__new__(VLLMServer)
+    backend._model = types.SimpleNamespace(extended_kv_cache=extended_kv_cache)
+    backend._model_instance = types.SimpleNamespace(cache_config=cache_config)
+    backend._get_device_info = lambda: ("cuda", None, None)
+    return backend
+
+
+def _shared_kv_cache_config():
+    return ExtendedKVCacheConfig(
+        enabled=True,
+        mode=KVCacheModeEnum.SHARED,
+        cache_service_id=3,
+        ram_size=8,
+        chunk_size=256,
+    )
+
+
+def test_vllm_shared_kv_cache_injected_applies_snapshot_env_and_args():
+    snapshot = CacheConfigSnapshot(
+        cache_service_id=3,
+        env={"MOONCAKE_CONFIG_PATH": "/etc/mooncake.json"},
+        args=["--kv-transfer-config", '{"kv_connector":"MooncakeConnector"}'],
+        injected=True,
+    )
+    backend = _vllm_backend_with_kv_cache(
+        _shared_kv_cache_config(), cache_config=snapshot
+    )
+
+    env = {}
+    backend._set_lmcache_env(env)
+    # Snapshot env is applied verbatim; local CPU cache sizing does not fire.
+    assert env == {"MOONCAKE_CONFIG_PATH": "/etc/mooncake.json"}
+    assert "LMCACHE_MAX_LOCAL_CPU_SIZE" not in env
+    assert "LMCACHE_CHUNK_SIZE" not in env
+
+    # The snapshot is applied verbatim — provider-specific knowledge
+    # (e.g. LMCache's --shutdown-timeout) lives in the catalog args.
+    assert backend._build_extended_kv_cache_arguments(None) == [
+        "--kv-transfer-config",
+        '{"kv_connector":"MooncakeConnector"}',
+    ]
+
+
+@pytest.mark.parametrize(
+    "cache_config",
+    [
+        None,
+        CacheConfigSnapshot(
+            cache_service_id=3, injected=False, reason="Cache service is not running."
+        ),
+    ],
+)
+def test_vllm_shared_kv_cache_not_injected_starts_without_cache(cache_config):
+    backend = _vllm_backend_with_kv_cache(
+        _shared_kv_cache_config(), cache_config=cache_config
+    )
+
+    env = {}
+    backend._set_lmcache_env(env)
+    assert env == {}
+
+    assert backend._build_extended_kv_cache_arguments(None) == []
+
+
+def test_vllm_shared_kv_cache_has_no_worker_vendor_gate():
+    """Shared mode applies the snapshot on any accelerator: the catalog's
+    framework-scoped integrations are the single accelerator gate (an
+    unsupported framework never gets an injected snapshot), so the worker
+    must not second-guess it and drop half the injection."""
+    snapshot = CacheConfigSnapshot(
+        cache_service_id=3,
+        env={"PYTHONHASHSEED": "0"},
+        args=["--kv-transfer-config", '{"kv_connector":"LMCacheMPConnector"}'],
+        injected=True,
+    )
+    backend = _vllm_backend_with_kv_cache(
+        _shared_kv_cache_config(), cache_config=snapshot
+    )
+    backend._get_device_info = lambda: ("cann", None, None)
+
+    env = {}
+    backend._set_lmcache_env(env)
+    assert env == {"PYTHONHASHSEED": "0"}
+    assert backend._build_extended_kv_cache_arguments(None) == [
+        "--kv-transfer-config",
+        '{"kv_connector":"LMCacheMPConnector"}',
+    ]
+
+
+def test_vllm_legacy_local_kv_cache_behavior_unchanged():
+    # A config without an explicit mode is local: LMCache env sizing and the
+    # LMCache connector args apply as before.
+    backend = _vllm_backend_with_kv_cache(
+        ExtendedKVCacheConfig(enabled=True, ram_size=4, chunk_size=256)
+    )
+
+    env = {}
+    backend._set_lmcache_env(env)
+    assert env == {
+        "LMCACHE_CHUNK_SIZE": "256",
+        "LMCACHE_MAX_LOCAL_CPU_SIZE": "4",
+    }
+
+    assert backend._build_extended_kv_cache_arguments(None) == [
+        "--kv-transfer-config",
+        '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}',
+    ]
+
+
+def test_sglang_shared_kv_cache_disables_hicache_arguments():
+    backend = SGLangServer.__new__(SGLangServer)
+    backend._model = types.SimpleNamespace(extended_kv_cache=_shared_kv_cache_config())
+
+    assert backend._get_hicache_arguments() == []
+
+
+def test_sglang_local_kv_cache_hicache_arguments_unchanged():
+    backend = SGLangServer.__new__(SGLangServer)
+    backend._model = types.SimpleNamespace(
+        extended_kv_cache=ExtendedKVCacheConfig(
+            enabled=True, ram_size=8, chunk_size=64, ram_ratio=None
+        )
+    )
+
+    assert backend._get_hicache_arguments() == [
+        "--enable-hierarchical-cache",
+        "--page-size",
+        "64",
+        "--hicache-size",
+        "8",
+    ]
+
+
+def test_vllm_command_args_include_late_system_flags_as_injected():
+    backend = VLLMServer.__new__(VLLMServer)
+    backend.inference_backend = None
+    backend._model_path = "/models/llm"
+    backend._worker = types.SimpleNamespace(ip="192.168.50.10")
+    backend._model_instance = types.SimpleNamespace(
+        model_name="llm",
+        gpu_indexes=[],
+        ports=[4000],
+        computed_resource_claim=None,
+        mounted_loras=None,
+    )
+    backend._model = types.SimpleNamespace(
+        name="llm",
+        backend=BackendEnum.VLLM,
+        backend_parameters=[],
+        backend_version=None,
+        categories=[],
+        extended_kv_cache=None,
+        speculative_config=None,
+    )
+    backend._derive_max_model_len = lambda: None
+    backend._get_speculative_arguments = lambda: []
+    backend._get_selected_gpu_devices = lambda: [
+        types.SimpleNamespace(vendor="NVIDIA", arch_family=None)
+    ]
+
+    arguments, injected = backend._build_command_args(port=4000, is_distributed=False)
+
+    assert arguments[-6:] == [
+        "--host",
+        "192.168.50.10",
+        "--port",
+        "4000",
+        "--served-model-name",
+        "llm",
+    ]
+    assert injected == [
+        "--host",
+        "192.168.50.10",
+        "--port",
+        "4000",
+        "--served-model-name",
+        "llm",
+    ]
+
+
+def test_vllm_command_args_exclude_user_backend_parameters_from_injected():
+    backend = VLLMServer.__new__(VLLMServer)
+    backend.inference_backend = None
+    backend._model_path = "/models/llm"
+    backend._worker = types.SimpleNamespace(ip="192.168.50.10")
+    backend._model_instance = types.SimpleNamespace(
+        model_name="llm",
+        gpu_indexes=[],
+        ports=[4000],
+        computed_resource_claim=None,
+        mounted_loras=None,
+    )
+    backend._model = types.SimpleNamespace(
+        name="llm",
+        backend=BackendEnum.VLLM,
+        backend_parameters=["--host", "0.0.0.0", "--temperature", "0.2"],
+        backend_version=None,
+        categories=[],
+        extended_kv_cache=None,
+        speculative_config=None,
+    )
+    backend._derive_max_model_len = lambda: None
+    backend._get_speculative_arguments = lambda: []
+    backend._get_selected_gpu_devices = lambda: [
+        types.SimpleNamespace(vendor="NVIDIA", arch_family=None)
+    ]
+
+    arguments, injected = backend._build_command_args(port=4000, is_distributed=False)
+
+    assert "--temperature" in arguments
+    assert "--temperature" not in injected
+    assert "--host" not in injected
+    assert injected == ["--port", "4000", "--served-model-name", "llm"]
+
+
+def test_sglang_command_args_include_model_and_late_system_flags_as_injected():
+    backend = SGLangServer.__new__(SGLangServer)
+    backend.inference_backend = None
+    backend._model_path = "/models/llm"
+    backend._worker = types.SimpleNamespace(ip="192.168.50.10")
+    backend._model_instance = types.SimpleNamespace(
+        gpu_indexes=[],
+        ports=[4000],
+        computed_resource_claim=None,
+        mounted_loras=None,
+    )
+    backend._model = types.SimpleNamespace(
+        backend_parameters=[],
+        backend_version=None,
+        env={"GPUSTACK_DISABLE_METRICS": "1"},
+        extended_kv_cache=None,
+        speculative_config=None,
+    )
+    backend._derive_max_model_len = lambda: None
+    backend._get_model_architecture = lambda: []
+    backend._get_speculative_arguments = lambda: []
+    backend._get_hicache_arguments = lambda: []
+    backend._get_selected_gpu_devices = lambda: [
+        types.SimpleNamespace(vendor="NVIDIA", arch_family=None)
+    ]
+
+    _, injected = backend._build_command_args(
+        port=4000,
+        is_distributed=False,
+        is_distributed_leader=False,
+    )
+
+    assert injected == [
+        "--model-path",
+        "/models/llm",
+        "--host",
+        "192.168.50.10",
+        "--port",
+        "4000",
+    ]
+
+
+@pytest.mark.parametrize("alias", ["tp", "dp"])
+def test_sglang_short_alias_prevents_conflicting_auto_parallelism_arguments(alias):
+    model_instance = types.SimpleNamespace(gpu_indexes=[0, 1])
+
+    assert (
+        get_sglang_auto_parallelism_arguments(
+            [f"--{alias}", "2"], model_instance, is_distributed=False
+        )
+        == []
+    )
+
+
+def test_vox_box_command_args_return_injected_parameters():
+    backend = VoxBoxServer.__new__(VoxBoxServer)
+    backend.inference_backend = None
+    backend._model_path = "/models/audio"
+    backend._config = types.SimpleNamespace(data_dir="/var/lib/gpustack")
+    backend._worker = types.SimpleNamespace(ip="192.168.50.10")
+    backend._model_instance = types.SimpleNamespace(gpu_indexes=[1])
+    backend._model = types.SimpleNamespace(backend_parameters=[], backend_version=None)
+
+    _, injected = backend._build_command_args(port=4000)
+
+    assert injected == [
+        "--model",
+        "/models/audio",
+        "--data-dir",
+        "/var/lib/gpustack",
+        "--host",
+        "192.168.50.10",
+        "--port",
+        "4000",
+        "--device",
+        "cuda:1",
+    ]
+
+
+def test_custom_command_args_return_injected_parameters_after_entrypoint():
+    backend = CustomServer.__new__(CustomServer)
+    backend._model_path = "/models/custom"
+    backend._worker = types.SimpleNamespace(ip="192.168.50.10")
+    backend._model_instance = types.SimpleNamespace(
+        ports=[4000], gpu_indexes=None, gpu_type=None, distributed_servers=None
+    )
+    backend._model = types.SimpleNamespace(
+        backend_parameters=["--temperature", "0.2"],
+        backend_version=None,
+        env={},
+        name="custom-model",
+        run_command="python -m custom.launch --model-path {{model_path}} --port {{port}}",
+    )
+    backend.inference_backend = types.SimpleNamespace(
+        replace_command_param=lambda **_: (
+            "python -m custom.launch --model-path /models/custom --port 4000"
+        )
+    )
+
+    arguments, injected = backend._build_command_args()
+
+    assert arguments[-2:] == ["--temperature", "0.2"]
+    assert injected == ["--model-path", "/models/custom", "--port", "4000"]
+
+
+def test_custom_command_args_include_short_flags_as_injected():
+    backend = CustomServer.__new__(CustomServer)
+    backend._model_path = "/models/custom"
+    backend._worker = types.SimpleNamespace(ip="192.168.50.10")
+    backend._model_instance = types.SimpleNamespace(
+        ports=[4000], gpu_indexes=None, gpu_type=None, distributed_servers=None
+    )
+    backend._model = types.SimpleNamespace(
+        backend_parameters=["-u", "1"],
+        backend_version=None,
+        env={},
+        name="custom-model",
+        run_command="custom-server -s 0.0.0.0 -t 4",
+    )
+    backend.inference_backend = types.SimpleNamespace(
+        replace_command_param=lambda **_: "custom-server -s 0.0.0.0 -t 4"
+    )
+
+    _, injected = backend._build_command_args()
+
+    assert injected == ["-s", "0.0.0.0", "-t", "4"]
+
+
+def test_injected_parameters_start_at_zero_with_explicit_container_entrypoint():
+    backend = CustomServer.__new__(CustomServer)
+    backend._model_path = "/models/custom"
+    backend._worker = types.SimpleNamespace(ip="192.168.50.10")
+    backend._model_instance = types.SimpleNamespace(
+        ports=[4000], gpu_indexes=None, gpu_type=None, distributed_servers=None
+    )
+    backend._model = types.SimpleNamespace(
+        backend_parameters=["-u", "1"],
+        backend_version=None,
+        env={},
+        name="custom-model",
+        run_command="-m /models/custom -t 4",
+    )
+    backend.inference_backend = types.SimpleNamespace(
+        replace_command_param=lambda **_: "-m /models/custom -t 4"
+    )
+
+    _, injected = backend._build_command_args(entrypoint=["llama-server"])
+
+    assert injected == ["-m", "/models/custom", "-t", "4"]
+
+
+@pytest.mark.parametrize(
+    "default_entrypoint, version_entrypoint, default_run_command, expected_entrypoint, expected_injected",
+    [
+        (
+            "llama-server",
+            None,
+            "-m {{model_path}} -p {{port}}",
+            ["llama-server"],
+            ["-m", "/models/custom", "-p", "4000"],
+        ),
+        (
+            "unused-entrypoint",
+            "python -m custom.launch",
+            "--model-path {{model_path}} --port {{port}}",
+            ["python", "-m", "custom.launch"],
+            ["--model-path", "/models/custom", "--port", "4000"],
+        ),
+    ],
+)
+def test_custom_backend_configured_entrypoint_injected_parameters(
+    default_entrypoint,
+    version_entrypoint,
+    default_run_command,
+    expected_entrypoint,
+    expected_injected,
+):
+    backend = CustomServer.__new__(CustomServer)
+    backend._model_path = "/models/custom"
+    backend._worker = types.SimpleNamespace(ip="192.168.50.10")
+    backend._model_instance = types.SimpleNamespace(
+        ports=[4000], gpu_indexes=None, gpu_type=None, distributed_servers=None
+    )
+    backend._model = types.SimpleNamespace(
+        backend_parameters=["--user-param", "1"],
+        backend_version="cpu",
+        env={},
+        name="custom-model",
+        run_command=None,
+    )
+    backend.inference_backend = InferenceBackend(
+        backend_name="custom-entrypoint-backend",
+        default_version="cpu",
+        default_entrypoint=default_entrypoint,
+        default_run_command=default_run_command,
+        version_configs=VersionConfigDict(
+            root={
+                "cpu": VersionConfig(
+                    image_name="custom/backend:cpu",
+                    entrypoint=version_entrypoint,
+                    custom_framework="cpu",
+                )
+            }
+        ),
+    )
+
+    entrypoint = backend.inference_backend.get_container_entrypoint("cpu")
+    arguments, injected = backend._build_command_args(entrypoint=entrypoint)
+
+    assert entrypoint == expected_entrypoint
+    assert arguments[-2:] == ["--user-param", "1"]
+    assert injected == expected_injected
+
+
+def _gpu_placeholder_backend() -> InferenceBackend:
+    return InferenceBackend(
+        backend_name="gpu-placeholder-backend",
+        default_version="v1",
+        default_run_command="serve {{model_path}} --gpus {{gpu_count}} --gpu-ids {{gpu_ids}} --port {{port}}",
+        version_configs=VersionConfigDict(
+            root={
+                "v1": VersionConfig(
+                    image_name="custom/backend:v1",
+                    custom_framework="cuda",
+                )
+            }
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "gpu_count, gpu_ids, expected_gpus, expected_gpu_ids",
+    [
+        (None, None, "", ""),
+        (0, [], "0", ""),
+        (1, [2], "1", "2"),
+        (3, [0, 1, 2], "3", "0,1,2"),
+    ],
+)
+def test_replace_command_param_substitutes_gpu_placeholders(
+    gpu_count, gpu_ids, expected_gpus, expected_gpu_ids
+):
+    backend = _gpu_placeholder_backend()
+
+    command = backend.replace_command_param(
+        version="v1",
+        model_path="/models/custom",
+        port=4000,
+        gpu_count=gpu_count,
+        gpu_ids=gpu_ids,
+    )
+
+    assert command == (
+        f"serve /models/custom --gpus {expected_gpus} "
+        f"--gpu-ids {expected_gpu_ids} --port 4000"
+    )
+
+
+def test_replace_command_param_substitutes_all_placeholders_together():
+    backend = InferenceBackend(
+        backend_name="all-placeholder-backend",
+        default_version="v1",
+        default_run_command=(
+            "serve {{model_path}} --port {{port}} --served-model-name {{model_name}} "
+            "--host {{worker_ip}} --gpus {{gpu_count}} --gpu-ids {{gpu_ids}}"
+        ),
+        version_configs=VersionConfigDict(
+            root={
+                "v1": VersionConfig(
+                    image_name="custom/backend:v1",
+                    custom_framework="cuda",
+                )
+            }
+        ),
+    )
+
+    command = backend.replace_command_param(
+        version="v1",
+        model_path="/models/custom",
+        port=4000,
+        worker_ip="192.168.50.10",
+        model_name="custom-model",
+        gpu_count=2,
+        gpu_ids=[0, 1],
+    )
+
+    assert command == (
+        "serve /models/custom --port 4000 --served-model-name custom-model "
+        "--host 192.168.50.10 --gpus 2 --gpu-ids 0,1"
+    )
+
+
+@pytest.mark.parametrize(
+    "command, command_args, command_script, expected_command, expected_args",
+    [
+        # No script + non-empty command (vLLM/SGLang main path): merge into
+        # command so the image ENTRYPOINT is fully overridden.
+        (
+            ["vllm", "serve"],
+            ["/models/llm", "--port", "8000"],
+            None,
+            ["vllm", "serve", "/models/llm", "--port", "8000"],
+            None,
+        ),
+        # No script + command is None (vox_box/ascend with no entrypoint):
+        # keep args as-is, must not raise TypeError on None + list.
+        (
+            None,
+            ["vox-box", "start", "--model", "/models/audio"],
+            None,
+            None,
+            ["vox-box", "start", "--model", "/models/audio"],
+        ),
+        # No script + empty command: same as None.
+        ([], ["mindieservice_daemon"], None, None, ["mindieservice_daemon"]),
+        # Script + non-empty command: script becomes entrypoint, command is
+        # prepended to its args.
+        (
+            ["vllm", "serve"],
+            ["/models/llm"],
+            "setup.sh",
+            None,
+            ["vllm", "serve", "/models/llm"],
+        ),
+        # Script + command is None: just pass the args through under the script.
+        (None, ["vox-box", "start"], "setup.sh", None, ["vox-box", "start"]),
+    ],
+)
+def test_override_entrypoint(
+    command, command_args, command_script, expected_command, expected_args
+):
+    result_command, result_args = InferenceServer._override_entrypoint(
+        command, command_args, command_script
+    )
+
+    assert result_command == expected_command
+    assert result_args == expected_args
+
+
+@pytest.mark.parametrize(
+    "arguments, entrypoint, expected_start_index",
+    [
+        # Empty arguments.
+        ([], None, 0),
+        # vLLM/SGLang style: executable carried in command (not args here),
+        # first option marks the start.
+        (["vllm", "serve", "/models/llm", "--port", "8000"], None, 3),
+        # python -m module ...: skip the launcher and module, start at 3.
+        (["python", "-m", "vllm", "--host", "x"], None, 3),
+        # With an explicit container entrypoint, the python -m heuristic is
+        # skipped; the first dash-prefixed token wins ("-m" at index 1).
+        (["python", "-m", "vllm", "--host", "x"], ["llama-server"], 1),
+        # Entrypoint set, model path then first option.
+        (["/models/llm", "--port", "8000"], ["vllm", "serve"], 1),
+        # First token already an option.
+        (["--port", "8000"], None, 0),
+    ],
+)
+def test_get_backend_parameter_start_index(arguments, entrypoint, expected_start_index):
+    assert (
+        InferenceServer._get_backend_parameter_start_index(arguments, entrypoint)
+        == expected_start_index
+    )
+
+
+def _write_adapter_config(path, data) -> str:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "adapter_config.json").write_text(json.dumps(data), encoding="utf-8")
+    return str(path)
+
+
+def _lora(lora_name, path):
+    return types.SimpleNamespace(lora_name=lora_name, path=path)
+
+
+def _arg_value(arguments, key):
+    """Return the value following ``key`` in a flat argument list."""
+    for i, token in enumerate(arguments):
+        if token == key:
+            return arguments[i + 1]
+        if token.startswith(f"{key}="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def test_read_lora_max_rank_basic(tmp_path):
+    adapter = _write_adapter_config(tmp_path / "a", {"r": 64})
+    assert read_lora_max_rank([adapter]) == 64
+
+
+def test_read_lora_max_rank_prefers_rank_pattern(tmp_path):
+    adapter = _write_adapter_config(
+        tmp_path / "a", {"r": 16, "rank_pattern": {"layers.0.attn": 128}}
+    )
+    assert read_lora_max_rank([adapter]) == 128
+
+
+def test_read_lora_max_rank_across_multiple_adapters(tmp_path):
+    a = _write_adapter_config(tmp_path / "a", {"r": 16})
+    b = _write_adapter_config(tmp_path / "b", {"r": 64})
+    assert read_lora_max_rank([a, b]) == 64
+
+
+def test_read_lora_max_rank_missing_or_broken_returns_none(tmp_path):
+    missing = str(tmp_path / "missing")
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "adapter_config.json").write_text("{not json", encoding="utf-8")
+    no_rank = _write_adapter_config(tmp_path / "no_rank", {"base_model_name": "x"})
+    assert read_lora_max_rank([missing, str(broken), no_rank]) is None
+    assert read_lora_max_rank([None, ""]) is None
+
+
+def test_vllm_injects_max_lora_rank(tmp_path):
+    adapter = _write_adapter_config(tmp_path / "a", {"r": 64})
+    arguments = []
+    extend_vllm_mounted_lora_arguments(
+        arguments,
+        [_lora("base:a", adapter)],
+        "base",
+        backend_parameters=None,
+    )
+    assert _arg_value(arguments, "--max-lora-rank") == "64"
+
+
+def test_vllm_rounds_up_to_allowed_choice(tmp_path):
+    adapter = _write_adapter_config(tmp_path / "a", {"r": 24})
+    arguments = []
+    extend_vllm_mounted_lora_arguments(
+        arguments,
+        [_lora("base:a", adapter)],
+        "base",
+        backend_parameters=None,
+    )
+    assert _arg_value(arguments, "--max-lora-rank") == "32"
+
+
+def test_vllm_respects_user_max_lora_rank(tmp_path):
+    adapter = _write_adapter_config(tmp_path / "a", {"r": 64})
+    arguments = []
+    extend_vllm_mounted_lora_arguments(
+        arguments,
+        [_lora("base:a", adapter)],
+        "base",
+        backend_parameters=["--max-lora-rank", "128"],
+    )
+    # User value lives in backend_parameters and is appended later; we must not
+    # inject our own into arguments.
+    assert "--max-lora-rank" not in arguments
+
+
+def test_vllm_skips_when_rank_unreadable(tmp_path):
+    adapter = _write_adapter_config(tmp_path / "a", {"base_model_name": "base"})
+    arguments = []
+    extend_vllm_mounted_lora_arguments(
+        arguments,
+        [_lora("base:a", adapter)],
+        "base",
+        backend_parameters=None,
+    )
+    assert "--max-lora-rank" not in arguments
+
+
+def test_sglang_injects_raw_max_lora_rank(tmp_path):
+    # SGLang has no fixed choice set: the raw max rank is used as-is.
+    adapter = _write_adapter_config(tmp_path / "a", {"r": 24})
+    arguments = []
+    extend_sglang_mounted_lora_arguments(
+        arguments,
+        [_lora("base:a", adapter)],
+        backend_parameters=None,
+    )
+    assert _arg_value(arguments, "--max-lora-rank") == "24"
+
+
+def test_sglang_respects_user_max_lora_rank(tmp_path):
+    adapter = _write_adapter_config(tmp_path / "a", {"r": 64})
+    arguments = []
+    extend_sglang_mounted_lora_arguments(
+        arguments,
+        [_lora("base:a", adapter)],
+        backend_parameters=["--max-lora-rank", "128"],
+    )
+    assert "--max-lora-rank" not in arguments
+
+
+def test_round_up_vllm_lora_rank():
+    assert _round_up_vllm_lora_rank(8) == 8
+    assert _round_up_vllm_lora_rank(24) == 32
+    assert _round_up_vllm_lora_rank(64) == 64
+    assert _round_up_vllm_lora_rank(200) == 256
+    assert _round_up_vllm_lora_rank(1024) == 1024  # beyond known set: pass through
+
+
+def _make_versioned_runner(backend_version, docker_image):
+    """Build a minimal BackendVersionedRunner-shaped stub for _resolve_image."""
+    platform_entry = types.SimpleNamespace(docker_image=docker_image)
+    service_version = types.SimpleNamespace(
+        version="0.10.2", platforms=[platform_entry]
+    )
+    service = types.SimpleNamespace(versions=[service_version])
+    variant = types.SimpleNamespace(services=[service])
+    return types.SimpleNamespace(version=backend_version, variants=[variant])
+
+
+@pytest.mark.parametrize(
+    "runtime_version, expected_image",
+    [
+        # Host runtime matches a runner exactly: pick it.
+        ("12.8", "gpustack/runner:cuda12.8-vllm0.10.2"),
+        # Host runtime lower than every runner: never cross major, fall back to
+        # the newest runner sharing the host major (12.9, not the oldest 12.8).
+        ("12.6", "gpustack/runner:cuda12.9-vllm0.10.2"),
+        # No runner shares the host major: fall back to the oldest available.
+        ("11.5", "gpustack/runner:cuda12.8-vllm0.10.2"),
+        # Host runtime is higher than all: pick the newest that is <= it.
+        ("13.5", "gpustack/runner:cuda13.0-vllm0.10.2"),
+        # Runtime version undetectable: fall back to the latest.
+        (None, "gpustack/runner:cuda13.0-vllm0.10.2"),
+    ],
+)
+def test_resolve_image_fallback_matches_host_major(
+    runtime_version, expected_image, monkeypatch
+):
+    import gpustack.worker.backends.base as base_module
+
+    # gpustack-runner returns backend versions newest-first.
+    runner = types.SimpleNamespace(
+        versions=[
+            _make_versioned_runner("13.0", "gpustack/runner:cuda13.0-vllm0.10.2"),
+            _make_versioned_runner("12.9", "gpustack/runner:cuda12.9-vllm0.10.2"),
+            _make_versioned_runner("12.8", "gpustack/runner:cuda12.8-vllm0.10.2"),
+        ]
+    )
+    # merged_backend_runners takes the override rows positionally, then the filters.
+    monkeypatch.setattr(
+        base_module, "merged_backend_runners", lambda *_, **__: [runner]
+    )
+
+    server = VLLMServer.__new__(VLLMServer)
+    server._model = types.SimpleNamespace(
+        image_name=None, backend="vllm", backend_version=None
+    )
+    server.inference_backend = None
+    server._get_device_info = lambda: ("cuda", runtime_version, None)
+    # The real fetch needs a clientset, and its failure is fatal by design.
+    server._fetch_runner_overrides = lambda: []
+
+    image_name, _ = server._resolve_image()
+    assert image_name == expected_image
+
+
+@pytest.mark.parametrize(
+    "backend_version, expected_service_version, expected_with_deprecated",
+    [
+        # Auto: no version filter, deprecated runners stay hidden.
+        (None, None, False),
+        # Blank version is stored by legacy/migrated data and API clients. It is
+        # shown as "Auto" in the UI and has to resolve like None, not like an
+        # exact version filter that matches no runner.
+        ("", None, False),
+        # An explicit version is still passed through verbatim.
+        ("0.10.2", "0.10.2", True),
+    ],
+)
+def test_resolve_image_treats_blank_backend_version_as_auto(
+    backend_version, expected_service_version, expected_with_deprecated, monkeypatch
+):
+    import gpustack.worker.backends.base as base_module
+
+    captured = {}
+
+    # merged_backend_runners takes the override rows positionally, then the filters.
+    def fake_merged_backend_runners(_overrides, **kwargs):
+        captured.update(kwargs)
+        return [
+            types.SimpleNamespace(
+                versions=[
+                    _make_versioned_runner(
+                        "13.0", "gpustack/runner:cuda13.0-vllm0.10.2"
+                    )
+                ]
+            )
+        ]
+
+    monkeypatch.setattr(
+        base_module, "merged_backend_runners", fake_merged_backend_runners
+    )
+
+    server = VLLMServer.__new__(VLLMServer)
+    server._model = types.SimpleNamespace(
+        image_name=None, backend="vllm", backend_version=backend_version
+    )
+    server.inference_backend = None
+    server._get_device_info = lambda: ("cuda", "13.0", None)
+    # The real fetch needs a clientset, and its failure is fatal by design.
+    server._fetch_runner_overrides = lambda: []
+
+    image_name, _ = server._resolve_image()
+
+    assert image_name == "gpustack/runner:cuda13.0-vllm0.10.2"
+    assert captured["service_version"] == expected_service_version
+    assert captured["with_deprecated"] is expected_with_deprecated
+
+
+class _StubServer(InferenceServer):
+    """Concrete InferenceServer so base methods can be exercised in isolation."""
+
+    def start(self):  # pragma: no cover - not used by these tests
+        raise NotImplementedError
+
+
+@pytest.mark.parametrize(
+    "image,expected",
+    [
+        ("gpustack/runner:cuda12.9-vllm0.10.2", "12.9"),
+        (
+            "registry.example.com/gpustack/runner:cuda12.8-vllm0.10.2-linux-amd64",
+            "12.8",
+        ),
+        (
+            "registry.example.com/cuda11.8/gpustack/runner:cuda12.8-vllm0.10.2-linux-amd64",
+            "12.8",
+        ),
+        ("gpustack/runner:cuda13.0-sglang0.4", "13.0"),
+        ("gpustack/runner:rocm6.2-vllm0.10.2", None),
+        ("myregistry/custom-vllm:latest", None),
+        ("", None),
+    ],
+)
+def test_parse_image_cuda_version(image, expected):
+    assert _parse_image_cuda_version(image) == expected
+
+
+def _make_cuda_compat_server(host_cuda, image, backend="cuda", model_env=None):
+    server = _StubServer.__new__(_StubServer)
+    server._model = types.SimpleNamespace(env=model_env)
+    server._get_device_info = lambda: (backend, host_cuda, None)
+    server._resolve_image = lambda: (image, None)
+    return server
+
+
+@pytest.mark.parametrize(
+    "host_cuda,image,backend,expected",
+    [
+        # Image minor higher than host driver, same major -> route through MVC.
+        ("12.8", "gpustack/runner:cuda12.9-vllm0.10.2", "cuda", True),
+        # Equal minor: cuda-compat is never activated, nothing to do.
+        ("12.8", "gpustack/runner:cuda12.8-vllm0.10.2", "cuda", False),
+        # Host newer than image: plain backward compatibility, nothing to do.
+        ("12.8", "gpustack/runner:cuda12.6-vllm0.10.2", "cuda", False),
+        # Cross major is not MVC-safe; must not trigger.
+        ("12.8", "gpustack/runner:cuda13.0-vllm0.10.2", "cuda", False),
+        # Non-CUDA vendor.
+        ("6.2", "gpustack/runner:rocm6.3-vllm0.10.2", "rocm", False),
+        # Host CUDA version undetected.
+        (None, "gpustack/runner:cuda12.9-vllm0.10.2", "cuda", False),
+        # Custom image whose tag does not encode a CUDA version.
+        ("12.8", "myregistry/custom:latest", "cuda", False),
+    ],
+)
+def test_should_disable_cuda_compat(monkeypatch, host_cuda, image, backend, expected):
+    # This case matrix exercises the version condition; force the opt-in switch on.
+    monkeypatch.setattr("gpustack.envs.ENABLE_CUDA_MINOR_VERSION_COMPATIBILITY", True)
+    server = _make_cuda_compat_server(host_cuda, image, backend)
+    assert server._should_disable_cuda_compat() is expected
+
+
+@pytest.mark.parametrize(
+    "global_enabled,model_env,expected",
+    [
+        # Enabled globally, no model override -> triggers.
+        (True, None, True),
+        # Disabled globally (the default), no model override -> off.
+        (False, None, False),
+        # Model-level override wins over the global default (opt in this model).
+        (False, {_KNOB: "true"}, True),
+        # Model-level override wins over the global default (opt out this model).
+        (True, {_KNOB: "false"}, False),
+    ],
+)
+def test_cuda_compat_switch_is_multi_level(
+    monkeypatch, global_enabled, model_env, expected
+):
+    # Host/image are fixed to a triggering pair so only the switch varies.
+    monkeypatch.setattr(
+        "gpustack.envs.ENABLE_CUDA_MINOR_VERSION_COMPATIBILITY", global_enabled
+    )
+    server = _make_cuda_compat_server(
+        "12.8",
+        "gpustack/runner:cuda12.9-vllm0.10.2",
+        model_env=model_env,
+    )
+    assert server._should_disable_cuda_compat() is expected
+
+
+def _make_host_ipc_server(cache_config=None, model_env=None):
+    server = _StubServer.__new__(_StubServer)
+    server._model = types.SimpleNamespace(env=model_env)
+    server._model_instance = types.SimpleNamespace(cache_config=cache_config)
+    return server
+
+
+@pytest.mark.parametrize(
+    "cache_config,model_env,global_env,expected",
+    [
+        # No shared cache attached -> private /dev/shm (shm_size applies).
+        (None, None, None, False),
+        # Attached and injected -> host IPC for the CUDA-IPC transfer path.
+        (types.SimpleNamespace(injected=True), None, None, True),
+        # Attached but degraded (not injected) -> nothing to transfer.
+        (types.SimpleNamespace(injected=False), None, None, False),
+        # Model env overrides the derivation either way.
+        (
+            types.SimpleNamespace(injected=True),
+            {"GPUSTACK_HOST_IPC": "false"},
+            None,
+            False,
+        ),
+        (None, {"GPUSTACK_HOST_IPC": "true"}, None, True),
+        # Global env overrides the derivation (e.g. PodSecurity clusters)
+        # but yields to the model env.
+        (types.SimpleNamespace(injected=True), None, "false", False),
+        (None, {"GPUSTACK_HOST_IPC": "true"}, "false", True),
+    ],
+)
+def test_host_ipc_follows_cache_attachment(
+    monkeypatch, cache_config, model_env, global_env, expected
+):
+    monkeypatch.setattr("gpustack.envs.HOST_IPC", global_env)
+    server = _make_host_ipc_server(cache_config=cache_config, model_env=model_env)
+    assert server._host_ipc_enabled() is expected
+
+
+def _script_server(should_disable_compat, cache_files=None):
+    server = _StubServer.__new__(_StubServer)
+    server._should_disable_cuda_compat = lambda: should_disable_compat
+    server._model_instance = types.SimpleNamespace(
+        cache_config=(
+            CacheConfigSnapshot(cache_service_id=5, injected=True, files=cache_files)
+            if cache_files
+            else None
+        )
+    )
+    return server
+
+
+def test_serving_command_script_bakes_in_compat_removal():
+    script = _script_server(True)._get_serving_command_script({})
+    assert script is not None
+    assert "rm -rf /usr/local/cuda/compat" in script
+    assert "ldconfig" in script
+    # Non-root containers can't remove compat; the script warns instead of failing silently.
+    assert "Warning: failed to remove /usr/local/cuda/compat" in script
+    assert script.rstrip().endswith('exec "$@"')
+
+
+def test_serving_command_script_writes_cache_injection_files():
+    """A shared cache connector that reads a config file (e.g. Mooncake's
+    MOONCAKE_CONFIG_PATH JSON) gets it written by the serving script
+    before the engine starts, verbatim via a quoted heredoc."""
+    files = {"/tmp/gpustack-mooncake.json": '{"mode": "standalone-store"}'}
+    script = _script_server(False, cache_files=files)._get_serving_command_script({})
+    assert script is not None
+    assert "cat > '/tmp/gpustack-mooncake.json' <<'GPUSTACK_CACHE_FILE_EOF'" in script
+    assert '{"mode": "standalone-store"}' in script
+    assert script.rstrip().endswith('exec "$@"')
+
+
+def test_serving_command_script_none_without_triggers():
+    assert _script_server(False)._get_serving_command_script({}) is None
+    # Explicit opt-out wins even when compat removal was requested.
+    assert (
+        _script_server(True)._get_serving_command_script(
+            {"GPUSTACK_MODEL_SERVING_COMMAND_SCRIPT_DISABLED": "1"}
+        )
+        is None
+    )
+
+
+def test_serving_command_script_pypi_has_no_compat_block():
+    script = _script_server(False)._get_serving_command_script(
+        {"PYPI_PACKAGES_INSTALL": "some-package"}
+    )
+    assert script is not None
+    assert "PYPI_PACKAGES_INSTALL" in script
+    assert "/usr/local/cuda/compat" not in script
+
+
+def test_configured_env_injects_disable_require_only(monkeypatch):
+    monkeypatch.setattr(
+        "gpustack.worker.backends.base.filter_env_vars", lambda _env: {}
+    )
+    server = _StubServer.__new__(_StubServer)
+    server._model = types.SimpleNamespace(env=None)
+    server._should_disable_cuda_compat = lambda: True
+
+    env = server._get_configured_env()
+
+    assert env["NVIDIA_DISABLE_REQUIRE"] == "1"
+    assert "GPUSTACK_DISABLE_CUDA_COMPAT" not in env
+
+
+def test_configured_env_respects_user_override(monkeypatch):
+    monkeypatch.setattr(
+        "gpustack.worker.backends.base.filter_env_vars", lambda _env: {}
+    )
+    server = _StubServer.__new__(_StubServer)
+    # User explicitly pins NVIDIA_DISABLE_REQUIRE; we must not clobber it.
+    server._model = types.SimpleNamespace(env={"NVIDIA_DISABLE_REQUIRE": "0"})
+    server._should_disable_cuda_compat = lambda: True
+
+    env = server._get_configured_env()
+
+    assert env["NVIDIA_DISABLE_REQUIRE"] == "0"
+
+
+def test_configured_env_no_injection_when_not_triggered(monkeypatch):
+    monkeypatch.setattr(
+        "gpustack.worker.backends.base.filter_env_vars", lambda _env: {}
+    )
+    server = _StubServer.__new__(_StubServer)
+    server._model = types.SimpleNamespace(env=None)
+    server._should_disable_cuda_compat = lambda: False
+
+    env = server._get_configured_env()
+
+    assert "NVIDIA_DISABLE_REQUIRE" not in env
+
+
+def _gpu(vendor: str, arch_family=None):
+    return types.SimpleNamespace(vendor=vendor, arch_family=arch_family)
+
+
+@pytest.mark.parametrize(
+    "name, devices, expected",
+    [
+        # The regression this guards: `all()` is vacuously true over nothing,
+        # so a model instance that named no device -- one scheduled by GPU
+        # type rather than by device index -- used to be served as Ascend
+        # 310P, and got `--enforce-eager --dtype float16` injected on top of
+        # whatever accelerator it actually landed on.
+        ("no device selected", [], False),
+        ("single 310P", [_gpu("ascend", "Ascend310P1")], True),
+        (
+            "several 310P",
+            [_gpu("ascend", "Ascend310P1"), _gpu("ascend", "Ascend310P3")],
+            True,
+        ),
+        ("Ascend but not 310P", [_gpu("ascend", "Ascend910B4")], False),
+        ("NVIDIA", [_gpu("nvidia")], False),
+        (
+            "310P mixed with another Ascend generation",
+            [_gpu("ascend", "Ascend310P1"), _gpu("ascend", "Ascend910B4")],
+            False,
+        ),
+    ],
+)
+def test_is_ascend_310p(name, devices, expected):
+    actual = is_ascend_310p(devices)
+    assert actual == expected, f"case {name} expected {expected}, but got {actual}"
+
+
+@pytest.mark.parametrize(
+    "name, devices, expected",
+    [
+        ("no device selected", [], False),
+        ("single Ascend", [_gpu("ascend", "Ascend910B4")], True),
+        (
+            "several Ascend",
+            [_gpu("ascend", "Ascend910B4"), _gpu("ascend", "Ascend310P1")],
+            True,
+        ),
+        ("NVIDIA", [_gpu("nvidia")], False),
+        (
+            "Ascend mixed with NVIDIA",
+            [_gpu("ascend", "Ascend910B4"), _gpu("nvidia")],
+            False,
+        ),
+    ],
+)
+def test_is_ascend(name, devices, expected):
+    actual = is_ascend(devices)
+    assert actual == expected, f"case {name} expected {expected}, but got {actual}"

@@ -1,0 +1,11 @@
+{{- if .Values.server.enabled }}
+apiVersion: v1
+data:
+{{ include "server_config" . | indent 2 }}
+kind: ConfigMap
+metadata:
+  name: server-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "chart_labels" . | indent 4 }}
+{{- end }}

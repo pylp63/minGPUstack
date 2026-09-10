@@ -1,0 +1,5 @@
+gpustack/.git
+gpustack/dist
+gpustack/gpustack/ui
+**/__pycache__
+**/*.pyc

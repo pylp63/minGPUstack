@@ -1,0 +1,246 @@
+# Single Sign-On (SSO) Authentication
+
+GPUStack supports Single Sign-On (SSO) authentication methods such as OIDC, SAML, and CAS. This allows users to log in using their existing credentials from an external identity provider.
+
+## OIDC
+
+Any authentication provider that supports OIDC can be configured. The `email`, `name`, and `picture` claims are used if available. The allowed redirect URI should include `<server-url>/auth/oidc/callback`.
+
+If your OIDC provider uses a certificate issued by a private or corporate CA, see [Additional Trusted CAs](../installation/installation.md#additional-trusted-cas) for how to mount CA certificates into the GPUStack container.
+
+The following CLI flags are available for OIDC configuration:
+
+| <div style="width:180px">Flag</div>                   | Description                                                                                                                                                          |
+|-------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--oidc-issuer`                                       | OIDC issuer URL. OIDC discovery under `<issuer>/.well-known/openid-configuration` will be used to discover the OIDC configuration.                                   |
+| `--oidc-client-id`                                    | OIDC client ID.                                                                                                                                                      |
+| `--oidc-client-secret`                                | OIDC client secret.                                                                                                                                                  |
+| `--oidc-redirect-uri`                                 | The redirect URI configured in your OIDC application. This must be set to `<server-url>/auth/oidc/callback`.                                                         |
+| `--external-auth-name` (Optional)                     | Mapping of OIDC user information to username, e.g., `preferred_username`. By default, the `email` claim is used if available.                                        |
+| `--external-auth-full-name` (Optional)                | Mapping of OIDC user information to user's full name. Multiple elements can be combined, e.g., `name` or `firstName+lastName`. By default, the `name` claim is used. |
+| `--external-auth-avatar-url` (Optional)               | Mapping of OIDC user information to user's avatar URL. By default, the `picture` claim is used if available.                                                         |
+| `--external-auth-default-inactive` (Optional)         | Prevents new SSO users from being activated by default.                                                                                                              |
+| `--external-auth-post-logout-redirect-key` (Optional) | Generic parameter name for post-logout redirection across different IdPs (e.g., Auth0 `returnTo`). Applied to both OIDC and SAML.                                    |
+
+You can also set these options via environment variables instead of CLI flags:
+
+```bash
+GPUSTACK_OIDC_ISSUER="your-oidc-issuer-url"
+GPUSTACK_OIDC_CLIENT_ID="your-client-id"
+GPUSTACK_OIDC_CLIENT_SECRET="your-client-secret"
+GPUSTACK_OIDC_REDIRECT_URI="{your-server-url}/auth/oidc/callback"
+# Optional
+GPUSTACK_EXTERNAL_AUTH_NAME="email"
+GPUSTACK_EXTERNAL_AUTH_FULL_NAME="name"
+GPUSTACK_EXTERNAL_AUTH_AVATAR_URL="picture"
+GPUSTACK_EXTERNAL_AUTH_DEFAULT_INACTIVE="true"
+GPUSTACK_EXTERNAL_AUTH_POST_LOGOUT_REDIRECT_KEY="returnTo"  # e.g., for Auth0
+```
+
+### Example: Integrate with Auth0 OIDC
+
+To configure GPUStack with Auth0 as the OIDC provider:
+
+1. Go to [auth0](https://auth0.com) and create a new application with type `Regular Web Applications`.
+
+![create-oidc-app](../assets/sso/create-oidc-app.png)
+
+2. Get the `Domain`, `Client ID`, and `Client Secret` from the application settings.
+
+![auth0-app](../assets/sso/auth0-app.png)
+
+3. Add `<your-server-url>/auth/oidc/callback` in the Allowed Callback URLs. Adapt the URL to match your server's URL.
+
+4. In Allowed Logout URLs, add `<your-server-url>/` (or your desired post-logout URL).
+
+![auth0-callback](../assets/sso/auth0-callback.png)
+
+Then, run GPUStack with relevant OIDC configuration. The following example uses Docker with CUDA:
+
+```bash
+sudo docker run -d --name gpustack \
+    --restart=unless-stopped \
+    --privileged \
+    --network=host \
+    --volume /var/run/docker.sock:/var/run/docker.sock \
+    --volume gpustack-data:/var/lib/gpustack \
+    --volume /path/to/custom-root-ca.crt:/usr/local/share/ca-certificates/custom-root-ca.crt:ro \
+    --runtime nvidia \
+    -e GPUSTACK_OIDC_ISSUER="https://<your-auth0-domain>" \
+    -e GPUSTACK_OIDC_CLIENT_ID="<your-client-id>" \
+    -e GPUSTACK_OIDC_CLIENT_SECRET="<your-client-secret>" \
+    -e GPUSTACK_OIDC_REDIRECT_URI="<your-server-url>/auth/oidc/callback" \
+    gpustack/gpustack
+```
+
+!!! note
+
+    The custom CA certificate mount is only required when your OIDC provider is signed by a private CA. Public OIDC providers such as Auth0 typically do not require it.
+
+## SAML
+
+GPUStack supports SAML authentication for Single Sign-On (SSO). This allows users to log in using their existing credentials from an external identity provider that supports SAML.
+
+The following CLI flags are available for SAML configuration:
+
+| <div style="width:180px">Flag</div>           | Description                                                                                                                                                                                                                                                    |
+|-----------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--saml-idp-server-url`                       | SAML Identity Provider server URL.                                                                                                                                                                                                                             |
+| `--saml-idp-entity-id`                        | SAML Identity Provider entity ID.                                                                                                                                                                                                                              |
+| `--saml-idp-x509-cert`                        | SAML Identity Provider X.509 certificate.                                                                                                                                                                                                                      |
+| `--saml-sp-entity-id`                         | SAML Service Provider entity ID.                                                                                                                                                                                                                               |
+| `--saml-sp-acs-url`                           | SAML Service Provider Assertion Consumer Service URL. It should be set to `<gpustack-server-url>/auth/saml/callback`.                                                                                                                                          |
+| `--saml-sp-x509-cert`                         | SAML Service Provider X.509 certificate.                                                                                                                                                                                                                       |
+| `--saml-sp-private-key`                       | SAML Service Provider private key.                                                                                                                                                                                                                             |
+| `--saml-idp-logout-url` (Optional)            | SAML Identity Provider Single Logout endpoint URL.                                                                                                                                                                                                             |
+| `--saml-sp-slo-url` (Optional)                | SAML Service Provider Single Logout Service callback URL (e.g., `<server-url>/auth/saml/logout/callback`).                                                                                                                                                     |
+| `--saml-sp-attribute-prefix` (Optional)       | SAML Service Provider attribute prefix, which is used for fetching the attributes that are specified by --external-auth-\*. e.g., 'http://schemas.auth0.com/'.                                                                                                 |
+| `--saml-security` (Optional)                  | SAML security settings in JSON format.                                                                                                                                                                                                                         |
+| `--external-auth-name` (Optional)             | Mapping of SAML user information to username. You must configure the full attribute name like 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress' or simplify with 'emailaddress' by '--saml-sp-attribute-prefix'.                            |
+| `--external-auth-full-name` (Optional)        | Mapping of SAML user information to user's full name. Multiple elements can be combined. You must configure the full attribute name like 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name' or simplify with 'name' by '--saml-sp-attribute-prefix'. |
+| `--external-auth-avatar-url` (Optional)       | Mapping of SAML user information to user's avatar URL. You must configure the full attribute name like 'http://schemas.auth0.com/picture' or simplify with 'picture' by '--saml-sp-attribute-prefix'.                                                          |
+| `--external-auth-default-inactive` (Optional) | Prevents new SSO users from being activated by default.                                                                                                                                                                                                        |
+
+You can also set these options via environment variables instead of CLI flags:
+
+```bash
+GPUSTACK_SAML_IDP_SERVER_URL="https://idp.example.com"
+GPUSTACK_SAML_IDP_ENTITY_ID="your-idp-entity-id"
+GPUSTACK_SAML_IDP_X509_CERT="your-idp-x509-cert"
+GPUSTACK_SAML_SP_ENTITY_ID="your-sp-entity-id"
+GPUSTACK_SAML_SP_ACS_URL="{your-server-url}/auth/saml/callback"
+GPUSTACK_SAML_SP_X509_CERT="your-sp-x509-cert"
+GPUSTACK_SAML_SP_PRIVATE_KEY="your-sp-private-key"
+# Optional
+GPUSTACK_SAML_SP_ATTRIBUTE_PREFIX="http://schemas.auth0.com/"
+GPUSTACK_SAML_SECURITY="{}"
+GPUSTACK_EXTERNAL_AUTH_NAME="emailaddress"
+GPUSTACK_EXTERNAL_AUTH_FULL_NAME="name"
+GPUSTACK_EXTERNAL_AUTH_AVATAR_URL="picture"
+GPUSTACK_EXTERNAL_AUTH_DEFAULT_INACTIVE="true"
+GPUSTACK_SAML_IDP_LOGOUT_URL="https://idp.example.com/saml/slo"  # if IdP supports SLO
+GPUSTACK_SAML_SP_SLO_URL="{your-server-url}/auth/saml/logout/callback"
+GPUSTACK_EXTERNAL_AUTH_POST_LOGOUT_REDIRECT_KEY="returnTo"  # optional, adds a post-logout parameter for compatible IdPs
+```
+
+### Example: Integrate with Auth0 SAML
+
+To configure GPUStack with Auth0 as the SAML provider:
+
+1. Go to [auth0](https://auth0.com) and create a new application with type `Regular Web Applications`.
+
+![create-saml-app](../assets/sso/create-saml-app.png)
+
+2. Get the `Domain` from the application settings and add `<your-server-url>/auth/saml/callback` in the Allowed Callback URLs. Adapt the URL to match your server's URL.
+
+![auth0-saml-callback](../assets/sso/auth0-saml-callback.png)
+
+3. In **Advanced Settings → Certificates**, copy the IdP `X.509 Certificate`.
+
+![auth0-saml-cert](../assets/sso/auth0-saml-cert.png)
+
+4. In **Endpoints** tab, find the `SAML Protocol URL`, which is your IdP server URL.
+
+![auth0-saml-url](../assets/sso/auth0-saml-url.png)
+
+5. Generate SP certificate and private key:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -keyout myservice.key -out myservice.cert -days 365 -nodes -subj "/CN=myservice.example.com"
+```
+
+!!! note
+
+    myservice.cert and myservice.key will be used for the SP configuration.
+
+6. Run GPUStack with relevant SAML configuration. The following example uses Docker with CUDA:
+
+```bash
+SP_CERT="$(cat myservice.cert)"
+SP_PRIVATE_KEY="$(cat myservice.key)"
+SP_ATTRIBUTE_PREFIX="http://schemas.auth0.com/"
+
+sudo docker run -d --name gpustack \
+    --restart=unless-stopped \
+    --privileged \
+    --network=host \
+    --volume /var/run/docker.sock:/var/run/docker.sock \
+    --volume gpustack-data:/var/lib/gpustack \
+    --runtime nvidia \
+    -e GPUSTACK_SAML_IDP_SERVER_URL="<auth0-saml-protocol-url>" \
+    -e GPUSTACK_SAML_IDP_ENTITY_ID="urn:<auth0-domain>" \
+    -e GPUSTACK_SAML_IDP_X509_CERT="<auth0-x509-cert>" \
+    -e GPUSTACK_SAML_SP_ENTITY_ID="urn:gpustack:sp" \
+    -e GPUSTACK_SAML_SP_ACS_URL="<your-gpustack-server-url>/auth/saml/callback" \
+    -e GPUSTACK_SAML_SP_X509_CERT="$SP_CERT" \
+    -e GPUSTACK_SAML_SP_PRIVATE_KEY="$SP_PRIVATE_KEY" \
+    -e GPUSTACK_SAML_SP_ATTRIBUTE_PREFIX="$SP_ATTRIBUTE_PREFIX" \
+    -e GPUSTACK_SAML_IDP_LOGOUT_URL="<idp-slo-url-if-available>" \
+    -e GPUSTACK_SAML_SP_SLO_URL="<your-gpustack-server-url>/auth/saml/logout/callback" \
+    -e GPUSTACK_EXTERNAL_AUTH_POST_LOGOUT_REDIRECT_KEY="returnTo" \
+    gpustack/gpustack
+```
+
+!!! note
+
+    Not all IdPs provide standard SAML Single Logout (SLO). Auth0 SAML connections commonly do not expose `singleLogoutService`. If unavailable, GPUStack will still clear local sessions on logout; for full browser sign-out with Auth0, consider using its OIDC `v2/logout` with `client_id` and `returnTo` allowed.
+
+## CAS
+
+!!! note
+
+    Modern Apereo CAS servers ship modules for OIDC and SAML2 alongside the native CAS protocol. If your CAS server has either enabled, you can also wire it up via the [OIDC](#oidc) or [SAML](#saml) section above — capability is the same; pick whichever matches what your server actually exposes. The native CAS protocol below is the right choice when only CAS is available (common in older Apereo / education / government deployments) or when you want the smallest integration surface.
+
+GPUStack supports CAS (Central Authentication Service) protocol versions 2.0 and 3.0. The login flow redirects the browser to `<cas-server-url>/login?service=<gpustack-callback>`; on success, GPUStack exchanges the returned service ticket via the standard `/serviceValidate` endpoint and provisions the user from the XML response. The callback URL registered with the CAS server should point to `<server-url>/auth/cas/callback`.
+
+CAS responses are parsed with or without the `cas:` XML namespace, so most servers in the wild work without extra tuning. CAS Single Sign-Out is wired into `/auth/logout` and sends the browser to `<cas-server-url>/logout?service=<server-external-url>` when the active session originated from CAS.
+
+The following CLI flags are available for CAS configuration:
+
+| <div style="width:200px">Flag</div>           | Description                                                                                                                                                                                |
+|-----------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--cas-server-url`                            | CAS server base URL, e.g., `https://cas.example.com/cas`. Setting this enables CAS login.                                                                                                  |
+| `--cas-callback-url` (Optional)               | CAS callback URL registered with the CAS server. Defaults to `<server-url>/auth/cas/callback` at request time when unset.                                                                  |
+| `--cas-validate-endpoint` (Optional)          | CAS ticket validation endpoint, relative to `--cas-server-url`. Default: `/p3/serviceValidate` (CAS 3.0, returns user attributes). Use `/serviceValidate` only when targeting a pre-CAS-3.0 server. |
+| `--cas-username-attribute` (Optional)         | CAS XML attribute name to use as the GPUStack username. Defaults to the CAS `cas:user` element when unset.                                                                                 |
+| `--cas-full-name-attribute` (Optional)        | CAS XML attribute name to use as the user's full name, e.g., `displayName`. Falls back to a `displayName` attribute if present, otherwise the username.                                    |
+| `--cas-avatar-attribute` (Optional)           | CAS XML attribute name to use as the user's avatar URL.                                                                                                                                    |
+| `--external-auth-default-inactive` (Optional) | Prevents new SSO users from being activated by default.                                                                                                                                    |
+
+You can also set these options via environment variables instead of CLI flags:
+
+```bash
+GPUSTACK_CAS_SERVER_URL="https://cas.example.com/cas"
+# Optional
+GPUSTACK_CAS_CALLBACK_URL="{your-server-url}/auth/cas/callback"
+GPUSTACK_CAS_VALIDATE_ENDPOINT="/p3/serviceValidate"
+GPUSTACK_CAS_USERNAME_ATTRIBUTE="uid"
+GPUSTACK_CAS_FULL_NAME_ATTRIBUTE="displayName"
+GPUSTACK_CAS_AVATAR_ATTRIBUTE=""
+GPUSTACK_EXTERNAL_AUTH_DEFAULT_INACTIVE="true"
+```
+
+### Example: Integrate with an Apereo CAS server
+
+1. Register GPUStack as a service on the CAS server with `serviceId` matching `<your-server-url>/auth/cas/callback`. Allow the attributes you intend to map (e.g., `uid`, `displayName`).
+
+2. Run GPUStack with the CAS configuration. The following example uses Docker with CUDA:
+
+```bash
+sudo docker run -d --name gpustack \
+    --restart=unless-stopped \
+    --privileged \
+    --network=host \
+    --volume /var/run/docker.sock:/var/run/docker.sock \
+    --volume gpustack-data:/var/lib/gpustack \
+    --runtime nvidia \
+    -e GPUSTACK_SERVER_EXTERNAL_URL="https://gpustack.example.com" \
+    -e GPUSTACK_CAS_SERVER_URL="https://cas.example.com/cas" \
+    -e GPUSTACK_CAS_USERNAME_ATTRIBUTE="uid" \
+    -e GPUSTACK_CAS_FULL_NAME_ATTRIBUTE="displayName" \
+    gpustack/gpustack
+```
+
+!!! note
+
+    If your CAS server uses a certificate issued by a private or corporate CA, see [Additional Trusted CAs](../installation/installation.md#additional-trusted-cas) for how to mount CA certificates into the GPUStack container.

@@ -1,0 +1,231 @@
+from typing import Optional, Tuple
+
+from kubernetes_asyncio import client
+
+from gpustack.schemas.principals import (
+    PLATFORM_PRINCIPAL_NAME,
+    Principal,
+    PrincipalType,
+)
+
+from gpustack.schemas import (
+    GPUInstancePersistentVolume,
+    GPUInstancePersistentVolumeType,
+)
+
+
+def _hoist_meta(spec: dict, owner) -> dict:
+    """Hoist row-level ``display_name`` / ``description`` into ``spec``.
+
+    The Python schemas keep these on the SQLModel row (mirroring the
+    table columns), but the Go CRDs declare them on the resource's
+    ``spec``. Each CRD-bound dict_* function calls this so the on-wire
+    payload matches the Go shape.
+    """
+    if getattr(owner, "display_name") is not None:
+        spec["displayName"] = owner.display_name
+    if getattr(owner, "description") is not None:
+        spec["description"] = owner.description
+    return spec
+
+
+def spec_persistent_volume(pv: GPUInstancePersistentVolume) -> dict:
+    """Convert a :class:`GPUInstancePersistentVolume` row into the dict
+    shape expected by the ``worker.gpustack.ai/v1`` InstancePersistentVolume
+    CRD's ``spec`` field, suitable for handing to
+    :meth:`ClusterOps.create_persistent_volume`.
+
+    Only ``displayName`` / ``description`` need a hoist; the rest of the
+    spec (``type``, ``capacity``) already lines up with the Go schema
+    once camelCase aliases are applied.
+    """
+    spec = pv.spec.model_dump(by_alias=True, exclude_none=True)
+    _hoist_meta(spec, pv)
+    return spec
+
+
+def spec_persistent_volume_type(
+    pvt: GPUInstancePersistentVolumeType, principal_name: str
+) -> dict:
+    """Convert a :class:`GPUInstancePersistentVolumeType` row into the
+    dict shape expected by the ``worker.gpustack.ai/v1``
+    InstancePersistentVolumeType CRD's ``spec`` field, suitable for
+    handing to :meth:`ClusterOps.create_persistent_volume_type`.
+
+    ``displayName`` / ``description`` are hoisted from the row, and for
+    NFS/S3-family specs the per-PVC path isolation suffix is applied
+    (二开: 按 ``driver`` 字段判断, 不再依赖固定 nfs/s3 子结构).
+    """
+    spec = pvt.spec.model_dump(by_alias=True, exclude_none=True)
+    _hoist_meta(spec, pvt)
+    _inject_path_isolation(spec, principal_name)
+    return spec
+
+
+PREFIX = "gpustack"
+SUFFIX = "${pvc.metadata.name}"
+
+
+def _inject_path_isolation(spec: dict, principal_name: str) -> dict:
+    """Ensure per-PVC path isolation, keyed off the storage ``driver``.
+
+    二开: spec 是自由结构 (``driver`` + 任意键). 仅对已知需要路径隔离
+    的 driver 生效; 未知 driver 原样透传, 由其 operator/CSI 自行处理.
+    """
+    driver = str(spec.get("driver") or "").lower()
+
+    if driver == "nfs":
+        # Preserve user prefix while ensuring every PVC gets a unique leaf path.
+        current = spec.get("subDirectory")
+        if current:
+            spec["subDirectory"] = f"{str(current).rstrip('/')}/{principal_name}/{SUFFIX}"
+        else:
+            spec["subDirectory"] = f"{principal_name}/{SUFFIX}"
+        return spec
+
+    if driver == "s3":
+        current = spec.get("bucket")
+        if current:
+            spec["prefix"] = f"{principal_name}/{SUFFIX}"
+        else:
+            spec["bucket"] = principal_name
+            spec["prefix"] = SUFFIX
+        return spec
+
+    # Unknown / custom driver: pass through untouched.
+    return spec
+
+
+def get_k8s_client_config(
+    server_api_port: int,
+    cluster_id: int,
+    cluster_registration_token: str,
+) -> client.Configuration:
+    api_config = client.Configuration(
+        host=f"http://localhost:{server_api_port}/v2/clusters/{cluster_id}/proxy",
+        api_key={
+            "BearerToken": cluster_registration_token,
+        },
+        api_key_prefix={
+            "BearerToken": "Bearer",
+        },
+    )
+    api_config.verify_ssl = False
+    return api_config
+
+
+def get_k8s_client(
+    server_api_port: int,
+    cluster_id: int,
+    cluster_registration_token: str,
+) -> client.api_client.ApiClient:
+    api_config = get_k8s_client_config(
+        server_api_port, cluster_id, cluster_registration_token
+    )
+    api = client.api_client.ApiClient(configuration=api_config)
+    api.user_agent = "gpustack/gpustack"
+    return api
+
+
+def principal_namespace_identifier(principal: Principal) -> str:
+    """Stable per-principal identifier that derives the k8s namespace
+    (and the PVT name / NFS subdir / S3 prefix that hang off it).
+
+    USER principals key off ``user-<id>`` rather than their ``name``:
+    - A USER ``name`` is a login identifier (often an email) that is not
+      a valid RFC 1123 namespace label, and — since USER and ORG no
+      longer share a name partition — may collide with a same-named Org.
+    - The ``user-<id>`` form is reserved against Org names (see
+      ``personal_name_pattern``), is numeric-stable across renames, and
+      is always a valid k8s label.
+    ORG / platform principals use their (already URL-safe) ``name``.
+    """
+    if principal.kind == PrincipalType.USER:
+        return f"user-{principal.id}"
+    return principal.name
+
+
+DEFAULT_SYSTEM_NAMESPACE = "gpustack-system"
+"""Namespace a cluster's own GPUStack components (operator, workers) live in
+when its ``k8s_options.namespace`` is unset — the same fallback the manifest
+renderer applies, mirrored here because the CRD client resolves the namespace
+of system-scoped resources without going through a render.
+"""
+
+
+def get_namespace_name(
+    principal_identifier: Optional[str] = None,
+) -> str:
+    """
+    Get the Kubernetes Namespace name for the given principal identifier
+    (see :func:`principal_namespace_identifier`).
+    """
+
+    if principal_identifier is None:
+        principal_identifier = PLATFORM_PRINCIPAL_NAME
+
+    return f"{PREFIX}-{principal_identifier}"
+
+
+def parse_namespace_name(
+    namespace_name: str,
+) -> Optional[str]:
+    """
+    Parse the principal name from the given Kubernetes Namespace name.
+
+    Returns the principal name if the name is valid, or None if it is not.
+    """
+
+    if not namespace_name.startswith(f"{PREFIX}-"):
+        return None
+
+    parts = namespace_name.split("-")
+    if len(parts) < 2:
+        return None
+
+    if parts[0] != PREFIX:
+        return None
+
+    # {principal_name}
+    return "-".join(parts[1:])
+
+
+def get_persistent_volume_type_name(
+    name: str,
+    principal_identifier: Optional[str] = None,
+) -> str:
+    """
+    Get the GPUStack-Operator InstancePersistentVolumeType name for
+    the given GPU instance persistent volume type name and principal
+    identifier.
+    """
+
+    if principal_identifier is None:
+        principal_identifier = PLATFORM_PRINCIPAL_NAME
+
+    return f"{PREFIX}.{principal_identifier}.{name}"
+
+
+def parse_persistent_volume_type_name(
+    persistent_volume_type_name: str,
+) -> Optional[Tuple[str, str]]:
+    """
+    Parse the GPU instance persistent volume type name from the given
+    GPUStack-Operator InstancePersistentVolumeType name.
+
+    Returns a tuple of (name, principal_name) if the name is valid,
+    or None if it is not.
+    """
+
+    if not persistent_volume_type_name.startswith(f"{PREFIX}."):
+        return None
+
+    parts = persistent_volume_type_name.split(".")
+    if len(parts) < 3:
+        return None
+
+    if parts[0] != PREFIX:
+        return None
+
+    # {name}, {principal_name}
+    return ".".join(parts[2:]), parts[1]

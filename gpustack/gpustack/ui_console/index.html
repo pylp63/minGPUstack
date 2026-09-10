@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPUStack 控制台 — GPU 服务器申请 / 审批 / 组织</title>
+<style>
+  :root { --fg:#1f2328; --muted:#656d76; --border:#d0d7de; --bg:#f6f8fa; --card:#fff; --accent:#0969da; --ok:#1a7f37; --warn:#9a6700; --err:#cf222e; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; color:var(--fg); background:var(--bg); }
+  header { background:var(--card); border-bottom:1px solid var(--border); padding:12px 24px; display:flex; align-items:center; gap:14px; position:sticky; top:0; z-index:5; }
+  header h1 { font-size:16px; margin:0; }
+  header .spacer { flex:1; }
+  .tag { font-size:12px; padding:2px 10px; border-radius:999px; background:#ddf4ff; color:#0969da; }
+  main { max-width:1100px; margin:24px auto; padding:0 16px; display:grid; gap:20px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:18px 20px; }
+  .card h2 { font-size:14px; margin:0 0 12px; color:var(--muted); font-weight:600; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); vertical-align:middle; }
+  th { color:var(--muted); font-weight:600; white-space:nowrap; }
+  tr:last-child td { border-bottom:none; }
+  .status { display:inline-block; padding:1px 10px; border-radius:999px; font-size:12px; }
+  .status.pending { background:#fff8c5; color:var(--warn); }
+  .status.approved { background:#dafbe1; color:var(--ok); }
+  .status.rejected { background:#ffebe9; color:var(--err); }
+  .status.cancelled { background:#eaeef2; color:var(--muted); }
+  button { font:inherit; border-radius:6px; border:1px solid var(--border); background:var(--card); color:var(--fg); padding:5px 14px; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.ok { background:var(--ok); border-color:var(--ok); color:#fff; }
+  button.danger { background:var(--err); border-color:var(--err); color:#fff; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  button.link { border:none; background:none; color:var(--accent); padding:2px 6px; }
+  input, select, textarea { font:inherit; border:1px solid var(--border); border-radius:6px; padding:6px 10px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .grow { flex:1; }
+  .muted { color:var(--muted); }
+  .badge { background:#cf222e; color:#fff; border-radius:999px; font-size:11px; padding:0 7px; margin-left:6px; }
+  .empty { text-align:center; color:var(--muted); padding:26px 0; }
+  .toast { position:fixed; bottom:20px; right:20px; background:#24292f; color:#fff; border-radius:8px; padding:10px 16px; font-size:13px; opacity:.95; z-index:50; }
+  dialog { border:1px solid var(--border); border-radius:10px; padding:0; width:min(560px, 92vw); }
+  dialog::backdrop { background:rgba(0,0,0,.35); }
+  dialog .body { padding:18px 20px; }
+  dialog h3 { margin:0 0 12px; font-size:15px; }
+  label { display:block; font-size:12px; color:var(--muted); margin:10px 0 4px; }
+  .kv { font-size:12px; color:var(--muted); }
+  .tabs { display:flex; gap:4px; border-bottom:1px solid var(--border); margin-bottom:14px; }
+  .tabs button { border:none; background:none; border-bottom:2px solid transparent; border-radius:0; padding:8px 14px; color:var(--fg); }
+  .tabs button.active { border-bottom-color:var(--accent); color:var(--accent); }
+  .role { display:inline-block; padding:1px 10px; border-radius:999px; font-size:12px; background:#ddf4ff; color:#0969da; }
+  .role.owner { background:#dafbe1; color:var(--ok); }
+  .panel { border:1px solid var(--border); border-radius:8px; padding:14px 16px; margin-bottom:12px; background:var(--card); }
+  .panel .head { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+  .panel .head b { font-size:14px; }
+  .sub { font-size:12px; }
+  .chips { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
+  .chip { font-size:12px; border:1px solid var(--border); border-radius:999px; padding:1px 10px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>GPUStack 控制台</h1>
+  <span class="tag" id="whoami"></span>
+  <span class="spacer"></span>
+  <a href="/" style="font-size:13px;color:var(--accent);text-decoration:none">← 返回主界面</a>
+</header>
+<main>
+
+  <section class="card" id="sec-requests">
+    <h2>GPU 服务器申请</h2>
+    <div id="request-form" style="margin-bottom:16px">
+      <div class="row">
+        <input id="f-count" type="number" min="1" max="1024" value="1" style="width:110px" title="申请 GPU 服务器数量 (整机)">
+        <input id="f-model" class="grow" placeholder="打算运行的模型 (可选), 如 Qwen2.5-7B">
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input id="f-reason" class="grow" placeholder="用途说明 (可选, 如: 跑大模型训练 / 推理服务)">
+        <button class="primary" onclick="submitRequest()">提交申请</button>
+      </div>
+    </div>
+    <table id="t-requests">
+      <thead><tr><th>ID</th><th>数量</th><th>模型</th><th>用途</th><th>状态</th><th>获批配额</th><th>管理员备注</th><th>时间</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section class="card" id="sec-admin" style="display:none">
+    <div class="tabs" id="tabs-bar">
+      <button class="active" data-tab="pending" onclick="switchTab('pending')">待审批</button>
+      <button data-tab="workers" onclick="switchTab('workers')">节点授权</button>
+          </div>
+
+    <div id="tab-pending">
+      <table id="t-pending">
+        <thead><tr><th>用户</th><th>数量</th><th>模型</th><th>用途</th><th>时间</th><th style="width:280px">操作</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div id="tab-workers" style="display:none">
+      <div class="row" style="margin-bottom:12px">
+        <select id="w-worker" class="grow"></select>
+        <select id="w-user" class="grow"></select>
+        <button class="primary" onclick="grantWorker()">开放节点给该用户</button>
+      </div>
+      <div class="row" style="margin-bottom:12px">
+        <select id="w-worker-grp" class="grow"></select>
+        <select id="w-group" class="grow"></select>
+        <button class="primary" onclick="grantWorkerToGroup()">开放节点给该用户组</button>
+      </div>
+      <table id="t-grants">
+        <thead><tr><th>节点</th><th>对象</th><th>类型</th><th>授权时间</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card" id="sec-groups" style="display:none">
+    <h2>用户组</h2>
+    <div class="row" style="margin-bottom:12px">
+      <input id="g-name" placeholder="用户组标识 (英文), 如 ml-team" style="width:220px">
+      <input id="g-desc" class="grow" placeholder="说明 (可选), 如 算法团队">
+      <button class="primary" onclick="createGroup()">创建用户组</button>
+    </div>
+    <div id="group-list"></div>
+  </section>
+
+  <section class="card" id="sec-notifications">
+    <h2>我的通知 <span class="badge" id="n-unread" style="display:none"></span></h2>
+    <div class="row" style="margin-bottom:10px">
+      <button onclick="markAllRead()">全部已读</button>
+      <span class="muted" style="font-size:12px">申请提交 / 审批结果 / 节点授权都会在这里通知</span>
+    </div>
+    <table id="t-notifs"><thead><tr><th style="width:170px">时间</th><th>内容</th><th></th></tr></thead><tbody></tbody></table>
+  </section>
+
+</main>
+
+<dialog id="dlg-member">
+  <form class="body" method="dialog">
+    <h3 id="m-title">用户组成员</h3>
+    <div class="row" style="margin-bottom:12px">
+      <select id="m-user" class="grow"></select>
+      <button class="primary" type="button" onclick="addGroupMember()">添加成员</button>
+    </div>
+    <table id="t-members">
+      <thead><tr><th>成员</th><th>加入时间</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="row" style="margin-top:14px;justify-content:flex-end">
+      <button value="cancel">关闭</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-approve">
+  <form class="body" method="dialog">
+    <h3>批准 GPU 服务器申请</h3>
+    <label>批准的服务器数量配额</label>
+    <input id="a-count" type="number" min="0" max="1024" style="width:140px">
+    <label>备注 (用户可见)</label>
+    <input id="a-comment" style="width:100%">
+    <div class="row" style="margin-top:16px;justify-content:flex-end">
+      <button value="cancel">取消</button>
+      <button class="ok" value="ok" onclick="doApprove()">批准</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-reject">
+  <form class="body" method="dialog">
+    <h3>驳回 GPU 服务器申请</h3>
+    <label>驳回原因 (用户可见)</label>
+    <input id="r-comment" style="width:100%">
+    <div class="row" style="margin-top:16px;justify-content:flex-end">
+      <button value="cancel">取消</button>
+      <button class="danger" value="ok" onclick="doReject()">驳回</button>
+    </div>
+  </form>
+</dialog>
+
+
+
+<script>
+const API = '/v2';
+let ME = null, IS_ADMIN = false;
+let approveId = null, rejectId = null, membersOrgId = null;
+
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function api(path, opts = {}) {
+  const res = await fetch(API + path, {
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  if (res.status === 401) { location.href = '/login?redirect=' + encodeURIComponent('/console/'); throw new Error('unauthorized'); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.message || res.statusText);
+  return data;
+}
+
+function toast(msg) {
+  const el = document.createElement('div');
+  el.className = 'toast'; el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 2600);
+}
+
+const fmtTime = (t) => t ? new Date(t).toLocaleString('zh-CN', {hour12:false}) : '—';
+
+async function init() {
+  // embed 模式: 被主界面 iframe 嵌入 (?embed=1). tab 参数定位初始视图
+  //   orgs(默认)=组织管理, requests=GPU 服务器申请, approvals=审批
+  const qs = new URLSearchParams(location.search);
+  const EMBED = qs.get('embed') === '1';
+  const TAB = qs.get('tab') || '';
+  try { ME = await api('/users/me'); } catch (e) { return; }
+  IS_ADMIN = !!ME.is_admin;
+  $('#whoami').textContent = ME.username + (IS_ADMIN ? ' · 管理员' : '');
+  // 管理员不需要申请区块 (申请是普通用户的动作, 管理员只需审批 + 节点授权)
+  if (IS_ADMIN) $('#sec-requests').style.display = 'none';
+  if (EMBED) {
+    // 隐藏页面 header 与外边距, 与主界面无缝融合
+    document.querySelector('header').style.display = 'none';
+    document.querySelector('main').style.margin = '0';
+    document.querySelector('main').style.maxWidth = 'none';
+    document.querySelector('main').style.padding = '0';
+    document.body.style.background = 'transparent';
+    // 普通用户嵌入时只显示申请视图 (隐藏 admin 区)
+    if (!IS_ADMIN) { $('#sec-admin').style.display = 'none'; }
+    else {
+      $('#sec-admin').style.display = '';
+      if (TAB === 'groups') {
+        // 用户组独立视图: 只显示用户组管理, 隐藏申请/审批/节点授权/通知
+        $('#sec-requests').style.display = 'none';
+        $('#sec-notifications').style.display = 'none';
+        $('#sec-admin').style.display = 'none';
+        $('#sec-groups').style.display = '';
+        loadGroupList();
+      } else {
+        switchTab('pending');
+      }
+    }
+  }
+  if (IS_ADMIN && TAB !== 'groups') $('#sec-admin').style.display = '';
+  // 管理员不需要「GPU 服务器申请」板块 — 申请是普通用户的功能, admin 只做审批
+  if (IS_ADMIN) { $('#sec-requests').style.display = 'none'; }
+  await refreshAll();
+  if (IS_ADMIN) { loadWorkerOpts(); loadUserOpts(); loadGroups(); }
+  setInterval(refreshAll, 15000);
+}
+
+async function refreshAll() {
+  await Promise.all([loadRequests(), loadNotifs().then(renderUnreadBadge)]);
+  if (IS_ADMIN) { loadPending(); loadGrants(); }
+}
+
+/* ---------- GPU 申请 ---------- */
+
+async function loadRequests() {
+  const data = await api('/gpu-requests?perPage=50');
+  const tb = $('#t-requests tbody');
+  tb.innerHTML = data.items.length ? data.items.map(r => `
+    <tr>
+      <td>#${r.id}</td>
+      <td><b>${r.requested_gpu_count}</b> 台</td>
+      <td>${esc(r.model_name || '—')}</td>
+      <td>${esc(r.reason || '—')}</td>
+      <td><span class="status ${r.status}">${{pending:'待审批',approved:'已批准',rejected:'已驳回',cancelled:'已取消'}[r.status]||r.status}</span></td>
+      <td>${r.granted_gpu_count ?? '—'}</td>
+      <td>${esc(r.admin_comment || '—')}</td>
+      <td class="kv">${fmtTime(r.created_at)}</td>
+      <td>${r.status==='pending' && !IS_ADMIN ? `<button class="danger" onclick="cancelRequest(${r.id})">取消</button>` : ''}</td>
+    </tr>`).join('') : '<tr><td colspan="9" class="empty">还没有申请记录</td></tr>';
+}
+
+async function submitRequest() {
+  try {
+    await api('/gpu-requests', { method:'POST', body: JSON.stringify({
+      requested_gpu_count: parseInt($('#f-count').value || '1'),  // 整机数量 (1台=该服务器全部GPU)
+      model_name: $('#f-model').value || null,
+      reason: $('#f-reason').value || null,
+    })});
+    toast('申请已提交, 管理员已收到通知');
+    $('#f-reason').value = '';
+    loadRequests();
+  } catch (e) { toast('提交失败: ' + e.message); }
+}
+
+async function cancelRequest(id) {
+  if (!confirm('取消这条申请?')) return;
+  try { await api(`/gpu-requests/${id}`, {method:'DELETE'}); toast('已取消'); loadRequests(); }
+  catch (e) { toast('取消失败: ' + e.message); }
+}
+
+/* ---------- admin: 待审批 ---------- */
+
+async function loadPending() {
+  const data = await api('/gpu-requests?status=pending&perPage=50');
+  const tb = $('#t-pending tbody');
+  tb.innerHTML = data.items.length ? data.items.map(r => `
+    <tr>
+      <td><b>${esc(r.username)}</b></td>
+      <td><b>${r.requested_gpu_count}</b> 台</td>
+      <td>${esc(r.model_name || '—')}</td>
+      <td>${esc(r.reason || '—')}</td>
+      <td class="kv">${fmtTime(r.created_at)}</td>
+      <td class="row">
+        <button class="ok" onclick="openApprove(${r.id}, ${r.requested_gpu_count})">批准…</button>
+        <button class="danger" onclick="openReject(${r.id})">驳回…</button>
+      </td>
+    </tr>`).join('') : '<tr><td colspan="6" class="empty">没有待审批的申请</td></tr>';
+}
+
+function openApprove(id, count) { approveId = id; $('#a-count').value = count; $('#dlg-approve').showModal(); }
+function openReject(id) { rejectId = id; $('#r-comment').value = ''; $('#dlg-reject').showModal(); }
+
+async function doApprove() {
+  try {
+    await api(`/gpu-requests/${approveId}/approve`, {method:'POST', body: JSON.stringify({
+      granted_gpu_count: parseInt($('#a-count').value || '0'),
+      admin_comment: $('#a-comment').value || null,
+    })});
+    toast('已批准');
+    loadPending(); loadRequests();
+  } catch (e) { toast('批准失败: ' + e.message); }
+}
+
+async function doReject() {
+  try {
+    await api(`/gpu-requests/${rejectId}/reject`, {method:'POST', body: JSON.stringify({
+      admin_comment: $('#r-comment').value || null,
+    })});
+    toast('已驳回');
+    loadPending(); loadRequests();
+  } catch (e) { toast('驳回失败: ' + e.message); }
+}
+
+/* ---------- admin: 节点授权 ---------- */
+
+async function loadWorkerOpts() {
+  const data = await api('/workers?perPage=200');
+  const opts = data.items.length
+    ? data.items.map(w => `<option value="${w.id}">${esc(w.name)} (${(w.status?.gpu_devices||[]).length} GPU)</option>`).join('')
+    : '<option value="">暂无节点</option>';
+  $('#w-worker').innerHTML = opts;
+  $('#w-worker-grp').innerHTML = opts;
+}
+async function loadUserOpts() {
+  const data = await api('/users?perPage=500');
+  window._users = data.items;
+  $('#w-user').innerHTML = data.items.filter(u => !u.is_admin)
+    .map(u => `<option value="${u.id}">${esc(u.username)}</option>`).join('');
+}
+
+async function grantWorker() {
+  const wid = $('#w-worker').value, uid = $('#w-user').value;
+  if (!wid) { toast('没有可选节点'); return; }
+  try {
+    await api(`/workers/${wid}/access`, {method:'POST', body: JSON.stringify({principal_id: parseInt(uid)})});
+    toast('节点已开放给该用户');
+    loadGrants();
+  } catch (e) { toast('授权失败: ' + e.message); }
+}
+
+async function loadGrants() {
+  const workers = await api('/workers?perPage=200');
+  const grants = [];
+  for (const w of workers.items) {
+    const rows = await api(`/workers/${w.id}/access`);
+    for (const r of rows) grants.push({...r, worker_name: w.name});
+  }
+  const tb = $('#t-grants tbody');
+  tb.innerHTML = grants.length ? grants.map(g => {
+    const kind = (g.principal_name||'').startsWith('system/') ? '系统' : '用户/组';
+    return `
+    <tr>
+      <td><b>${esc(g.worker_name)}</b></td>
+      <td>${esc(g.principal_display_name || g.principal_name || g.principal_id)}</td>
+      <td class="kv">${kind}</td>
+      <td class="kv">${fmtTime(g.created_at)}</td>
+      <td><button onclick="revokeWorker(${g.worker_id}, ${g.principal_id})">撤销</button></td>
+    </tr>`;}).join('') : '<tr><td colspan="5" class="empty">还没有节点授权</td></tr>';
+}
+
+async function revokeWorker(wid, pid) {
+  if (!confirm('撤销该授权?')) return;
+  try { await api(`/workers/${wid}/access/${pid}`, {method:'DELETE'}); toast('已撤销'); loadGrants(); }
+  catch (e) { toast('撤销失败: ' + e.message); }
+}
+
+/* ---------- admin: 用户组管理 (/v2/groups — 把用户归组, 对组做资源隔离) ---------- */
+
+async function loadGroups() {
+  // 仅用于"节点授权"tab 的"开放节点给该用户组"下拉。
+  const data = await api('/groups?perPage=100');
+  $('#w-group').innerHTML = data.items.length
+    ? data.items.map(g => `<option value="${g.id}">${esc(g.name)}</option>`).join('')
+    : '<option value="">暂无用户组</option>';
+}
+
+/* ---------- 用户组独立视图 (左侧菜单「用户组」) ---------- */
+
+async function loadGroupList() {
+  const data = await api('/groups?perPage=100');
+  const wrap = $('#group-list');
+  wrap.innerHTML = data.items.length ? '' : '<div class="empty">还没有用户组</div>';
+  for (const g of data.items) {
+    const panel = document.createElement('div');
+    panel.className = 'panel';
+    panel.innerHTML = `
+      <div class="head">
+        <b>${esc(g.name)}</b>
+        ${g.description ? '<span class="kv">' + esc(g.description) + '</span>' : ''}
+        <span class="chip">${g.member_count || 0} 名成员</span>
+        <span class="spacer" style="flex:1"></span>
+        <button class="link" onclick="openGroupMembers(${g.id}, '${esc(g.name)}')">成员管理</button>
+        <button class="link" onclick="deleteGroup(${g.id}, '${esc(g.name)}')" style="color:var(--err)">删除</button>
+      </div>
+      <div class="kv" id="group-members-${g.id}">加载成员…</div>`;
+    wrap.appendChild(panel);
+    try {
+      const members = await api(`/groups/${g.id}/members`);
+      document.getElementById(`group-members-${g.id}`).innerHTML =
+        members.length ? `<div class="chips">${members.map(m =>
+          `<span class="chip" title="${esc(m.full_name || '')}">${esc(m.username || m.user_id)}</span>`).join('')}</div>`
+        : '<span class="muted sub">暂无成员</span>';
+    } catch (e) {
+      document.getElementById(`group-members-${g.id}`).textContent = '成员加载失败';
+    }
+  }
+}
+
+async function createGroup() {
+  const name = $('#g-name').value.trim();
+  const desc = $('#g-desc').value.trim();
+  if (!name) { toast('请填写用户组标识'); return; }
+  try {
+    await api('/groups', {method: 'POST', body: JSON.stringify({name, description: desc || null})});
+    toast('用户组已创建');
+    $('#g-name').value = ''; $('#g-desc').value = '';
+    loadGroupList(); loadGroups();
+  } catch (e) { toast('创建失败: ' + e.message); }
+}
+
+async function deleteGroup(id, gname) {
+  if (!confirm(`删除用户组 ${gname}? 组内成员不受影响, 仅移除分组。`)) return;
+  try { await api(`/groups/${id}`, {method: 'DELETE'}); toast('已删除'); loadGroupList(); loadGroups(); }
+  catch (e) { toast('删除失败: ' + e.message); }
+}
+
+let membersGroupId = null;
+
+async function openGroupMembers(groupId, groupName) {
+  membersGroupId = groupId;
+  $('#m-title').textContent = `用户组成员 — ${groupName}`;
+  const users = window._users || (await api('/users?perPage=500')).items;
+  $('#m-user').innerHTML = users.map(u => `<option value="${u.id}">${esc(u.username)}</option>`).join('');
+  await loadGroupMembers();
+  $('#dlg-member').showModal();
+}
+
+async function loadGroupMembers() {
+  const members = await api("/groups/" + membersGroupId + "/members");
+  const tb = document.querySelector("#t-members tbody");
+  tb.innerHTML = members.length
+    ? members
+        .map(function (m) {
+          var nm = m.username || m.user_id;
+          var fn = m.full_name ? ' <span class="kv">' + esc(m.full_name) + "</span>" : "";
+          return "<tr><td><b>" + esc(nm) + "</b>" + fn + "</td>"
+            + '<td class="kv">' + fmtTime(m.created_at) + "</td>"
+            + '<td><button class="link" onclick="removeGroupMember(' + m.user_id + ')" style="color:var(--err)">移除</button></td></tr>';
+        })
+        .join("")
+    : '<tr><td colspan="3" class="empty">暂无成员</td></tr>';
+}
+
+async function addGroupMember() {
+  var uid = parseInt(document.getElementById("m-user").value);
+  try {
+    await api("/groups/" + membersGroupId + "/members", {
+      method: "POST",
+      body: JSON.stringify({ user_ids: [uid] }),
+    });
+    toast("已添加");
+    loadGroupMembers();
+    loadGroupList();
+    loadGroups();
+  } catch (e) {
+    toast("添加失败: " + e.message);
+  }
+}
+
+async function removeGroupMember(uid) {
+  if (!confirm("从用户组移除该用户?")) return;
+  try {
+    await api("/groups/" + membersGroupId + "/members/" + uid, { method: "DELETE" });
+    toast("已移除");
+    loadGroupMembers();
+    loadGroupList();
+    loadGroups();
+  } catch (e) {
+    toast("移除失败: " + e.message);
+  }
+}
+
+async function grantWorkerToGroup() {
+  const wid = $('#w-worker-grp').value, gid = $('#w-group').value;
+  if (!wid) { toast('没有可选节点'); return; }
+  try {
+    await api(`/workers/${wid}/access`, {method:'POST', body: JSON.stringify({principal_id: parseInt(gid)})});
+    toast('节点已开放给该用户组 (组内所有用户可用)');
+    loadGrants();
+  } catch (e) { toast('授权失败: ' + e.message); }
+}
+
+/* ---------- 通知 ---------- */
+
+async function loadNotifs() {
+  const data = await api('/notifications?perPage=50');
+  const tb = $('#t-notifs tbody');
+  tb.innerHTML = data.items.length ? data.items.map(n => `
+    <tr style="${n.read ? 'opacity:.55' : ''}">
+      <td class="kv">${fmtTime(n.created_at)}</td>
+      <td><b>${esc(n.title)}</b>${n.body ? '<br><span class="kv">' + esc(n.body) + '</span>' : ''}</td>
+      <td>${n.read ? '' : `<button onclick="markRead(${n.id})">已读</button>`}</td>
+    </tr>`).join('') : '<tr><td colspan="3" class="empty">暂无通知</td></tr>';
+  return data;
+}
+
+async function renderUnreadBadge() {
+  const { unread } = await api('/notifications/unread');
+  const el = $('#n-unread');
+  if (unread > 0) { el.style.display = ''; el.textContent = unread; } else el.style.display = 'none';
+}
+
+async function markRead(id) { await api(`/notifications/${id}/read`, {method:'PUT'}); loadNotifs().then(renderUnreadBadge); }
+async function markAllRead() { await api('/notifications/read-all', {method:'POST'}); loadNotifs().then(renderUnreadBadge); }
+
+function switchTab(name, hideBar) {
+  for (const t of ['pending', 'workers']) {
+    $('#tab-' + t).style.display = t === name ? '' : 'none';
+    const el = document.querySelector('.tabs button[data-tab="' + t + '"]');
+    if (el) el.classList.toggle('active', t === name);
+  }
+  var bar = document.getElementById('tabs-bar');
+  if (bar) bar.style.display = hideBar ? 'none' : '';
+}
+
+init();
+</script>
+</body>
+</html>

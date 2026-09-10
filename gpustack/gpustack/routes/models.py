@@ -1,0 +1,1204 @@
+import logging
+import math
+from typing import Any, Dict, List, Optional, Union
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import RedirectResponse, StreamingResponse
+from urllib.parse import urlencode
+from gpustack_runtime.detector import ManufacturerEnum
+from sqlalchemy.orm import selectinload
+from sqlmodel import and_, or_, select
+from sqlmodel.ext.asyncio.session import AsyncSession
+
+from gpustack.api.exceptions import (
+    AlreadyExistsException,
+    InternalServerErrorException,
+    BadRequestException,
+    ForbiddenException,
+    NotFoundException,
+)
+from gpustack.schemas.common import Pagination
+from gpustack.schemas.inference_backend import is_custom_backend
+from gpustack.schemas.models import (
+    ModelInstance,
+    ModelInstancesPublic,
+    BackendEnum,
+    ModelListParams,
+)
+from gpustack.schemas.cache_services import CacheService
+from gpustack.schemas.clusters import Cluster
+from gpustack.schemas.gpu_instance_types import GPUInstanceType
+from gpustack.schemas.workers import GPUDeviceStatus, Worker
+from gpustack.utils.version import version_in_range
+from gpustack.api.tenant import (
+    TenantContext,
+    bypass_tenant_filter,
+    assert_cluster_visible,
+    assert_resource_visible,
+    cluster_scoped_system,
+    scoped_cluster_row_visible,
+    tenant_list_conditions,
+)
+from gpustack.server.db import async_session
+from gpustack.server.deps import (
+    CurrentUserDep,
+    ListParamsDep,
+    SessionDep,
+    TenantContextDep,
+)
+from gpustack.schemas.models import (
+    LoraListEntry,
+    Model,
+    ModelCreate,
+    ModelSpecBase,
+    ModelUpdate,
+    ModelPublic,
+    ModelsPublic,
+)
+from gpustack.schemas.model_routes import (
+    AccessPolicyEnum,
+    ModelRoute,
+    ModelRouteTarget,
+    TargetStateEnum,
+)
+from gpustack.schemas.links import ModelRoutePrincipalLink
+from gpustack.schemas.principals import platform_principal_id
+from gpustack.server.services import (
+    ModelService,
+    WorkerService,
+    revoke_model_access_cache,
+)
+from gpustack.server.scaling_scheduler import compute_desired_replicas
+from gpustack.server.cache_provider_catalog import get_cache_provider
+from gpustack.server.lora_adapters_discovery import list_adapters_for_base
+from gpustack.server.lora_model_routes import (
+    cleanup_orphan_lora_routes,
+    create_lora_model_routes,
+    is_lora_list_stale,
+)
+from gpustack.utils.command import find_parameter
+from gpustack.utils.convert import safe_int
+from gpustack.utils.gpu import parse_gpu_id
+from gpustack.routes.model_common import (
+    ModelStateFilterEnum,
+    build_category_conditions,
+    categories_filter,
+    state_stream_filter,
+)
+from gpustack.config.config import get_global_config
+from gpustack.utils.grafana import resolve_grafana_base_url
+from gpustack.utils.lora_model_source import lora_route_name_for
+
+router = APIRouter()
+
+logger = logging.getLogger(__name__)
+
+
+def _make_model_watch_filter(ctx, categories, state=None):
+    """Watch-stream visibility: cluster-bound service accounts only see
+    their own cluster's models; everyone keeps the categories and state
+    filters. Predicates are pre-built so inactive filters cost nothing on
+    the per-event hot path."""
+    predicates = []
+    if cluster_scoped_system(ctx):
+        predicates.append(lambda data: scoped_cluster_row_visible(ctx, data))
+    if state is not None:
+        predicates.append(
+            lambda data: state_stream_filter(data, state, "ready_replicas", "replicas")
+        )
+    if categories:
+        predicates.append(lambda data: categories_filter(data, categories))
+
+    def _visible(data) -> bool:
+        for p in predicates:
+            if not p(data):
+                return False
+        return True
+
+    return _visible
+
+
+@router.get("", response_model=ModelsPublic)
+async def get_models(
+    ctx: TenantContextDep,
+    params: ModelListParams = Depends(),
+    state: Optional[ModelStateFilterEnum] = Query(
+        default=None,
+        description="Filter by model state.",
+    ),
+    search: str = None,
+    categories: Optional[List[str]] = Query(None, description="Filter by categories."),
+    cluster_id: int = None,
+    backend: Optional[str] = Query(None, description="Filter by backend."),
+):
+    fuzzy_fields = {}
+    if search:
+        fuzzy_fields = {"name": search}
+
+    fields = {}
+    if cluster_id:
+        fields["cluster_id"] = cluster_id
+
+    if backend:
+        fields["backend"] = backend
+
+    # Streaming uses field-equality only; scope by current org so non-admin
+    # users never see cross-org rows via the live stream. Admin without an
+    # explicit org context keeps the unfiltered cross-org stream. System
+    # users (workers / cluster accounts) bypass owner scoping — they serve
+    # every Org's models — but cluster-bound service accounts are narrowed
+    # to their own cluster's rows below.
+    if ctx.current_principal_id is not None and not bypass_tenant_filter(ctx):
+        fields["owner_principal_id"] = ctx.current_principal_id
+
+    if params.watch:
+        return StreamingResponse(
+            Model.streaming(
+                fields=fields,
+                fuzzy_fields=fuzzy_fields,
+                filter_func=_make_model_watch_filter(ctx, categories, state),
+            ),
+            media_type="text/event-stream",
+        )
+
+    async with async_session() as session:
+        extra_conditions = list(tenant_list_conditions(ctx, Model))
+        if categories:
+            conditions = build_category_conditions(session, Model, categories)
+            extra_conditions.append(or_(*conditions))
+
+        if state is None:
+            pass
+        elif state == ModelStateFilterEnum.READY:
+            extra_conditions.append(Model.ready_replicas > 0)
+        elif state == ModelStateFilterEnum.NOT_READY:
+            extra_conditions.append(and_(Model.ready_replicas == 0, Model.replicas > 0))
+        elif state == ModelStateFilterEnum.STOPPED:
+            extra_conditions.append(Model.replicas == 0)
+
+        order_by = params.order_by
+        if order_by:
+            # When sorting by "source", add additional sorting fields for deterministic ordering
+            new_order_by = []
+            for field, direction in order_by:
+                new_order_by.append((field, direction))
+                if field == "source":
+                    new_order_by.append(("huggingface_repo_id", direction))
+                    new_order_by.append(("huggingface_filename", direction))
+                    new_order_by.append(("model_scope_model_id", direction))
+                    new_order_by.append(("model_scope_file_path", direction))
+                    new_order_by.append(("local_path", direction))
+            order_by = new_order_by
+
+        return await Model.paginated_by_query(
+            session=session,
+            fuzzy_fields=fuzzy_fields,
+            extra_conditions=extra_conditions,
+            page=params.page,
+            per_page=params.perPage,
+            fields=fields,
+            order_by=order_by,
+        )
+
+
+@router.get("/adapters", response_model=Dict[str, Any])
+async def get_model_adapters(
+    session: SessionDep,
+    user: CurrentUserDep,
+    base: str = Query(
+        ...,
+        description=(
+            "Base model repo id (e.g. Qwen/Qwen3-8B) for HF/ModelScope adapter discovery; "
+            "also used to match local cached LoRAs."
+        ),
+    ),
+    q: Optional[str] = Query(
+        None,
+        description="Optional keyword (Hugging Face search, ModelScope Search).",
+    ),
+    limit: int = Query(
+        40,
+        ge=1,
+        le=200,
+        description="Max adapter entries per remote source (HF and ModelScope).",
+    ),
+):
+    _ = user
+    return await list_adapters_for_base(session, base, q=q, limit=limit)
+
+
+@router.get("/{id}", response_model=ModelPublic)
+async def get_model(
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+):
+    model = await Model.one_by_id(session, id, options=[selectinload(Model.instances)])
+    assert_resource_visible(ctx, model, not_found_message="Model not found")
+    public = ModelPublic.model_validate(model)
+    public.has_stale_lora_instances = is_lora_list_stale(model)
+    return public
+
+
+@router.get("/{id}/dashboard")
+async def get_model_dashboard(
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+    request: Request,
+):
+    model = await _get_model(session=session, ctx=ctx, id=id)
+
+    cfg = get_global_config()
+    if not cfg.get_grafana_url() or not cfg.grafana_model_dashboard_uid:
+        raise InternalServerErrorException(
+            message="Grafana dashboard settings are not configured"
+        )
+
+    cluster = None
+    if model.cluster_id is not None:
+        cluster = await Cluster.one_by_id(session, model.cluster_id)
+
+    query_params = {}
+    if cluster is not None:
+        query_params["var-cluster_name"] = cluster.name
+    query_params["var-model_name"] = model.name
+
+    grafana_base = resolve_grafana_base_url(cfg, request)
+    slug = "gpustack-model"
+    dashboard_url = f"{grafana_base}/d/{cfg.grafana_model_dashboard_uid}/{slug}"
+    if query_params:
+        dashboard_url = f"{dashboard_url}?{urlencode(query_params)}"
+
+    return RedirectResponse(url=dashboard_url, status_code=302)
+
+
+async def _get_model(
+    session: SessionDep,
+    ctx,
+    id: int,
+):
+    model = await Model.one_by_id(session, id)
+    assert_resource_visible(ctx, model, not_found_message="Model not found")
+    return model
+
+
+@router.get("/{id}/instances", response_model=ModelInstancesPublic)
+async def get_model_instances(ctx: TenantContextDep, id: int, params: ListParamsDep):
+    if params.watch:
+        # Gate the stream on the same visibility check the non-watch
+        # branch applies, so a model id outside the caller's scope can't
+        # be tailed live.
+        async with async_session() as session:
+            model = await Model.one_by_id(session, id)
+            assert_resource_visible(ctx, model, not_found_message="Model not found")
+        fields = {"model_id": id}
+        return StreamingResponse(
+            ModelInstance.streaming(fields=fields),
+            media_type="text/event-stream",
+        )
+
+    async with async_session() as session:
+        model = await Model.one_by_id(
+            session, id, options=[selectinload(Model.instances)]
+        )
+        assert_resource_visible(ctx, model, not_found_message="Model not found")
+
+        instances = model.instances
+        count = len(instances)
+        total_page = math.ceil(count / params.perPage)
+        pagination = Pagination(
+            page=params.page,
+            perPage=params.perPage,
+            total=count,
+            totalPage=total_page,
+        )
+
+        return ModelInstancesPublic(items=instances, pagination=pagination)
+
+
+def apply_scaling_schedule_baseline(
+    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
+) -> None:
+    """
+    Drive ``replicas`` from an enabled scaling schedule.
+
+    While a schedule is enabled the replica count is owned by the schedule:
+    ``baseline_replicas`` plus the window rules are the user's input, and
+    ``replicas`` becomes the scheduler-driven value. Set it to the count
+    effective right now so the model doesn't run at a stale count until the
+    scheduler's next tick. A submitted ``replicas`` is ignored in this mode.
+
+    Call this as a server-side assignment *after* validation. Validating a
+    rewritten ``replicas`` would make checks depend on the current wall clock:
+    the value is a point-in-time output of the schedule, not caller intent.
+    """
+    schedule = getattr(model_in, "scaling_schedule", None)
+    if not schedule or not schedule.enabled:
+        return
+    effective = compute_desired_replicas(schedule)
+    if effective is not None:
+        model_in.replicas = effective
+
+
+def _max_intended_replicas(
+    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
+) -> int:
+    """Largest replica count this deployment could ever run.
+
+    Only for deciding *whether* placement needs validating. The plain
+    ``replicas > 0`` gate assumes a zero count means no instances are ever
+    placed, which a schedule breaks: ``replicas`` is then just the count for
+    right now, and the scheduler raises it later. Scaling to zero outside
+    business hours is a headline use case, so a submitted 0 must still get its
+    ``gpu_selector`` checked. Checks *inside* validation keep reading the
+    submitted ``replicas`` — that is the caller's intent.
+    """
+    schedule = getattr(model_in, "scaling_schedule", None)
+    if not schedule or not schedule.enabled:
+        return model_in.replicas
+    # An enabled schedule always carries a baseline and at least one rule.
+    return max(
+        model_in.replicas,
+        schedule.baseline_replicas,
+        *(rule.replicas for rule in schedule.rules),
+    )
+
+
+def _model_gpu_demand(model_in) -> int:
+    """GPUs this deployment would claim per replica.
+
+    Uses the explicit GPU selector when present; otherwise derives
+    parallelism from backend parameters (tensor/pipeline/data
+    parallel), falling back to 1. A coarse upper bound is fine — this
+    guards the quota gate, not the final placement.
+    """
+    from gpustack.schemas.models import GPUSelector
+    from gpustack.utils.command import find_int_parameter
+
+    gpu_selector = getattr(model_in, "gpu_selector", None)
+    if gpu_selector and getattr(gpu_selector, "gpu_ids", None):
+        return len(gpu_selector.gpu_ids)
+
+    params = getattr(model_in, "backend_parameters", None) or []
+    tp = find_int_parameter(params, ["tensor-parallel-size", "tp-size", "tp"]) or 1
+    pp = find_int_parameter(
+        params, ["pipeline-parallel-size", "pp-size", "pp"]
+    ) or 1
+    dp = find_int_parameter(params, ["data-parallel-size", "dp-size", "dp"]) or 1
+    return max(1, tp * pp * dp)
+
+
+async def assert_model_quota(session, ctx, model_in, exclude_model_id=None) -> None:
+    """User isolation (feature one): enforce the approved GPU quota.
+
+    Non-admin callers may not deploy models whose total GPU demand
+    (existing deployments + this one) exceeds the quota granted in
+    their most recent approved GPU request. Admins and SYSTEM
+    principals are unrestricted.
+    """
+    from gpustack.api.exceptions import ForbiddenException
+    from gpustack.schemas.gpu_allocation_requests import get_user_gpu_quota
+    from gpustack.schemas.models import Model, ModelInstance
+    from gpustack.schemas.principals import PrincipalType
+
+    user = ctx.user
+    if user is None or user.is_admin or user.kind == PrincipalType.SYSTEM:
+        return
+
+    quota = await get_user_gpu_quota(session, user.id)
+    if quota is None:
+        quota = 0
+
+    # GPUs already committed by this user's models (excluding the model
+    # being updated, if any).
+    used = 0
+    stmt = select(Model).where(
+        Model.owner_principal_id == user.id,
+        Model.deleted_at.is_(None),
+    )
+    if exclude_model_id is not None:
+        stmt = stmt.where(Model.id != exclude_model_id)
+    models = (await session.exec(stmt)).all()
+    for m in models:
+        per_replica = _model_gpu_demand(m)
+        used += per_replica * max(1, m.replicas)
+
+    demand = _model_gpu_demand(model_in) * max(1, model_in.replicas or 1)
+    if used + demand > quota:
+        from gpustack.api.exceptions import InvalidException
+
+        raise InvalidException(
+            message=(
+                f"GPU quota exceeded: your quota is {quota} GPU(s), "
+                f"{used} already in use by your deployments, and this "
+                f"deployment needs {demand} more. Request a higher "
+                f"quota from an administrator."
+            )
+        )
+
+
+async def validate_model_in(
+    session: SessionDep,
+    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
+    *,
+    cluster_id: Optional[int] = None,
+):
+    if getattr(model_in, "gpu_type_selector", None) is not None:
+        await validate_gpu_type_selector(session, model_in, cluster_id=cluster_id)
+
+    if model_in.gpu_selector is not None and _max_intended_replicas(model_in) > 0:
+        await validate_gpu_ids(session, model_in, cluster_id=cluster_id)
+
+    if is_custom_backend(model_in.backend):
+        logger.info("Skip model validation for custom backend")
+        return
+
+    if model_in.backend_parameters:
+        param_gpu_layers = find_parameter(
+            model_in.backend_parameters, ["ngl", "gpu-layers", "n-gpu-layers"]
+        )
+
+        if param_gpu_layers:
+            int_param_gpu_layers = safe_int(param_gpu_layers, None)
+            if (
+                not param_gpu_layers.isdigit()
+                or int_param_gpu_layers < 0
+                or int_param_gpu_layers > 999
+            ):
+                raise BadRequestException(
+                    message="Invalid backend parameter --gpu-layers. Please provide an integer in the range 0-999 (inclusive)."
+                )
+
+            if (
+                int_param_gpu_layers == 0
+                and model_in.gpu_selector is not None
+                and len(model_in.gpu_selector.gpu_ids) > 0
+            ):
+                raise BadRequestException(
+                    message="Cannot set --gpu-layers to 0 and manually select GPUs at the same time. Setting --gpu-layers to 0 means running on CPU only."
+                )
+
+        unsupported_params = [
+            (
+                ["port"],
+                (
+                    "Setting the port using --port is not supported. Ports are "
+                    "automatically allocated by GPUStack."
+                ),
+            ),
+            (
+                ["api-key"],
+                (
+                    "Setting the API key using --api-key is not supported. API keys "
+                    "are managed by GPUStack."
+                ),
+            ),
+            (
+                ["served-model-name"],
+                (
+                    "Setting the served model name using --served-model-name is not "
+                    "supported. The model name is automatically set from your "
+                    "deployment configuration."
+                ),
+            ),
+        ]
+
+        for param_names, error_message in unsupported_params:
+            if find_parameter(model_in.backend_parameters, param_names):
+                raise BadRequestException(message=error_message)
+
+    validate_and_normalize_lora_list(model_in)
+
+
+def validate_and_normalize_lora_list(
+    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
+) -> None:
+    """Normalize each lora_name to the stored "<base>:<short>" form.
+
+    Accepts a bare short name and prepends the base prefix; a correct "<base>:"
+    prefix is kept as-is. Rejects wrong prefixes, embedded colons, empty names,
+    and duplicates. The API strips the prefix again on the way out (see
+    ModelPublic._strip_lora_prefix).
+    """
+    lora_list = getattr(model_in, "lora_list", None)
+    if not lora_list:
+        return
+
+    expected_prefix = f"{model_in.name}:"
+    seen: set = set()
+    for i, item in enumerate(lora_list):
+        entry = LoraListEntry.model_validate(item) if isinstance(item, dict) else item
+        short_name = (entry.lora_name or "").strip()
+        if not short_name:
+            raise BadRequestException(
+                message="lora_name must not be empty in lora_list."
+            )
+        if ":" in short_name:
+            if not short_name.startswith(expected_prefix):
+                raise BadRequestException(
+                    message=(
+                        f"lora_name '{short_name}' must not contain ':'. Set "
+                        f"lora_name to the bare adapter name (e.g. 'my-adapter'); "
+                        f"the '{expected_prefix}' prefix is added automatically."
+                    )
+                )
+            short_name = short_name[len(expected_prefix) :]
+            if not short_name:
+                raise BadRequestException(
+                    message=(
+                        f"lora_name is missing the suffix after the base model "
+                        f"prefix '{expected_prefix}'."
+                    )
+                )
+            if ":" in short_name:
+                raise BadRequestException(
+                    message=(
+                        f"lora_name '{entry.lora_name}' must not contain a nested "
+                        f"':' after the base model prefix."
+                    )
+                )
+        entry.lora_name = lora_route_name_for(model_in.name, short_name)
+        lora_list[i] = entry
+        if short_name in seen:
+            raise BadRequestException(
+                message=f"Duplicate lora_name '{short_name}' in lora_list."
+            )
+        seen.add(short_name)
+
+
+async def validate_gpu_type_selector(
+    session: SessionDep,
+    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
+    *,
+    cluster_id: Optional[int] = None,
+):
+    """Validate a model's ``gpu_type_selector`` against the local projection.
+
+    Reads only the local ``GPUInstanceType`` projection table (synced from the
+    operator watch stream); no Kubernetes client calls. Fails closed: anything
+    that cannot be verified from the projection is rejected.
+    """
+    selector = model_in.gpu_type_selector
+
+    gpu_selector = model_in.gpu_selector
+    if gpu_selector is not None and gpu_selector.gpu_ids:
+        raise BadRequestException(
+            message="gpu_type_selector cannot be combined with gpu_selector: "
+            "manual GPU selection and InstanceType-based sliced GPU selection "
+            "are mutually exclusive."
+        )
+
+    if (
+        gpu_selector is not None
+        and gpu_selector.gpus_per_replica is not None
+        and gpu_selector.gpus_per_replica > 1
+    ):
+        raise BadRequestException(
+            message="gpus_per_replica must be 1 when gpu_type_selector is set: "
+            "an InstanceType provides exactly one card per worker per replica."
+        )
+
+    memory_pct = selector.accelerator_sliced_memory_percentage
+    cores_pct = selector.accelerator_sliced_cores_percentage
+    memory_sliced = memory_pct is not None and memory_pct > 0
+    cores_sliced = cores_pct is not None and cores_pct > 0
+    if (memory_sliced or cores_sliced) and selector.accelerator_partitioned_profile:
+        raise BadRequestException(
+            message="accelerator_partitioned_profile cannot be combined with "
+            "accelerator_sliced_memory_percentage or "
+            "accelerator_sliced_cores_percentage: hardware partitioning and "
+            "software slicing cannot both apply to one card."
+        )
+
+    effective_cluster_id = (
+        cluster_id if cluster_id is not None else getattr(model_in, "cluster_id", None)
+    )
+    if effective_cluster_id is None:
+        raise BadRequestException(
+            message="A cluster must be specified when gpu_type_selector is set: "
+            "the InstanceType projection is scoped per cluster."
+        )
+
+    matched_list = await GPUInstanceType.all_by_fields(
+        session,
+        fields={
+            "cluster_id": effective_cluster_id,
+            "deleted_at": None,
+            "name": selector.type,
+        },
+    )
+    if not matched_list:
+        # Keep the two errors distinct: no synced types in the cluster at
+        # all vs. this type missing.
+        instance_types = await GPUInstanceType.all_by_fields(
+            session,
+            fields={"cluster_id": effective_cluster_id, "deleted_at": None},
+        )
+        if not instance_types:
+            raise BadRequestException(
+                message=f"Cluster {effective_cluster_id} has no synced GPU InstanceTypes: "
+                "gpu_type_selector requires a Kubernetes cluster managed by "
+                "gpustack-operator."
+            )
+        raise BadRequestException(
+            message=f"GPU InstanceType '{selector.type}' not found in cluster "
+            f"{effective_cluster_id}."
+        )
+    matched = matched_list[0]
+
+    # A cluster also publishes non-accelerated InstanceTypes (a CPU-only pool),
+    # and nothing about their name says so. The deploy form filters them out of
+    # its GPU Type list, but an API caller can still name one — and it would
+    # only fail later at scheduling, reported as a type that "does not report
+    # its accelerator memory" rather than as the wrong kind of type.
+    if not matched.spec.acceleratable:
+        raise BadRequestException(
+            message=f"GPU InstanceType '{selector.type}' in cluster "
+            f"{effective_cluster_id} is not an accelerator type: "
+            "gpu_type_selector requires one backed by GPUs."
+        )
+
+    # spec is projected as soon as the InstanceType appears, but status.detail is
+    # backfilled by the operator afterwards, so a type can be nameable before its
+    # hardware is known. Every mode needs the card's memory to size the claim
+    # (a percentage of it, a profile out of it, or the whole card), so without it
+    # the model would be accepted here and then never schedule — the fit would
+    # report the type as unavailable or as not reporting its memory.
+    detail = matched.status.detail if matched.status else None
+    if detail is None or not detail.memory:
+        raise BadRequestException(
+            message=f"GPU InstanceType '{selector.type}' in cluster "
+            f"{effective_cluster_id} does not report its accelerator memory yet: "
+            "gpustack-operator has not finished backfilling the type. Retry once "
+            "the type reports its hardware detail."
+        )
+
+    if selector.accelerator_partitioned_profile:
+        sliced_detail = detail.sliced_detail
+        physical = sliced_detail.physical if sliced_detail else None
+        profiles = physical.profiles if physical and physical.profiles else []
+        profile_names = {p.name for p in profiles if p.name}
+        if selector.accelerator_partitioned_profile not in profile_names:
+            raise BadRequestException(
+                message=f"Profile '{selector.accelerator_partitioned_profile}' "
+                f"is not offered by GPU InstanceType '{selector.type}' in "
+                f"cluster {effective_cluster_id}. Available profiles: "
+                f"{sorted(profile_names) or 'none'}."
+            )
+
+
+async def validate_gpu_ids(  # noqa: C901
+    session: SessionDep,
+    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
+    *,
+    cluster_id: Optional[int] = None,
+):
+    effective_cluster_id = (
+        cluster_id if cluster_id is not None else getattr(model_in, "cluster_id", None)
+    )
+
+    if (
+        model_in.gpu_selector
+        and model_in.gpu_selector.gpu_ids
+        and model_in.gpu_selector.gpus_per_replica
+    ):
+        if len(model_in.gpu_selector.gpu_ids) < model_in.gpu_selector.gpus_per_replica:
+            raise BadRequestException(
+                message="The number of selected GPUs must be greater than or equal to gpus_per_replica."
+            )
+
+    model_backend = model_in.backend
+
+    if model_backend == BackendEnum.VOX_BOX and (
+        len(model_in.gpu_selector.gpu_ids) > 1
+        or (
+            model_in.gpu_selector.gpus_per_replica is not None
+            and model_in.gpu_selector.gpus_per_replica > 1
+        )
+    ):
+        raise BadRequestException(
+            message="The vox-box backend is restricted to execution on a single NVIDIA GPU."
+        )
+
+    worker_name_set = set()
+    for gpu_id in model_in.gpu_selector.gpu_ids:
+        is_valid, matched = parse_gpu_id(gpu_id)
+        if not is_valid:
+            raise BadRequestException(message=f"Invalid GPU ID: {gpu_id}")
+
+        worker_name = matched.get("worker_name")
+        gpu_index = safe_int(matched.get("gpu_index"), -1)
+        worker_name_set.add(worker_name)
+
+        if effective_cluster_id is None:
+            raise BadRequestException(
+                message=f"A cluster context is required for manual GPU selection, but was not provided. Cannot validate worker '{worker_name}'."
+            )
+
+        worker = await WorkerService(session).get_by_cluster_id_name(
+            effective_cluster_id, worker_name
+        )
+        if not worker:
+            raise BadRequestException(message=f"Worker {worker_name} not found")
+
+        gpu = (
+            next(
+                (gpu for gpu in worker.status.gpu_devices if gpu.index == gpu_index),
+                None,
+            )
+            if worker.status and worker.status.gpu_devices
+            else None
+        )
+        if gpu:
+            validate_gpu(gpu, model_backend=model_backend)
+
+        if model_backend == BackendEnum.VLLM and len(worker_name_set) > 1:
+            await validate_distributed_vllm_limit_per_worker(session, model_in, worker)
+
+    if (
+        is_custom_backend(model_backend)
+        and len(worker_name_set) > 1
+        and model_in.replicas == 1
+    ):
+        raise BadRequestException(
+            message="Distributed inference across multiple workers is not supported for custom backends."
+        )
+
+
+def validate_gpu(gpu_device: GPUDeviceStatus, model_backend: str = ""):
+    if (
+        model_backend == BackendEnum.VOX_BOX
+        and gpu_device.vendor != ManufacturerEnum.NVIDIA.value
+    ):
+        raise BadRequestException(
+            "The vox-box backend is supported only on NVIDIA GPUs."
+        )
+
+    if (
+        model_backend == BackendEnum.ASCEND_MINDIE
+        and gpu_device.vendor != ManufacturerEnum.ASCEND.value
+    ):
+        raise BadRequestException(
+            f"Ascend MindIE backend requires Ascend NPUs. Selected {gpu_device.vendor} GPU is not supported."
+        )
+
+
+async def validate_distributed_vllm_limit_per_worker(
+    session: AsyncSession, model: Union[ModelCreate, ModelUpdate], worker: Worker
+):
+    """
+    Validate that there is no more than one distributed vLLM instance per worker.
+    """
+    instances = await ModelInstance.all_by_field(session, "worker_id", worker.id)
+    for instance in instances:
+        if (
+            instance.distributed_servers
+            and instance.distributed_servers.subordinate_workers
+            and instance.model_name != model.name
+        ):
+            raise BadRequestException(
+                message=f"Each worker can run only one distributed vLLM instance. Worker '{worker.name}' already has '{instance.name}'."
+            )
+
+
+async def assert_cluster_belongs_to_org(
+    ctx: TenantContext,
+    session: AsyncSession,
+    cluster_id: Optional[int],
+    owner_principal_id: int,
+    cluster: Optional[Cluster] = None,
+):
+    """Ensure a chosen cluster is visible to the caller and owned by the
+    given Org.
+
+    A model runs on infrastructure owned by its Org, so its cluster must
+    belong to that Org — otherwise a tenant could target the platform's
+    (or another Org's) cluster, stamping a cross-tenant model. A cluster the
+    caller can't see is reported as missing (404), so cross-tenant cluster
+    ids can't be probed via a 403-vs-404 difference; a visible cluster owned
+    by another Org is a 403. No cluster chosen (``cluster_id is None``)
+    leaves default-cluster resolution to pick the Org's own cluster.
+
+    ``cluster`` may be passed pre-fetched to avoid a duplicate lookup.
+    """
+    if cluster_id is None:
+        return
+    if cluster is None:
+        cluster = await Cluster.one_by_id(session, cluster_id)
+    not_found = f"Cluster {cluster_id} not found"
+    assert_cluster_visible(ctx, cluster, not_found_message=not_found)
+    if cluster.deleted_at is not None:
+        raise NotFoundException(message=not_found)
+    if cluster.owner_principal_id != owner_principal_id:
+        raise ForbiddenException(
+            message="The selected cluster does not belong to the current organization."
+        )
+
+
+async def validate_shared_kv_cache(
+    session: AsyncSession,
+    model_in: Union[ModelCreate, ModelUpdate],
+    owner_principal_id: int,
+    effective_cluster_id: Optional[int],
+) -> None:
+    """Validate the extended-KV-cache configuration against its target
+    cache service.
+
+    "shared" mode attaches the model's inference engine to a CacheService
+    row, so the service must exist, belong to the model's Org (a
+    cross-tenant id is reported as missing so service ids can't be probed),
+    run in the model's cluster (the engine connects over the cluster
+    network), and have a provider that knows how to inject connector
+    config for the model's backend. "local" mode uses no service, so a
+    stray cache_service_id is rejected as a mis-configuration rather than
+    silently ignored.
+    """
+    ext = model_in.extended_kv_cache
+    if not ext or not ext.enabled:
+        return
+
+    if ext.is_local():
+        if ext.cache_service_id:
+            raise BadRequestException(
+                message="cache_service_id is only valid when mode is 'shared'"
+            )
+        return
+
+    if not ext.cache_service_id:
+        raise BadRequestException(
+            message=(
+                "cache_service_id is required when extended KV cache "
+                "mode is 'shared'"
+            )
+        )
+
+    cache_service = await CacheService.one_by_id(session, ext.cache_service_id)
+    if (
+        cache_service is None
+        or cache_service.deleted_at is not None
+        or cache_service.owner_principal_id != owner_principal_id
+    ):
+        raise NotFoundException(message="Cache service not found")
+
+    if (
+        effective_cluster_id is not None
+        and cache_service.cluster_id != effective_cluster_id
+    ):
+        raise BadRequestException(
+            message="The cache service must be in the same cluster as the model."
+        )
+
+    provider = get_cache_provider(cache_service.provider_name)
+    backend = model_in.backend or BackendEnum.VLLM.value
+    if provider is None or provider.integration_for(backend) is None:
+        raise BadRequestException(
+            message=(
+                f"Cache service provider '{cache_service.provider_name}' is "
+                f"not compatible with backend '{backend}'."
+            )
+        )
+
+    # Every built-in integration is framework-scoped, so a cluster whose
+    # accelerators are all outside the provider's support matrix would
+    # pass the framework-less check above and then degrade on every
+    # instance. Pre-check against the cluster's actual accelerators;
+    # accelerator-less clusters are left to scheduling.
+    workers = await Worker.all_by_fields(
+        session,
+        fields={"cluster_id": cache_service.cluster_id},
+        extra_conditions=[Worker.deleted_at.is_(None)],
+    )
+    frameworks = {
+        device.type
+        for worker in workers
+        for device in (
+            worker.status.gpu_devices
+            if worker.status and worker.status.gpu_devices
+            else []
+        )
+        if device.type
+    }
+    if frameworks and not any(
+        provider.integration_for(backend, framework) for framework in frameworks
+    ):
+        raise BadRequestException(
+            message=(
+                f"Cache service provider '{cache_service.provider_name}' "
+                f"has no '{backend}' integration for the cluster's "
+                f"accelerators ({', '.join(sorted(frameworks))})."
+            )
+        )
+
+    # A pinned engine version below an integration's declared floor would
+    # receive injected args the engine does not accept (e.g.
+    # --shutdown-timeout) and fail to start. Reject when the version
+    # falls outside every candidate integration's range; unparseable
+    # versions fail open, and an unpinned version is resolved at deploy
+    # time (the injection resolver re-checks it there).
+    engine_version = model_in.backend_version
+    if engine_version:
+        candidates = (
+            [provider.integration_for(backend, framework) for framework in frameworks]
+            if frameworks
+            else [provider.integration_for(backend)]
+        )
+        ranged = [c for c in candidates if c is not None and c.versions]
+        if ranged and all(
+            version_in_range(engine_version, c.versions) is False for c in ranged
+        ):
+            ranges = ", ".join(sorted({c.versions for c in ranged}))
+            raise BadRequestException(
+                message=(
+                    f"Backend version {engine_version} is outside the "
+                    f"cache provider's supported '{backend}' range "
+                    f"({ranges})."
+                )
+            )
+
+
+@router.post(
+    "",
+    response_model=ModelPublic,
+)
+async def create_model(
+    session: SessionDep, ctx: TenantContextDep, model_in: ModelCreate
+):
+    # Resolve the owning Org first — admin in "All" mode (no current
+    # principal) inherits the chosen cluster's Org, or falls back to
+    # the platform Org. The same value drives both the uniqueness
+    # pre-check below and the row we stamp on insert; resolving it up
+    # front keeps them in sync so the pre-check actually catches a
+    # collision in the Org the model will land in.
+    target_org_id = ctx.current_principal_id
+    cluster = None
+    if target_org_id is None and model_in.cluster_id is not None:
+        # Admin "All" mode has no principal context; derive the owning Org
+        # from the chosen cluster. Reused by the check below to avoid a
+        # second lookup. Under an Org context the helper does the single
+        # lookup itself.
+        cluster = await Cluster.one_by_id(session, model_in.cluster_id)
+        if cluster is None:
+            raise NotFoundException(message=f"Cluster {model_in.cluster_id} not found")
+        target_org_id = cluster.owner_principal_id
+    if target_org_id is None:
+        target_org_id = platform_principal_id()
+
+    # The chosen cluster must exist, be visible to the caller, and be owned
+    # by the target Org. In admin "All" mode target_org_id was derived from
+    # the cluster above, so the ownership check is trivially satisfied and
+    # this mainly rejects a missing/deleted or non-visible cluster_id.
+    await assert_cluster_belongs_to_org(
+        ctx, session, model_in.cluster_id, target_org_id, cluster=cluster
+    )
+
+    # Model & ModelRoute names are unique within their Org. Two Orgs
+    # can each have a "llama3" without colliding.
+    existing = await Model.one_by_fields(
+        session,
+        {"name": model_in.name, "owner_principal_id": target_org_id},
+    )
+    if existing:
+        raise AlreadyExistsException(
+            message=f"Model with name '{model_in.name}' already exists."
+        )
+    should_create_route = (
+        model_in.enable_model_route is not None and model_in.enable_model_route
+    )
+    if should_create_route:
+        existing_route = await ModelRoute.one_by_fields(
+            session,
+            {"name": model_in.name, "owner_principal_id": target_org_id},
+        )
+        if existing_route:
+            raise AlreadyExistsException(
+                message=f"Model route with name '{model_in.name}' already exists."
+            )
+    # User isolation (feature one): a non-admin user cannot deploy more
+    # GPUs than their approved quota.
+    await assert_model_quota(session, ctx, model_in)
+    await validate_model_in(session, model_in)
+    # Server-side assignment, after validation: validation must see the replica
+    # count the caller submitted, not the schedule-driven one.
+    apply_scaling_schedule_baseline(model_in)
+    await validate_shared_kv_cache(
+        session, model_in, target_org_id, model_in.cluster_id
+    )
+    model_in_dict = model_in.model_dump(exclude={"enable_model_route"})
+
+    # Stamp tenant scope. ModelBase has owner_principal_id defaulted to
+    # PLATFORM_PRINCIPAL_ID, so `model_dump()` always emits the key —
+    # `setdefault` would silently leave it at 1 even when the caller is
+    # acting under a different Org. Override directly with the value we
+    # resolved above.
+    model_in_dict["owner_principal_id"] = target_org_id
+
+    # Multi-tenant default: a non-platform Org's new model (and the
+    # route(s) it spawns) is scoped to that Org via ALLOWED_PRINCIPALS
+    # with the owning Org auto-granted below. The Default (platform) Org
+    # keeps AUTHED. Caller's explicit ``access_policy`` always wins and
+    # then manages its own grants via /principals. ``model_dump`` always
+    # emits ``access_policy`` (it has a default), so override directly.
+    org_scoped_default = (
+        target_org_id is not None
+        and target_org_id != platform_principal_id()
+        and "access_policy" not in model_in.model_fields_set
+    )
+    if org_scoped_default:
+        model_in_dict["access_policy"] = AccessPolicyEnum.ALLOWED_PRINCIPALS
+
+    try:
+        model: Model = await Model.create(
+            session, source=model_in_dict, auto_commit=(not should_create_route)
+        )
+        if should_create_route:
+            model_route = ModelRoute(
+                name=model.name,
+                description=model.description,
+                categories=model.categories,
+                generic_proxy=model.generic_proxy,
+                created_model_id=model.id,
+                access_policy=model.access_policy,
+                owner_principal_id=model.owner_principal_id,
+            )
+            model_route: ModelRoute = await ModelRoute.create(
+                session, source=model_route, auto_commit=False
+            )
+            model_route_target = ModelRouteTarget(
+                name=f"{model.name}-deployment",
+                route_name=model_route.name,
+                generic_proxy=model.generic_proxy,
+                model_route=model_route,
+                model=model,
+                weight=100,
+                state=TargetStateEnum.UNAVAILABLE,
+            )
+            await ModelRouteTarget.create(
+                session,
+                source=model_route_target,
+                auto_commit=False,
+            )
+            if org_scoped_default:
+                # Auto-grant the owning Org on the primary route so its
+                # members see it out of the box. The route is brand new,
+                # so no existence check is needed; LoRA child routes get
+                # their own grants inside create_lora_model_routes.
+                session.add(
+                    ModelRoutePrincipalLink(
+                        route_id=model_route.id,
+                        principal_id=model.owner_principal_id,
+                    )
+                )
+            await create_lora_model_routes(
+                session,
+                model,
+                access_policy=model.access_policy,
+                generic_proxy=model.generic_proxy,
+            )
+            await session.commit()
+            await revoke_model_access_cache(session=session)
+    except BadRequestException:
+        await session.rollback()
+        raise
+    except Exception as e:
+        await session.rollback()
+        raise InternalServerErrorException(message=f"Failed to create model: {e}")
+
+    return model
+
+
+@router.put(
+    "/{id}",
+    response_model=ModelPublic,
+)
+async def update_model(
+    session: SessionDep, ctx: TenantContextDep, id: int, model_in: ModelUpdate
+):
+    model = await Model.one_by_id(session, id)
+    assert_resource_visible(ctx, model, not_found_message="Model not found")
+
+    # Block re-pointing a model at another Org's (e.g. the Default org's
+    # shared) or a non-visible cluster: its cluster must stay owned by the
+    # model's Org.
+    await assert_cluster_belongs_to_org(
+        ctx, session, model_in.cluster_id, model.owner_principal_id
+    )
+
+    # Validate against the merged state: a sparse update carries only the
+    # fields being changed, so validation would otherwise check
+    # gpu_selector/gpu_type_selector mutual exclusion against half the
+    # picture (e.g. setting gpu_selector on a model that already has
+    # gpu_type_selector). object.__setattr__ bypasses pydantic's
+    # fields-set tracking, keeping the backfill out of the persisted patch.
+    for field in ("gpu_type_selector", "gpu_selector", "cluster_id"):
+        if field not in model_in.model_fields_set:
+            object.__setattr__(model_in, field, getattr(model, field))
+
+    # User isolation (feature one): quota gate on updates too (the
+    # model being updated doesn't count against its own quota).
+    await assert_model_quota(
+        session, ctx, model_in, exclude_model_id=model.id
+    )
+
+    await validate_model_in(session, model_in)
+    # Server-side assignment, after validation: validation must see the replica
+    # count the caller submitted, not the schedule-driven one.
+    apply_scaling_schedule_baseline(model_in)
+    await validate_shared_kv_cache(
+        session,
+        model_in,
+        model.owner_principal_id,
+        model_in.cluster_id or model.cluster_id,
+    )
+
+    if model_in.backend != BackendEnum.CUSTOM.value and (
+        model.run_command or model.image_name
+    ):
+        patch = model_in.model_dump(exclude_unset=True)
+        patch["run_command"] = None
+        patch["image_name"] = None
+        model_in = patch
+
+    try:
+        await ModelService(session).update(model, model_in, auto_commit=False)
+        updated = await Model.one_by_id(session, id)
+        if not updated:
+            raise RuntimeError("Model not found after update")
+        base_route = await ModelRoute.one_by_field(session, "name", updated.name)
+        if base_route:
+            await create_lora_model_routes(
+                session,
+                updated,
+                access_policy=updated.access_policy,
+                generic_proxy=updated.generic_proxy,
+            )
+            await cleanup_orphan_lora_routes(session, updated)
+        await session.commit()
+        await revoke_model_access_cache(session=session)
+    except BadRequestException:
+        await session.rollback()
+        raise
+    except Exception as e:
+        await session.rollback()
+        raise InternalServerErrorException(message=f"Failed to update model: {e}")
+
+    return updated
+
+
+@router.delete(
+    "/{id}",
+)
+async def delete_model(session: SessionDep, ctx: TenantContextDep, id: int):
+    model = await Model.one_by_id(
+        session,
+        id,
+        options=[
+            selectinload(Model.instances),
+            selectinload(Model.model_route_targets),
+        ],
+    )
+    assert_resource_visible(ctx, model, not_found_message="Model not found")
+
+    try:
+        await ModelService(session).delete(model)
+    except Exception as e:
+        raise InternalServerErrorException(message=f"Failed to delete model: {e}")

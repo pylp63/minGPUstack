@@ -1,0 +1,45 @@
+# GPUStack 二开版 — Docker Compose 部署 (全国内源镜像)
+#
+# 用法:
+#   cd deploy && docker compose up -d
+#
+# 服务说明:
+#   gpustack — GPUStack server + UI + 内置 PostgreSQL + 内置 worker
+#              (用户隔离 / GPU申请审批 / 组织管理 / 一键部署架构;
+#               计费功能已移除)
+#
+# 环境变量见 .env
+
+services:
+  gpustack:
+    image: ${GPUSTACK_IMAGE:-gpustack-custom:latest}
+    container_name: gpustack
+    restart: unless-stopped
+    # 本宿主 docker 禁用了 bridge 网络 (iptables=false), 用 host 网络直通
+    network_mode: host
+    environment:
+      - GPUSTACK_BOOTSTRAP_PASSWORD=${BOOTSTRAP_PASSWORD:-admin}
+      - GPUSTACK_GATEWAY_MODE=disabled
+      - GPUSTACK_DISABLE_BUILTIN_OBSERVABILITY=true
+      # 单机一体模式: server 内嵌 worker, 注册本容器为一个节点
+      # (跑真实推理需要 GPU; 无 GPU 时仅用于体验平台功能)
+      - GPUSTACK_ENABLE_WORKER=${ENABLE_WORKER:-true}
+      # 后端工具 (gguf-parser 等) 下载走腾讯云 COS 国内镜像
+      - GPUSTACK_TOOLS_DOWNLOAD_BASE_URL=https://gpustack-1303613262.cos.ap-guangzhou.myqcloud.com
+      # API/UI 端口 (host 网络模式下直接生效; 80/443 被 OpenStack 占用, 用 30080)
+      - GPUSTACK_API_PORT=${GPUSTACK_PORT:-30080}
+      - TZ=${TZ:-Asia/Shanghai}
+    volumes:
+      - gpustack-data:/var/lib/gpustack
+      - /var/run/docker.sock:/var/run/docker.sock  # 让 GPUStack 能起推理容器
+    # 单机部署 (在本机跑推理) 需要 GPU 时取消注释:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  gpustack-data:

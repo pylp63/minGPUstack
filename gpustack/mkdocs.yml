@@ -1,0 +1,282 @@
+# Project information
+site_name: GPUStack
+site_url: https://docs.gpustack.ai
+site_author: GPUStack.ai
+site_description: >-
+  GPUStack is an open-source GPU cluster manager designed for efficient AI model deployment.
+  It lets you run models efficiently on your own GPU hardware by choosing the best inference engines,
+  scheduling GPU resources, analyzing model architectures, and automatically configuring deployment parameters.
+
+# Repository
+repo_name: gpustack/gpustack
+repo_url: https://github.com/gpustack/gpustack
+
+# Copyright
+copyright: Copyright &copy; 2026 GPUStack.ai
+
+theme:
+  name: material
+  logo: assets/logo-white.png
+  favicon: assets/logo.png
+  custom_dir: docs/overrides
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: orange
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: light blue
+      accent: orange
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  features:
+    - search.suggest
+    - search.highlight
+    - content.tabs.link
+    - navigation.indexes
+    - content.tooltips
+    - navigation.path
+    - navigation.tabs
+    - content.code.annotate
+    - content.code.copy
+    - content.code.select
+    - content.action.view
+    - content.action.edit
+    - navigation.top
+    - navigation.footer
+    - navigation.tracking
+    - search.share
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+  language: en
+plugins:
+  - glightbox
+  - search
+  - redirects:
+      redirect_maps:
+        'installation/nvidia/installation.md': 'installation/requirements.md'
+        'installation/amd/installation.md': 'installation/requirements.md'
+        'installation/ascend/installation.md': 'installation/requirements.md'
+        'installation/hygon/installation.md': 'installation/requirements.md'
+        'installation/mthreads/installation.md': 'installation/requirements.md'
+        'installation/iluvatar/installation.md': 'installation/requirements.md'
+        'installation/cambricon/installation.md': 'installation/requirements.md'
+        'installation/metax/installation.md': 'installation/requirements.md'
+  - minify:
+      minify_html: true
+      minify_css: true
+      minify_js: true
+      cache_safe: true
+      htmlmin_opts:
+        remove_comments: true
+extra:
+  generator: false
+  version:
+    provider: mike
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/gpustack
+    - icon: fontawesome/brands/docker
+      link: https://hub.docker.com/r/gpustack
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/gpustack/
+    - icon: fontawesome/brands/discord
+      link: https://discord.gg/VXYJzuaqwD
+extra_javascript:
+  - image-selector/assets/extra.js
+  - https://unpkg.com/katex@0/dist/katex.min.js
+  - javascripts/katex.js
+  - https://unpkg.com/katex@0/dist/contrib/auto-render.min.js
+  - https://unpkg.com/tablesort@5.3.0/dist/tablesort.min.js
+  - javascripts/tablesort.js
+extra_css:
+  - stylesheets/extra.css
+  - https://unpkg.com/katex@0/dist/katex.min.css
+markdown_extensions:
+  - abbr
+  - def_list
+  - attr_list
+  - md_in_html
+  - pymdownx.highlight:
+      linenums: true
+      line_spans: __span
+      anchor_linenums: true
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - sane_lists
+  - pymdownx.details
+  - pymdownx.tilde
+  - pymdownx.betterem
+  - pymdownx.caret
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.emoji:
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+  - pymdownx.critic
+  - pymdownx.keys
+  - pymdownx.snippets:
+      auto_append:
+        - docs/includes/abbreviations.md
+edit_uri: edit/main/docs/
+nav:
+  - Home:
+      - Overview: overview.md
+      - Quickstart: quickstart.md
+      - Installation:
+          - Requirements: installation/requirements.md
+          - Installation via Docker: installation/installation.md
+          - Installation via Helm: installation/helm.md
+          - Air-Gapped Installation: installation/air-gapped.md
+          - Uninstallation: installation/uninstallation.md
+      - Upgrade:
+          - Upgrade via Docker: upgrade/docker.md
+          - Upgrade via Helm: upgrade/helm.md
+          - Upgrade a Cluster Deployment: upgrade/cluster.md
+      - Migration: migration.md
+      - User Guide:
+          - Playground:
+              - Overview: user-guide/playground/index.md
+              - Chat: user-guide/playground/chat.md
+              - Image: user-guide/playground/image.md
+              - Audio: user-guide/playground/audio.md
+              - Embedding: user-guide/playground/embedding.md
+              - Rerank: user-guide/playground/rerank.md
+          - Model Catalog: user-guide/model-catalog.md
+          - Model Deployment Management: user-guide/model-deployment-management.md
+          - Model Route Management: user-guide/model-route-management.md
+          - Model Provider Management: user-guide/model-provider-management.md
+          - Inference Backend Management: user-guide/inference-backend-management.md
+          - Built-in Inference Backends: user-guide/built-in-inference-backends.md
+          - OTA Content Updates: user-guide/ota-content-updates.md
+          - Compatibility Check: user-guide/compatibility-check.md
+          - Model File management: user-guide/model-file-management.md
+          - Cluster Management: user-guide/cluster-management.md
+          - GPU Service:
+              - GPU Instances: user-guide/gpuservice-instances.md
+              - Instance Types: user-guide/gpuservice-instance-types.md
+              - Instance Templates: user-guide/gpuservice-instance-templates.md
+              - Storage: user-guide/gpuservice-storage.md
+              - Storage Types: user-guide/gpuservice-storage-types.md
+              - SSH Public Keys: user-guide/gpuservice-ssh-public-keys.md
+          - Cloud Credential Management: user-guide/cloud-credential-management.md
+          - API Key Management: user-guide/api-key-management.md
+          - User Management: user-guide/user-management.md
+          - Usage: user-guide/usage.md
+          - Single Sign-On (SSO) Authentication: user-guide/sso.md
+          - Observability: user-guide/observability.md
+          - Benchmarking: user-guide/benchmarking.md
+      - Using Models:
+          - Using Large Language Models: using-models/using-large-language-models.md
+          - Using Vision Language Models: using-models/using-vision-language-models.md
+          - Using Embedding Models: using-models/using-embedding-models.md
+          - Using Reranker Models: using-models/using-reranker-models.md
+          - Using Image Generation Models: using-models/using-image-generation-models.md
+          - Using Audio Models: using-models/using-audio-models.md
+      - Tutorials:
+          - Running DeepSeek R1 671B with Distributed vLLM: tutorials/running-deepseek-r1-671b-with-distributed-vllm.md
+          - Running Distributed vLLM with the MultiProcessing Backend: tutorials/running-distributed-vllm-with-multiprocessing.md
+          - Running DeepSeek R1 671B with Distributed Ascend Mindie: tutorials/running-deepseek-r1-671b-with-distributed-ascend-mindie.md
+          - Inference On CPUs: tutorials/inference-on-cpus.md
+          - Inference with Tool Calling: tutorials/inference-with-tool-calling.md
+          - Using Custom Inference Backend: tutorials/using-custom-backends.md
+          - Adding a GPU Cluster Using DigitalOcean: tutorials/adding-gpucluster-using-digitalocean.md
+          - Adding a GPU Cluster Using Shuihua: tutorials/adding-gpucluster-using-shuihua.md
+          - Adding a GPU Cluster Using Kubernetes: tutorials/adding-gpucluster-using-kubernetes.md
+          - Managing Model Routes: tutorials/managing-model-routes.md
+          - Serving Models with LoRA Adapters: tutorials/serving-with-lora-adapters.md
+      - Integrations:
+          - Inference APIs: integrations/inference-apis.md
+          - Integrate with Claude Code: integrations/integrate-with-claude-code.md
+          - Integrate with Dify: integrations/integrate-with-dify.md
+          - Integrate with RAGFlow: integrations/integrate-with-ragflow.md
+          - Integrate with Cherry Studio: integrations/integrate-with-cherrystudio.md
+          - Integrate with OpenClaw: integrations/integrate-with-openclaw.md
+          - Integrate with n8n: integrations/integrate-with-n8n.md
+          - Integrate with MaxKB: integrations/integrate-with-maxkb.md
+          - Integrate with NewAPI: integrations/integrate-with-newapi.md
+          - Integrate with LiteLLM: integrations/integrate-with-litellm.md
+      - Architecture: architecture.md
+      - Scheduler: scheduler.md
+      - Troubleshooting: troubleshooting.md
+      - FAQ: faq.md
+      - API Reference: api-reference.md
+      - CLI Reference:
+          - Start: cli-reference/start.md
+          - Download Tools: cli-reference/download-tools.md
+          - Reload Config: cli-reference/reload-config.md
+          - List Images: cli-reference/list-images.md
+          - Save Images: cli-reference/save-images.md
+          - Load Images: cli-reference/load-images.md
+          - Copy Images: cli-reference/copy-images.md
+      - Environment Variables: environment-variables.md
+  - Inference Performance Lab:
+      - Overview: performance-lab/overview.md
+      - Optimizing Throughput:
+          - Qwen3.5-35B-A3B:
+              - H200: performance-lab/qwen3.5-35b-a3b/h200.md
+          - Qwen3.5-9B:
+              - H100: performance-lab/qwen3.5-9b/h100.md
+          - GLM-4.5-Air:
+              - A100: performance-lab/glm-4.5-air/a100.md
+              - H100: performance-lab/glm-4.5-air/h100.md
+          - GLM-4.x:
+              - A100: performance-lab/glm-4.x/a100.md
+              - H100: performance-lab/glm-4.x/h100.md
+              - H200: performance-lab/glm-4.x/h200.md
+          - GPT-OSS-20B:
+              - A100: performance-lab/gpt-oss-20b/a100.md
+              - H100: performance-lab/gpt-oss-20b/h100.md
+          - GPT-OSS-120B:
+              - A100: performance-lab/gpt-oss-120b/a100.md
+              - H100: performance-lab/gpt-oss-120b/h100.md
+          - DeepSeek-R1:
+              - H200: performance-lab/deepseek-r1/h200.md
+          - DeepSeek-V3.2:
+              - H200: performance-lab/deepseek-v3.2/h200.md
+          - GLM-5.2:
+              - H200: performance-lab/glm-5.2/h200.md
+          - Qwen3-8B:
+              - 910B: performance-lab/qwen3-8b/910b.md
+          - Qwen3-14B:
+              - A100: performance-lab/qwen3-14b/a100.md
+              - H100: performance-lab/qwen3-14b/h100.md
+          - Qwen3-32B:
+              - A100: performance-lab/qwen3-32b/a100.md
+              - H100: performance-lab/qwen3-32b/h100.md
+          - Qwen3-30B-A3B:
+              - 910B: performance-lab/qwen3-30b-a3b/910b.md
+          - Qwen3-235B-A22B:
+              - A100: performance-lab/qwen3-235b-a22b/a100.md
+              - H100: performance-lab/qwen3-235b-a22b/h100.md
+      - Optimizing Latency:
+          - Qwen3.5-35B-A3B:
+              - H200: performance-lab/qwen3.5-35b-a3b/h200-latency.md
+          - Qwen3.5-9B:
+              - H100: performance-lab/qwen3.5-9b/h100-latency.md
+          - Qwen3-8B:
+              - H100: performance-lab/qwen3-8b/h100-latency.md
+      - References:
+          - The Impact of Quantization on vLLM Inference Performance: performance-lab/references/the-impact-of-quantization-on-vllm-inference-performance.md
+          - Evaluating LMCache Prefill Acceleration in vLLM: performance-lab/references/evaluating-lmcache-prefill-acceleration-in-vllm.md
+  - Container Image Selector: image-selector/index.html
