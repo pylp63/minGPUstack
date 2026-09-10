@@ -56,6 +56,7 @@ from gpustack.routes import (
     notifications,
     worker_access,
     deploy_presets,
+    deploy_topologies,
 )
 
 from gpustack.api.exceptions import error_responses, openai_api_error_responses
@@ -173,6 +174,11 @@ v1_base_router.include_router(
 # Feature two: one-click deployment architecture presets.
 v1_base_router.include_router(
     deploy_presets.router, prefix="/deploy-presets", tags=["Deploy Presets"]
+)
+v1_base_router.include_router(
+    deploy_topologies.router,
+    prefix="/deploy-topologies",
+    tags=["Deploy Topologies"],
 )
 
 cluster_client_router = APIRouter()

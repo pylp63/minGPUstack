@@ -90,6 +90,9 @@ new_items = (
     '49:{name:"console",path:"/models/console",key:"console",'
     'icon:"icon-rocket-launch1",selectedIcon:"icon-rocket-launch-fill",'
     'defaultIcon:"icon-rocket-launch1",parentId:"9",id:"49"},'
+    '50:{name:"deployWizard",path:"/models/deploy-wizard",key:"deployWizard",'
+    'icon:"icon-rocket-launch1",selectedIcon:"icon-rocket-launch-fill",'
+    'defaultIcon:"icon-rocket-launch1",parentId:"9",id:"50"},'
 )
 if 'id:"49"' not in u:
     u = u.replace(anchor_m.group(1), anchor_m.group(1) + new_items, 1)
@@ -97,21 +100,34 @@ if 'id:"49"' not in u:
 else:
     print("C1: menu item already exists")
 
-# --- C2: 组件绑定表新增 49 (复用 42 的 chunk 加载链: 9675)
-bind_anchor = '42:k.lazy((function(){return Promise.all([a.e(6149),a.e(1961),a.e(6974),a.e(9675)]).then(a.bind(a,87924))}))'
-if bind_anchor in u:
-    extra = (
-        ',49:k.lazy((function(){return Promise.all([a.e(6149),a.e(1961),a.e(6974),a.e(9675)]).then(a.bind(a,87924))}))'
-    )
-    u = u.replace(bind_anchor, bind_anchor + extra, 1)
-    print("C2: component binding 49 added")
+# --- C2: 组件绑定表新增 49/50 (复用 42 组织页的 chunk 加载链)
+# 宽松正则: 官方 UI tarball 更新会改变 chunk id/模块 id, 精确字符串会漂移;
+# 用正则从 42 的绑定链提取实际加载代码, 49/50 复用同一段。
+if "49:k.lazy" in u:
+    print("C2: binding 49 already exists")
 else:
-    # 若 49 已存在则跳过
-    if '49:k.lazy' in u:
-        print("C2: binding 49 already exists")
-    else:
+    i42 = u.find("42:k.lazy")
+    if i42 == -1:
         print("!! cannot anchor component binding (42 pattern changed)")
         sys.exit(1)
+    # 按括号配平提取 42 的完整 lazy 表达式
+    depth = 0
+    j = i42 + len("42:")
+    start_expr = j
+    while j < len(u):
+        c = u[j]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                j += 1
+                break
+        j += 1
+    lazy_expr = u[start_expr:j]  # 42 完整的 lazy 加载链
+    extra = ",49:" + lazy_expr + ",50:" + lazy_expr
+    u = u[:j] + extra + u[j:]
+    print("C2: component binding 49/50 added (balanced anchor)")
 
 if u != orig:
     write(UMI, u)
@@ -121,6 +137,7 @@ if u != orig:
 # ================================================================ locale 文案 (菜单聚合: 控制台 + 组织改用户组)
 LABELS = {
     "menu.models.console": "控制台",
+    "menu.models.deployWizard": "部署向导",
     "menu.accessControl.organizations": "用户组",
 }
 patched = 0
@@ -191,18 +208,25 @@ if not org_files:
     print("!! organizations page chunk not found")
     sys.exit(1)
 
-# 组件: iframe 嵌 console 控制台. 按 hash 路由决定 tab:
-#   /models/console (菜单"控制台")      → 默认视图 (申请 + admin审批)
-#   /access-control/organizations (用户组) → tab=groups
+# 组件: iframe 嵌 console 控制台/部署向导. 按 hash 路由决定目标:
+#   /models/deploy-wizard (菜单"部署向导") → /console/deploy_wizard.html
+#   /access-control/organizations (用户组)  → tab=groups
+#   /models/console (菜单"控制台")          → 默认视图 (申请 + admin审批)
+# (二开修复: 原注释里的 wizard.html 已删除 — 它调用 deploy-topologies
+#  API 且无任何入口引用; 统一走 deploy_wizard.html + deploy-presets.)
 STUB = (
     '"use strict";(self.webpackChunk=self.webpackChunk||[]).push([[9675],{'
     '87924:function(e,t,i){i.r(t);'
     'var R=i(75271);'
     't.default=function(){'
-    'var tab="";'
-    'if(typeof window!=="undefined"&&(window.location.hash||"").indexOf("/access-control/organizations")!==-1){tab="groups"}'
+    'var src="/console/?embed=1&tab=";'
+    'if(typeof window!=="undefined"){'
+    'var h=window.location.hash||"";'
+    'if(h.indexOf("/models/deploy-wizard")!==-1){src="/console/deploy_wizard.html?embed=1"}'
+    'else if(h.indexOf("/access-control/organizations")!==-1){src="/console/?embed=1&tab=groups"}'
+    '}'
     'return R.createElement("iframe",{'
-    'src:"/console/?embed=1&tab="+tab,'
+    'src:src,'
     'style:{width:"100%",height:Math.max(360,(typeof window!=="undefined"?window.innerHeight:600)-96)+"px",border:0,display:"block"},'
     'frameBorder:"0"'
     '})'
@@ -263,36 +287,7 @@ if u3 != u2:
 
 print("UI dist patched OK")
 
-# ================================================================ rehash
-
-
-def rehash_chunks():
-    umi_text = read(UMI)
-
-    def repl(match):
-        cid = match.group(1)
-        old_hash = match.group(2)
-        fname = cid + "." + old_hash + ".chunk.js"
-        fp = os.path.join(JS, fname)
-        if not os.path.exists(fp):
-            return match.group(0)
-        data = open(fp, "rb").read()
-        new_hash = hashlib.md5(data).hexdigest()[:8]
-        if new_hash == old_hash:
-            return match.group(0)
-        new_fp = os.path.join(JS, cid + "." + new_hash + ".chunk.js")
-        os.rename(fp, new_fp)
-        gz = fp + ".gz"
-        if os.path.exists(gz):
-            os.remove(gz)
-        print("rehash: " + fname + " -> " + cid + "." + new_hash + ".chunk.js")
-        return cid + ':"' + new_hash + '"'
-
-    new_umi = re.sub(r'(\\d+):"([a-f0-9]{8})"', repl, umi_text)
-    if new_umi != umi_text:
-        write(UMI, new_umi)
-        regen_gz(UMI)
-        print("rehash: umi.js chunk map updated")
-
-
-rehash_chunks()
+# ================================================================
+# 历史: 此处曾有内嵌 rehash_chunks(), 其正则双重转义匹配字面 '\d',
+# 实为 no-op; 真正的 rehash 由构建链末尾的 rehash_umi_entry.py 完成
+# (见 Dockerfile). 已删除死代码.

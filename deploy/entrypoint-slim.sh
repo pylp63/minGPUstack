@@ -1,10 +1,12 @@
 #!/bin/bash
 # GPUStack slim 镜像 entrypoint: 拉起内置 PostgreSQL, 再 exec gpustack
-# 参考 official pack/entrypoint.sh 的 postgres 初始化逻辑 (简化版)
+# 参考官方 pack/entrypoint.sh 的 postgres 初始化逻辑 (简化版)
 set -e
 
 DATA_DIR="${GPUSTACK_DATA_DIR:-/var/lib/gpustack}"
-PGDATA="${PGDATA:-/var/lib/postgresql/data}"
+# 二开修复: PGDATA 默认放进数据卷 (容器重建不丢库);
+# 显式设置 GPUSTACK_PGDATA/PGDATA 可覆盖, 兼容旧部署.
+PGDATA="${GPUSTACK_PGDATA:-${PGDATA:-$DATA_DIR/postgresql/data}}"
 PG_DB="gpustack"
 # 内置 PG 端口: host 网络模式下 5432 常被占用, 默认 5433
 PG_PORT="${GPUSTACK_EMBEDDED_PG_PORT:-5433}"
@@ -22,7 +24,19 @@ if [ -n "${GPUSTACK_DATABASE_URL:-}" ]; then
 fi
 
 mkdir -p "$DATA_DIR" "$PGDATA"
-chown -R postgres:postgres "$(dirname "$PGDATA")"
+
+# 旧部署迁移: 容器可写层的旧 PG 数据 (Dockerfile 原默认路径) 搬进卷.
+# 幂等: 仅当旧目录有数据且新目录为空时执行.
+LEGACY_PGDATA="/var/lib/postgresql/data"
+if [ -s "$LEGACY_PGDATA/PG_VERSION" ] && [ ! -s "$PGDATA/PG_VERSION" ]; then
+    echo "[entrypoint] migrating legacy postgres data $LEGACY_PGDATA -> $PGDATA"
+    mkdir -p "$(dirname "$PGDATA")"
+    cp -a "$LEGACY_PGDATA/." "$PGDATA/"
+fi
+
+# PG 数据目录属主必须是 postgres; 卷挂载点同理
+chown -R postgres:postgres "$(dirname "$PGDATA")" 2>/dev/null || true
+chown -R postgres:postgres "$PGDATA" 2>/dev/null || true
 
 # 首次启动: initdb + 创建库
 if [ ! -s "$PGDATA/PG_VERSION" ]; then

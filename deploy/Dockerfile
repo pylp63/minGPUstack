@@ -13,6 +13,12 @@
 ARG BASE_REGISTRY=docker.m.daocloud.io/library
 FROM ${BASE_REGISTRY}/python:3.11-slim AS base
 
+# UI 静态资源版本钉扎 (二开修复): 原版拉 latest.tar.gz, 官方 UI 一更新
+# patch 链的字面锚点就漂移 (构建不可复现). 钉到当前验证过的版本;
+# 升级 UI 时先本地验证 patch 链再更新此 SHA256.
+ARG UI_TARBALL_URL="https://gpustack-ui-1303613262.cos.accelerate.myqcloud.com/releases/latest.tar.gz"
+ARG UI_TARBALL_SHA256="df12eeccf16e1cbc859e4343e4e80cd16e8c9eefa293af3f468f3480ed1884da"
+
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -60,11 +66,14 @@ RUN uv venv /opt/venv \
     && VIRTUAL_ENV=/opt/venv uv pip install --no-build-isolation .
 
 # 下载 UI 静态资源 (腾讯云 COS, 国内直连; tarball 结构为 dist/...)
+# 二开修复: 校验 SHA256 (钉版本), 校验失败构建即失败 — 避免 latest
+# 漂移导致 patch 锚点失效产出坏镜像.
 RUN mkdir -p /workspace/gpustack/ui \
     && curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL \
-        "https://gpustack-ui-1303613262.cos.accelerate.myqcloud.com/releases/latest.tar.gz" \
-        | tar -xzf - --directory /workspace/gpustack/ui --strip-components=1 \
-    || echo "UI download failed; UI will not be available (API still works)"
+        "$UI_TARBALL_URL" -o /tmp/ui.tar.gz \
+    && echo "$UI_TARBALL_SHA256  /tmp/ui.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/ui.tar.gz --directory /workspace/gpustack/ui --strip-components=1 \
+    && rm -f /tmp/ui.tar.gz
 # static/ 下的目录图标等随包附带, 合并进 ui 目录
 RUN if [ -d /workspace/gpustack/ui ]; then cp -a /workspace/static/. /workspace/gpustack/ui/ 2>/dev/null || true; fi
 
@@ -92,11 +101,13 @@ RUN VIRTUAL_ENV=/opt/venv GPUSTACK_TOOLS_DOWNLOAD_BASE_URL="https://gpustack-130
 # ---- 运行阶段 ----
 FROM base AS runtime
 
+# 二开修复: PGDATA 放进数据卷 (compose 设 GPUSTACK_PGDATA=/var/lib/gpustack/
+# postgresql/data); 兼容旧路径由 entrypoint 迁移逻辑处理.
 ENV PATH="/opt/venv/bin:$PATH" \
     GPUSTACK_DATA_DIR=/var/lib/gpustack \
     GPUSTACK_GATEWAY_MODE=disabled \
     GPUSTACK_DISABLE_BUILTIN_OBSERVABILITY=true \
-    PGDATA=/var/lib/postgresql/data \
+    PGDATA=/var/lib/gpustack/postgresql/data \
     GPUSTACK_TOOLS_DOWNLOAD_BASE_URL="https://gpustack-1303613262.cos.ap-guangzhou.myqcloud.com"
 
 # 从构建阶段带走 venv 与 gpustack 包 (含修补后的 UI 和工具)
@@ -105,8 +116,8 @@ COPY --from=builder /opt/venv /opt/venv
 # 启动脚本: 初始化并拉起内置 PostgreSQL, 再启动 gpustack
 COPY deploy/entrypoint-slim.sh /usr/local/bin/entrypoint-slim.sh
 RUN chmod +x /usr/local/bin/entrypoint-slim.sh \
-    && mkdir -p /var/lib/gpustack /var/lib/postgresql \
-    && chown -R postgres:postgres /var/lib/postgresql
+    && mkdir -p /var/lib/gpustack /var/lib/postgresql /var/lib/gpustack/postgresql \
+    && chown -R postgres:postgres /var/lib/postgresql /var/lib/gpustack/postgresql
 
 VOLUME /var/lib/gpustack
 WORKDIR /

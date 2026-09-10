@@ -42,11 +42,15 @@ from gpustack.security import (
     generate_secure_password,
     get_secret_hash,
     new_secret_key_digest,
+    get_key_pair,
     API_KEY_PREFIX,
 )
 from gpustack.server.app import create_app
 from gpustack.server.passwords import set_password
-from gpustack.server.services import provision_bootstrap_admin_orgs
+from gpustack.server.services import (
+    APIKeyService,
+    provision_bootstrap_admin_orgs,
+)
 from gpustack.config.config import Config
 from gpustack.schemas.config import GatewayModeEnum
 from gpustack.config import registration
@@ -998,6 +1002,27 @@ class Server:
         # blow up.
         cluster = cluster_principal.cluster
         token = cluster.registration_token
+        # 二开修复 (P0): token 已存在时, 校验其 access_key 在 api_keys 表里仍有
+        # 对应行 (get_user_from_api_token 按 access_key 查行再验 secret; 行丢失
+        # 则 worker/embedded-worker 注册永远 401 且无法自愈). 场景: 历史上
+        # _ensure_registration_token 在 ApiKey.create 成功但后续步骤失败回滚,
+        # 或 DB 被部分恢复 — cluster.registration_token 残留而 ApiKey 行缺失.
+        # 自愈: 为现有 token 的 access_key 补建 ApiKey 行; 无法从 token 复原
+        # digest (secret 只在明文里), 行持有 argon2 散列需明文 secret — 拿不到
+        # 明文时只能整体换发新 token (同时改写 data_dir 的 token 文件).
+        if token:
+            access_key, _ = get_key_pair(token)
+            if access_key:
+                existing_key = await APIKeyService(session).get_by_access_key(
+                    access_key
+                )
+                if existing_key is None:
+                    logger.warning(
+                        "Registration token has no api_keys row "
+                        f"(access_key={access_key}); reissuing token."
+                    )
+                    token = None  # fall through, regenerate below
+
         if not token:
             try:
                 access_key = generate_access_key()

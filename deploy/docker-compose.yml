@@ -27,7 +27,12 @@ services:
       # 后端工具 (gguf-parser 等) 下载走腾讯云 COS 国内镜像
       - GPUSTACK_TOOLS_DOWNLOAD_BASE_URL=https://gpustack-1303613262.cos.ap-guangzhou.myqcloud.com
       # API/UI 端口 (host 网络模式下直接生效; 80/443 被 OpenStack 占用, 用 30080)
-      - GPUSTACK_API_PORT=${GPUSTACK_PORT:-30080}
+      - GPUSTACK_API_PORT=${GPUSTACK_PORT:-8080}
+      # 二开修复: 内置 PostgreSQL 数据目录放进 gpustack-data 卷.
+      # 原版 PGDATA=/var/lib/postgresql/data 在容器可写层, 容器一重建
+      # (down/up, 换镜像) 用户/审批/模型配置全丢. entrypoint 会读取
+      # 此变量, 未设时回落到 /var/lib/postgresql/data (兼容旧行为).
+      - GPUSTACK_PGDATA=/var/lib/gpustack/postgresql/data
       - TZ=${TZ:-Asia/Shanghai}
     volumes:
       - gpustack-data:/var/lib/gpustack

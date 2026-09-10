@@ -17,3 +17,5 @@ deploy/.env
 # 编辑器/系统
 .DS_Store
 *.swp
+# GitHub push token (deploy/git_push.sh)
+.gh_token

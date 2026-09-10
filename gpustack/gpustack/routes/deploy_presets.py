@@ -1,10 +1,11 @@
-"""Deployment architecture presets (feature two): one-click deploy.
+"""Deployment architecture presets v2 (feature two): one-click deploy.
 
-Endpoints::
+Endpoints (v2 prefix, registered in routes.py)::
 
-    GET  /v1/deploy-presets                 list available architectures
-    POST /v1/deploy-presets/plan            expand to ModelCreate payloads
-    POST /v1/deploy-presets/deploy          plan + create the models
+    GET  /deploy-presets                 list available architectures
+    POST /deploy-presets/plan            expand to ModelCreate payloads
+    POST /deploy-presets/preview         full plan: roles + topology + YAML
+    POST /deploy-presets/deploy          plan + create the models
 
 `deploy` runs the same expansion as `plan` and then creates the
 resulting Model rows through the model-create path (including the
@@ -23,6 +24,7 @@ from gpustack.schemas.deploy_presets import (
     PresetDeployRequest,
     PRESET_DESCRIPTIONS,
     build_preset_payloads,
+    build_topology_graph,
 )
 from gpustack.server.deps import SessionDep, TenantContextDep
 
@@ -34,31 +36,23 @@ router = APIRouter()
 @router.get("", response_model=List[dict])
 async def list_presets():
     """Enumerate the supported one-click deployment architectures."""
-    return [
-        {
-            "architecture": arch.value,
-            "description": desc,
-            "parameters": (
-                ["prefill_gpu_count", "decode_gpu_count"]
-                if arch in (DeploymentArchitectureEnum.PD_DISAGGREGATED,)
-                else (
-                    [
-                        "prefill_gpu_count",
-                        "decode_gpu_count",
-                        "prefill_replicas",
-                        "decode_replicas",
-                    ]
-                    if arch == DeploymentArchitectureEnum.MULTI_PD
-                    else (
-                        ["pipeline_parallel_size"]
-                        if arch == DeploymentArchitectureEnum.PIPELINE_PARALLEL
-                        else []
-                    )
-                )
-            ),
-        }
-        for arch, desc in PRESET_DESCRIPTIONS.items()
-    ]
+    out = []
+    for arch, desc in PRESET_DESCRIPTIONS.items():
+        params: List[str] = []
+        if arch in (DeploymentArchitectureEnum.PD_DISAGGREGATED,
+                    DeploymentArchitectureEnum.MULTI_PD):
+            params = ["prefill_gpu_count", "decode_gpu_count",
+                      "prefill_replicas", "decode_replicas",
+                      "router_replicas", "kv_transfer"]
+        elif arch == DeploymentArchitectureEnum.PIPELINE_PARALLEL:
+            params = ["pipeline_parallel_size", "tensor_parallel_size"]
+        elif arch == DeploymentArchitectureEnum.STANDALONE:
+            params = ["replicas", "tensor_parallel_size"]
+        elif arch == DeploymentArchitectureEnum.CUSTOM:
+            params = ["custom_topology"]
+        out.append({"architecture": arch.value, "description": desc,
+                    "parameters": params})
+    return out
 
 
 @router.post("/plan", response_model=PresetDeployPlan)
@@ -70,13 +64,45 @@ async def plan_preset(req: PresetDeployRequest):
         raise InvalidException(message=str(e))
 
 
+@router.post("/preview")
+async def preview_preset(req: PresetDeployRequest):
+    """Full deploy plan preview: roles / topology graph / YAML.
+
+    验收要求: 部署计划可预览, 包含节点角色、GPU、端口、环境变量、
+    启动命令、依赖. 返回 topology(前端 SVG 用) + plan_yaml(可下载).
+    """
+    try:
+        plan = build_preset_payloads(req)
+    except ValueError as e:
+        raise InvalidException(message=str(e))
+    return {
+        "architecture": plan.architecture,
+        "description": plan.description,
+        "roles": [r.model_dump() for r in plan.roles],
+        "topology": build_topology_graph(plan),
+        "plan_yaml": plan.plan_yaml,
+        "payloads": plan.payloads,
+    }
+
+
 @router.post("/deploy", response_model=PresetDeployPlan)
-async def deploy_preset(session: SessionDep, ctx: TenantContextDep, req: PresetDeployRequest):
+async def deploy_preset(session: SessionDep, ctx: TenantContextDep,
+                        req: PresetDeployRequest):
     """One-click deploy: expand the preset and create the models."""
     from gpustack.routes.models import create_model
     from gpustack.schemas.models import ModelCreate
 
     plan = build_preset_payloads(req)
+
+    # models.cluster_id 非空约束: 未显式指定时回落到默认集群.
+    if not req.cluster_id:
+        from gpustack.schemas.clusters import Cluster
+        default_cluster = await Cluster.first_by_field(
+            session=session, field="is_default", value=True
+        )
+        if default_cluster is not None:
+            for payload in plan.payloads:
+                payload["cluster_id"] = default_cluster.id
 
     created = []
     try:
@@ -84,7 +110,8 @@ async def deploy_preset(session: SessionDep, ctx: TenantContextDep, req: PresetD
             model_in = ModelCreate(**payload)
             # Reuse the full model-create path — validation, quota
             # enforcement (feature one), tenant stamping, route wiring.
-            model = await create_model(session=session, ctx=ctx, model_in=model_in)
+            model = await create_model(session=session, ctx=ctx,
+                                       model_in=model_in)
             created.append(model)
     except Exception as e:
         # Best effort rollback of already-created siblings so a failed

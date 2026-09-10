@@ -43,7 +43,9 @@ cd "$SCRIPT_DIR"
 
 if [[ "$SKIP_BUILD" != "true" ]]; then
   echo "==> 构建 gpustack-custom 镜像 (首次构建较慢)..."
-  docker build -t gpustack-custom:latest -f Dockerfile "$(dirname "$SCRIPT_DIR")"
+  # 二开修复: Dockerfile 在 deploy/ 下, 构建上下文是仓库根
+  docker build --network host -t gpustack-custom:latest \
+    -f "$SCRIPT_DIR/Dockerfile" "$SCRIPT_DIR/.."
 fi
 
 echo "==> 启动 GPUStack..."

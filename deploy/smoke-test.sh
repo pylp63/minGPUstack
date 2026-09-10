@@ -98,8 +98,8 @@ PASS "dev1 配额 = $QUOTA"
 STEP "8. 部署架构 presets"
 PRESETS=$(curl -sf -b "$JAR_ADMIN" "$API/deploy-presets")
 N=$(echo "$PRESETS" | jq 'len(d)')
-[ "$N" = "4" ] || FAIL "应有 4 种架构, 实际 $N"
-PASS "4 种架构: $(echo "$PRESETS" | jq '",".join(x["architecture"] for x in d)')"
+[ "$N" = "5" ] || FAIL "应有 5 种架构 (standalone/pd/multi_pd/pp/custom), 实际 $N"
+PASS "5 种架构: $(echo "$PRESETS" | jq '",".join(x["architecture"] for x in d)')"
 
 PLAN=$(curl -sf -b "$JAR_ADMIN" -X POST "$API/deploy-presets/plan" \
   -H "Content-Type: application/json" \
@@ -116,6 +116,43 @@ PLAN2=$(curl -sf -b "$JAR_ADMIN" -X POST "$API/deploy-presets/plan" \
 PP=$(echo "$PLAN2" | jq 'sum(1 for p in d["payloads"] for b in [p.get("backend_parameters") or []] if "--pipeline-parallel-size=4" in b)')
 [ "$PP" = "1" ] || FAIL "流水线并行参数未生成"
 PASS "流水线并行 --pipeline-parallel-size=4 已生成"
+
+STEP "8b. PD 引擎参数语法 (kv 对称)"
+PDPLAN=$(curl -sf -b "$JAR_ADMIN" -X POST "$API/deploy-presets/plan" \
+  -H "Content-Type: application/json" \
+  -d '{"architecture":"pd_disaggregated","model_name":"kvtest","model_source":"Qwen/Qwen2.5-0.5B-Instruct","kv_transfer":true}')
+NP=$(echo "$PDPLAN" | jq 'sum(1 for p in d["payloads"] for b in [p.get("backend_parameters") or []] if "kv_producer" in " ".join(b))')
+NC=$(echo "$PDPLAN" | jq 'sum(1 for p in d["payloads"] for b in [p.get("backend_parameters") or []] if "kv_consumer" in " ".join(b))')
+[ "$NP" = "1" ] && [ "$NC" = "1" ] || FAIL "kv 参数不对称 (producer=$NP consumer=$NC, 应各 1)"
+BAD=$(echo "$PDPLAN" | jq 'sum(1 for p in d["payloads"] for b in [p.get("backend_parameters") or []] if "api-server-type" in " ".join(b))')
+[ "$BAD" = "0" ] || FAIL "仍生成不存在的 --api-server-type 参数"
+PASS "kv producer/consumer 对称, 无引擎不识别参数"
+
+STEP "8c. 拓扑图 edges 指向真实节点"
+TOPO=$(curl -sf -b "$JAR_ADMIN" -X POST "$API/deploy-presets/preview" \
+  -H "Content-Type: application/json" \
+  -d '{"architecture":"pd_disaggregated","model_name":"edgetest","model_source":"Qwen/Qwen2.5-0.5B-Instruct"}')
+DANGLING=$(echo "$TOPO" | TOPO="$TOPO" python3 -c '
+import json, os, sys
+d = json.loads(os.environ["TOPO"])
+topo = d["topology"]
+ids = {n["id"] for n in topo["nodes"]}
+bad = [e for e in topo["edges"] if e["from"] not in ids or e["to"] not in ids]
+print(len(bad))')
+[ "$DANGLING" = "0" ] || FAIL "拓扑图有 $DANGLING 条悬空边 (from/to 不在节点集)"
+PASS "拓扑图全部边指向真实节点"
+
+STEP "8d. deploy-topologies 单机部署 (端到端)"
+TD=$(curl -sf -b "$JAR_ADMIN" -X POST "$API/deploy-topologies/deploy" \
+  -H "Content-Type: application/json" \
+  -d '{"shape":"single_node_tp","model_name":"topo-smoke","model_source":"Qwen/Qwen2.5-0.5B-Instruct","replicas":1}')
+TU=$(echo "$TD" | jq 'len(d["units"])')
+[ "$TU" = "1" ] || FAIL "topologies 部署单元数应为 1, 实际 $TU"
+PASS "deploy-topologies deploy 成功 (不再 422/500)"
+curl -sf -b "$JAR_ADMIN" "$API/models?search=topo-smoke" | jq 'len(d["items"])' | sed 's/^/  已创建模型数: /'
+MID2=$(curl -sf -b "$JAR_ADMIN" "$API/models?search=topo-smoke" | jq 'next((m["id"] for m in d["items"] if m["name"]=="topo-smoke"), None)')
+[ "$MID2" != "None" ] && [ -n "$MID2" ] && curl -sf -b "$JAR_ADMIN" -X DELETE "$API/models/$MID2" -o /dev/null \
+  && echo "  (清理 topo-smoke 完成)"
 
 STEP "9. worker 视图隔离"
 ALL_WORKERS=$(curl -sf -b "$JAR_ADMIN" "$API/workers")
