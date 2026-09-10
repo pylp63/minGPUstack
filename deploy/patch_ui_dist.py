@@ -93,6 +93,9 @@ new_items = (
     '50:{name:"deployWizard",path:"/models/deploy-wizard",key:"deployWizard",'
     'icon:"icon-rocket-launch1",selectedIcon:"icon-rocket-launch-fill",'
     'defaultIcon:"icon-rocket-launch1",parentId:"9",id:"50"},'
+    '51:{name:"servingTopology",path:"/models/serving-topology",key:"servingTopology",'
+    'icon:"icon-rocket-launch1",selectedIcon:"icon-rocket-launch-fill",'
+    'defaultIcon:"icon-rocket-launch1",parentId:"9",id:"51"},'
 )
 if 'id:"49"' not in u:
     u = u.replace(anchor_m.group(1), anchor_m.group(1) + new_items, 1)
@@ -125,7 +128,7 @@ else:
                 break
         j += 1
     lazy_expr = u[start_expr:j]  # 42 完整的 lazy 加载链
-    extra = ",49:" + lazy_expr + ",50:" + lazy_expr
+    extra = ",49:" + lazy_expr + ",50:" + lazy_expr + ",51:" + lazy_expr
     u = u[:j] + extra + u[j:]
     print("C2: component binding 49/50 added (balanced anchor)")
 
@@ -138,6 +141,7 @@ if u != orig:
 LABELS = {
     "menu.models.console": "控制台",
     "menu.models.deployWizard": "部署向导",
+    "menu.models.servingTopology": "服务拓扑",
     "menu.accessControl.organizations": "用户组",
 }
 patched = 0
@@ -222,7 +226,8 @@ STUB = (
     'var src="/console/?embed=1&tab=";'
     'if(typeof window!=="undefined"){'
     'var h=window.location.hash||"";'
-    'if(h.indexOf("/models/deploy-wizard")!==-1){src="/console/deploy_wizard.html?embed=1"}'
+    'if(h.indexOf("/models/serving-topology")!==-1){src="/console/serving_topology.html?embed=1"}'
+    'else if(h.indexOf("/models/deploy-wizard")!==-1){src="/console/deploy_wizard.html?embed=1"}'
     'else if(h.indexOf("/access-control/organizations")!==-1){src="/console/?embed=1&tab=groups"}'
     '}'
     'return R.createElement("iframe",{'

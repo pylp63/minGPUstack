@@ -43,6 +43,12 @@ if [ "$DEV1_ID" = "None" ] || [ -z "$DEV1_ID" ]; then
     -d "{\"username\":\"dev1\",\"password\":\"$PASSWD\",\"is_admin\":false}" >/dev/null \
     || FAIL "创建 dev1 失败"
   DEV1_ID=$(curl -sf -b "$JAR_ADMIN" "$API/users?search=dev1" | jq 'next((u["id"] for u in d["items"] if u["username"]=="dev1"), None)')
+else
+  # 用户已存在 (数据卷持久化): 重置密码保证后续登录步骤可用
+  curl -sf -b "$JAR_ADMIN" -X PUT "$API/users/$DEV1_ID" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"dev1\",\"password\":\"$PASSWD\",\"is_admin\":false}" >/dev/null \
+    || FAIL "重置 dev1 密码失败"
 fi
 PASS "dev1 就绪 (id=$DEV1_ID)"
 

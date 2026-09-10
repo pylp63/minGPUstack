@@ -57,6 +57,7 @@ from gpustack.routes import (
     worker_access,
     deploy_presets,
     deploy_topologies,
+    serving_topology,
 )
 
 from gpustack.api.exceptions import error_responses, openai_api_error_responses
@@ -179,6 +180,12 @@ v1_base_router.include_router(
     deploy_topologies.router,
     prefix="/deploy-topologies",
     tags=["Deploy Topologies"],
+)
+
+v1_base_router.include_router(
+    serving_topology.router,
+    prefix="/serving-topology",
+    tags=["Serving Topology"],
 )
 
 cluster_client_router = APIRouter()
