@@ -941,7 +941,9 @@ async def worker_ssh_exec(
         if ipaddress.ip_address(worker.ip or "") in ipaddress.ip_network(
             "198.18.0.0/15"
         ):
-            w = worker.model_copy(update={"ip": "127.0.0.1"})
+            w = worker.model_copy(
+                update={"ip": "127.0.0.1", "advertise_address": "127.0.0.1"}
+            )
     except ValueError:
         pass
 
