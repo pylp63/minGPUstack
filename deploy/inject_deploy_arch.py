@@ -128,7 +128,7 @@ FIELD_GROUP = (
     '(0,D.jsx)(k.Z.Item,{noStyle:!0,'
     'shouldUpdate:function(a,b){return a.serving_topology!==b.serving_topology},'
     'children:function(fv){'
-    'var arch=fv.serving_topology;'
+    'var arch=fv.getFieldValue("serving_topology");'
     'var pd=(arch==="pd_disaggregated");'
     'var pp=(arch==="pipeline_parallel");'
     'if(!pd&&!pp){return null}'
