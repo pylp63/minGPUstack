@@ -149,6 +149,7 @@ FIELD_GROUP = (
     'if(!pd&&!pp){return null}'
     'var out=[];'
     'if(pd){out.push('
+    '(0,D.jsx)(k.Z.Item,{name:"pd_node_assign",hidden:!0,children:(0,D.jsx)("input",{style:{display:"none"}})}),'
     '(0,D.jsx)(k.Z.Item,{name:"prefill_groups",'
     'children:(0,D.jsx)(Y.Z.Input,{type:"number",min:1,max:64,'
     'label:e.formatMessage({id:"models.form.servingTopology.pgroups"})})}'
