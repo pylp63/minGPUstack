@@ -947,18 +947,24 @@ async def worker_ssh_exec(
     except ValueError:
         pass
 
+    # 自建一次性 session: app.state 的两个 session 共享同一 connector,
+    # force_close + 共享组合在部分请求路径上不稳定 (连接被另一侧关闭)。
+    _connector = aiohttp.TCPConnector(limit=4, force_close=True)
     try:
-        _, resp_body = await request_to_worker(
-            worker=w,
-            method="POST",
-            path="files/exec",
-            proxy_client=request.app.state.http_client,
-            no_proxy_client=request.app.state.http_client_no_proxy,
-            data=json.dumps({"command": command}).encode(),
-            headers={"Content-Type": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=45, sock_connect=5),
-        )
+        async with aiohttp.ClientSession(connector=_connector) as _sess:
+            _, resp_body = await request_to_worker(
+                worker=w,
+                method="POST",
+                path="files/exec",
+                proxy_client=_sess,
+                no_proxy_client=_sess,
+                data=json.dumps({"command": command}).encode(),
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=45, sock_connect=5),
+            )
     except aiohttp.ClientError as e:
         raise InvalidException(message=f"worker 不可达: {e}")
+    finally:
+        await _connector.close()
 
     return json.loads(resp_body or b'{"returncode": -1, "output": "no response"}')
