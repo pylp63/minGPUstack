@@ -34,6 +34,15 @@ services:
       # 此变量, 未设时回落到 /var/lib/postgresql/data (兼容旧行为).
       - GPUSTACK_PGDATA=/var/lib/gpustack/postgresql/data
       - TZ=${TZ:-Asia/Shanghai}
+    # 镜像更新窗口内 UI 静态资源会短暂 404, 浏览器可能缓存该 404 导致
+    # "Loading chunk failed" 停留; 服务端已对 404 加 no-store. healthcheck
+    # 让编排层等 API 真正就绪再视为健康, 缩短误访问窗口.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:${GPUSTACK_PORT:-8080}/ >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
     volumes:
       - gpustack-data:/var/lib/gpustack
       - /var/run/docker.sock:/var/run/docker.sock  # 让 GPUStack 能起推理容器

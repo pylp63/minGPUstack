@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException
-from starlette.responses import Response
+from starlette.responses import PlainTextResponse, Response
 from starlette.types import Scope
 
 # One year, the conventional "forever" — the longest value HTTP caches are
@@ -110,7 +110,23 @@ class PrecompressedStaticFiles(StaticFiles):
             if response is not None:
                 return response
 
-        response = await super().get_response(path, scope)
+        # A miss during a restart window must not outlive the window: an
+        # undecorated 404 (container mid-recreate, bundle not landed yet) that
+        # a browser or proxy stores keeps replaying after the service is back,
+        # freezing the SPA on "Loading chunk failed" until a manual cache
+        # purge. StaticFiles raises the miss as an HTTPException — catch it
+        # here and answer with the same status plus ``no-store`` so the miss
+        # stays single-shot: the next navigation re-requests and succeeds.
+        try:
+            response = await super().get_response(path, scope)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                return PlainTextResponse(
+                    "Not Found", status_code=404, headers={
+                        "Cache-Control": "no-store"
+                    }
+                )
+            raise
         self._apply_policy(response, path)
         return response
 

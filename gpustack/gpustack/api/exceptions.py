@@ -241,6 +241,16 @@ def register_handlers(app: FastAPI):
                 request.url.path,
                 request.method,
             )
+        headers = None
+        # A 404 during an upgrade window must not be stored. The SPA loads
+        # hashed assets with a year-long immutable lifetime, and an
+        # undecorated miss (the container is mid-restart, the new bundle has
+        # not landed yet) that a browser or proxy caches keeps replaying
+        # after the service is back — freezing the UI on "Loading chunk
+        # failed" until a manual cache purge. Marking the miss no-store keeps
+        # it single-shot: the next navigation re-requests and succeeds.
+        if exc.status_code == 404:
+            headers = {"Cache-Control": "no-store"}
         return JSONResponse(
             status_code=exc.status_code,
             content=ErrorResponse(
@@ -249,6 +259,7 @@ def register_handlers(app: FastAPI):
                 message=exc.message,
                 details=getattr(exc, "details", None),
             ).model_dump(),
+            headers=headers,
         )
 
     @app.exception_handler(OpenAIAPIException)
