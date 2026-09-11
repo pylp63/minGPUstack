@@ -960,6 +960,82 @@ async def validate_shared_kv_cache(
     "",
     response_model=ModelPublic,
 )
+async def create_model_route(
+    request: Request,
+    session: SessionDep,
+    ctx: TenantContextDep,
+    model_in: ModelCreate,
+):
+    """Create a model — or, when the request carries a serving topology,
+    expand it through the preset planner first.
+
+    The deploy form's ``serving_topology`` field rides along in the body
+    (``ModelCreate`` ignores unknown keys), so the raw payload is read
+    here: a PD/multi-PD/pipeline selection deploys the expanded group
+    set through the same validation + quota path, and the first created
+    model is returned so the form's post-submit flow (navigation to the
+    instance view) works unchanged.
+    """
+    topology = (await _serving_topology_from_request(request)) or {}
+    arch = topology.get("serving_topology")
+    if arch and arch != "standalone":
+        from gpustack.routes.deploy_presets import deploy_preset
+        from gpustack.schemas.deploy_presets import PresetDeployRequest
+
+        req = PresetDeployRequest(
+            architecture=arch,
+            model_name=model_in.name,
+            model_source=(
+                model_in.huggingface_repo_id
+                or model_in.model_scope_model_id
+                or model_in.local_path
+                or model_in.name
+            ),
+            model_source_kind=model_in.source,
+            backend=model_in.backend,
+            backend_parameters=model_in.backend_parameters,
+            env=model_in.env,
+            cluster_id=model_in.cluster_id,
+            prefill_gpu_count=int(topology.get("prefill_gpu_count") or 1),
+            decode_gpu_count=int(topology.get("decode_gpu_count") or 1),
+            pipeline_parallel_size=int(
+                topology.get("pipeline_parallel_size") or 2
+            ),
+            tensor_parallel_size=max(
+                1,
+                len(model_in.gpu_selector.gpu_ids or [])
+                if model_in.gpu_selector
+                else 1,
+            ),
+        )
+        plan = await deploy_preset(session=session, ctx=ctx, req=req)
+        created = getattr(plan, "created_models", None) or []
+        if created:
+            return await Model.one_by_id(session=session, id=created[0]["id"])
+        raise InvalidException(
+            message="serving topology deploy produced no models"
+        )
+    return await create_model(session=session, ctx=ctx, model_in=model_in)
+
+
+async def _serving_topology_from_request(request: Request) -> dict:
+    """The topology fields the form submits, or an empty dict.
+
+    ``model_in`` has already consumed the body through FastAPI; re-reading
+    a consumed body raises, so cache a copy the first time and reuse it.
+    """
+    cached = getattr(request.state, "_raw_json", None)
+    if cached is None:
+        try:
+            cached = await request.json()
+        except Exception:  # noqa: BLE001
+            cached = {}
+        if not isinstance(cached, dict):
+            cached = {}
+        request.state._raw_json = cached
+    return cached
+
+
 async def create_model(
     session: SessionDep, ctx: TenantContextDep, model_in: ModelCreate
 ):

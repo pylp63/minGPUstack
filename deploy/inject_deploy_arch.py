@@ -1,4 +1,4 @@
-"""构建期 patch: 注入「多机」tab + 多机参数字段到部署表单 (8671 chunk).
+"""构建期 patch: 注入「服务拓扑」字段组到部署表单 (8671 chunk) 高级 tab.
 
 目标: 高级 tab 之后新增「多机」分段, 支持一个模型放不下跨多台机器的场景:
   - standalone       单机部署 (默认, 现状)
@@ -81,6 +81,8 @@ idx_old = t.find(OLD_ARCH_MARK)
 if idx_old != -1:
     # 回溯到旧字段 Form.Item 的起点 children:[ 或 (0,D.jsx)(k.Z.Item
     start = t.rfind('(0,D.jsx)(k.Z.Item,{name:"deploy_architecture"', 0, idx_old)
+    if start == -1:
+        start = t.rfind('(0,D.jsx)(k.Z.Item,{name:"serving_topology"', 0, idx_old)
     if start != -1:
         # 终点: 该字段结束后的下一个 (0,D.jsx)(k.Z.Item (即 categories)
         end = t.find('(0,D.jsx)(k.Z.Item', idx_old)
@@ -108,32 +110,32 @@ if ci == -1:
 # 改为记录所选架构, 提交时由表单 JS 调 /v2/deploy-presets/deploy
 # 展开 (PD 分离 => prefill+decode 两个模型), backend_parameters 留空.
 FIELD_GROUP = (
-    '(0,D.jsx)(k.Z.Item,{name:"deploy_architecture","data-field":"deploy_architecture",'
+    '(0,D.jsx)(k.Z.Item,{name:"serving_topology","data-field":"serving_topology",'
     'style:{scrollMarginTop:200},'
-    'label:e.formatMessage({id:"deploy.arch.label"}),'
-    'extra:e.formatMessage({id:"deploy.arch.hint"}),'
+    'label:e.formatMessage({id:"models.form.servingTopology.mode"}),'
+    'extra:e.formatMessage({id:"models.form.servingTopology.tips"}),'
     'children:(0,D.jsx)(z.Z,{allowNull:!0,'
-    'placeholder:e.formatMessage({id:"deploy.arch.placeholder"}),'
-    'options:[{label:"单机部署",value:"standalone"},'
-    '{label:"PD 分离 (prefill+decode)",value:"pd_disaggregated"},'
-    '{label:"多P多D (multi-P-multi-D)",value:"multi_pd"},'
-    '{label:"流水线并行 (一模型跨多节点)",value:"pipeline_parallel"}],'
+    'placeholder:e.formatMessage({id:"models.form.servingTopology.placeholder"}),'
+    'options:[{label:e.formatMessage({id:"models.form.servingTopology.standalone"}),value:"standalone"},'
+    '{label:e.formatMessage({id:"models.form.servingTopology.pd"}),value:"pd_disaggregated"},'
+    '{label:e.formatMessage({id:"models.form.servingTopology.multipd"}),value:"multi_pd"},'
+    '{label:e.formatMessage({id:"models.form.servingTopology.pipeline"}),value:"pipeline_parallel"}],'
     'onChange:function(v){'
     'n.setFieldValue("backend_parameters",[]);'
     'n.setFieldValue("distributed_inference_across_workers",v==="pipeline_parallel");'
     '}})}),'
-    '(0,D.jsx)(k.Z.Item,{noStyle:!0,shouldUpdate:function(a,b){return a.deploy_architecture!==b.deploy_architecture},'
-    'children:function(fv){var arch=fv.deploy_architecture;'
+    '(0,D.jsx)(k.Z.Item,{noStyle:!0,shouldUpdate:function(a,b){return a.serving_topology!==b.serving_topology},'
+    'children:function(fv){var arch=fv.serving_topology;'
     'var pd=(arch==="pd_disaggregated"||arch==="multi_pd");'
     'var pp=(arch==="pipeline_parallel");'
     'if(!pd&&!pp){return null}'
     'var out=[];'
-    'if(pd){out.push((0,D.jsx)(k.Z.Item,{name:"num_p",label:"prefill (P) 节点数",'
-    'children:(0,D.jsx)(z.Z,{options:[{label:"1",value:1},{label:"2",value:2},{label:"3",value:3},{label:"4",value:4}],defaultValue:1})})'
-    ',(0,D.jsx)(k.Z.Item,{name:"num_d",label:"decode (D) 节点数",'
-    'children:(0,D.jsx)(z.Z,{options:[{label:"1",value:1},{label:"2",value:2},{label:"3",value:3},{label:"4",value:4}],defaultValue:1})}))}'
-    'if(pp){out.push((0,D.jsx)(k.Z.Item,{name:"num_pipeline",label:"流水线并行度 (节点/GPU 数)",'
-    'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:2,min:1,max:16})}))}'
+    'if(pd){out.push((0,D.jsx)(k.Z.Item,{name:"prefill_gpu_count",label:e.formatMessage({id:"models.form.servingTopology.prefill"}),'
+    'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:1,min:1,max:64})})'
+    ',(0,D.jsx)(k.Z.Item,{name:"decode_gpu_count",label:e.formatMessage({id:"models.form.servingTopology.decode"}),'
+    'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:1,min:1,max:64})}))}'
+    'if(pp){out.push((0,D.jsx)(k.Z.Item,{name:"pipeline_parallel_size",label:e.formatMessage({id:"models.form.servingTopology.ppSize"}),'
+    'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:2,min:2,max:16})}))}'
     'return (0,D.jsx)(D.Fragment,{children:out})'
     '}}),'
 )
@@ -186,11 +188,17 @@ for lf in [f] + glob.glob(os.path.join(JS, "*.chunk.js")):
     if '"models.form.categories"' not in lt:
         continue
     labels = [
-        ("deploy.arch.label", "多机部署架构"),
-        ("deploy.arch.placeholder", "选择多机架构 (单机 / PD分离 / 多P多D / 流水线并行)"),
-        ("deploy.arch.hint",
-         "选择多机架构后, 提交时由部署向导展开为多模型部署; "
-         "此处不再直接改写启动参数"),
+        ("models.form.servingTopology.mode", "服务拓扑"),
+        ("models.form.servingTopology.tips",
+         "选择服务拓扑后按该架构部署; PD 分离将创建 prefill/decode 两组实例"),
+        ("models.form.servingTopology.placeholder", "选择服务拓扑 (默认单机部署)"),
+        ("models.form.servingTopology.standalone", "单机部署"),
+        ("models.form.servingTopology.pd", "PD 分离 (prefill + decode)"),
+        ("models.form.servingTopology.multipd", "多 P 多 D"),
+        ("models.form.servingTopology.pipeline", "流水线并行 (跨节点)"),
+        ("models.form.servingTopology.prefill", "Prefill GPU 数"),
+        ("models.form.servingTopology.decode", "Decode GPU 数"),
+        ("models.form.servingTopology.ppSize", "流水线并行度 (节点数)"),
     ]
     changed = False
     for k, v in labels:

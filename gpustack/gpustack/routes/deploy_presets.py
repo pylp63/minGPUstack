@@ -124,6 +124,9 @@ async def deploy_preset(session: SessionDep, ctx: TenantContextDep,
                 logger.warning(f"Failed to roll back model {m.id}")
         raise
 
+    plan.created_models = [
+        {"id": m.id, "name": m.name} for m in created
+    ]
     logger.info(
         f"Preset '{req.architecture.value}' deployed: "
         f"{[m.name for m in created]}"

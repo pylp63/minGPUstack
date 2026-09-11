@@ -117,6 +117,8 @@ class PresetDeployPlan(BaseModel):
     roles: List[RolePlan]
     payloads: List[Dict[str, Any]]
     plan_yaml: str = Field(default="", description="完整计划 YAML")
+    # deploy 后回填: [{"id": .., "name": ..}] (plan 阶段为空)
+    created_models: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 PRESET_DESCRIPTIONS = {
