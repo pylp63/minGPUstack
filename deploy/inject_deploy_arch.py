@@ -112,7 +112,6 @@ if ci == -1:
 FIELD_GROUP = (
     '(0,D.jsx)(k.Z.Item,{name:"serving_topology","data-field":"serving_topology",'
     'style:{scrollMarginTop:200},'
-    'extra:e.formatMessage({id:"models.form.servingTopology.tips"}),'
     'children:(0,D.jsx)(z.Z,{allowNull:!0,'
     'label:e.formatMessage({id:"models.form.servingTopology.mode"}),'
     'placeholder:e.formatMessage({id:"models.form.servingTopology.placeholder"}),'
@@ -123,6 +122,13 @@ FIELD_GROUP = (
     'onChange:function(v){'
     'n.setFieldValue("backend_parameters",[]);'
     'n.setFieldValue("distributed_inference_across_workers",v==="pipeline_parallel");'
+    'if(v==="pd_disaggregated"){'
+    'if(n.getFieldValue("prefill_groups")===undefined){n.setFieldValue("prefill_groups",1)}'
+    'if(n.getFieldValue("decode_groups")===undefined){n.setFieldValue("decode_groups",1)}'
+    'if(n.getFieldValue("prefill_gpu_count")===undefined){n.setFieldValue("prefill_gpu_count",1)}'
+    'if(n.getFieldValue("decode_gpu_count")===undefined){n.setFieldValue("decode_gpu_count",1)}}'
+    'if(v==="pipeline_parallel"){'
+    'if(n.getFieldValue("pipeline_parallel_size")===undefined){n.setFieldValue("pipeline_parallel_size",2)}}'
     '}})'
     '}),'
     '(0,D.jsx)(k.Z.Item,{noStyle:!0,'
@@ -135,24 +141,24 @@ FIELD_GROUP = (
     'var out=[];'
     'if(pd){out.push('
     '(0,D.jsx)(k.Z.Item,{name:"prefill_groups",'
-    'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:1,min:1,max:64,'
+    'children:(0,D.jsx)(Y.Z.Input,{type:"number",min:1,max:64,'
     'label:e.formatMessage({id:"models.form.servingTopology.pgroups"})})}'
     '),'
     '(0,D.jsx)(k.Z.Item,{name:"decode_groups",'
-    'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:1,min:1,max:64,'
+    'children:(0,D.jsx)(Y.Z.Input,{type:"number",min:1,max:64,'
     'label:e.formatMessage({id:"models.form.servingTopology.dgroups"})})}'
     '),'
     '(0,D.jsx)(k.Z.Item,{name:"prefill_gpu_count",'
-    'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:1,min:1,max:64,'
+    'children:(0,D.jsx)(Y.Z.Input,{type:"number",min:1,max:64,'
     'label:e.formatMessage({id:"models.form.servingTopology.prefill"})})}'
     '),'
     '(0,D.jsx)(k.Z.Item,{name:"decode_gpu_count",'
-    'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:1,min:1,max:64,'
+    'children:(0,D.jsx)(Y.Z.Input,{type:"number",min:1,max:64,'
     'label:e.formatMessage({id:"models.form.servingTopology.decode"})})}'
     '))}'
     'if(pp){out.push('
     '(0,D.jsx)(k.Z.Item,{name:"pipeline_parallel_size",'
-    'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:2,min:2,max:16,'
+    'children:(0,D.jsx)(Y.Z.Input,{type:"number",min:2,max:16,'
     'label:e.formatMessage({id:"models.form.servingTopology.ppSize"})})}'
     '))}'
     'return (0,D.jsx)(D.Fragment,{children:out})'
@@ -216,8 +222,6 @@ for lf in [f] + glob.glob(os.path.join(JS, "*.chunk.js")) + umis:
         continue
     labels = [
         ("models.form.servingTopology.mode", "服务拓扑"),
-        ("models.form.servingTopology.tips",
-         "选择后按该拓扑部署，PD 分离将分别创建 Prefill 与 Decode 实例，节点数量 >1 即多 P 多 D 水平扩展"),
         ("models.form.servingTopology.placeholder", "默认单机部署"),
         ("models.form.servingTopology.standalone", "单机部署"),
         ("models.form.servingTopology.pd", "PD 分离"),
