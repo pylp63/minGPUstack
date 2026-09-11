@@ -129,7 +129,7 @@ FIELD_GROUP = (
     'if(!pd&&!pp){return null}'
     'var out=[];'
     'if(pd){out.push((0,D.jsx)(k.Z.Item,{name:"num_p",label:"prefill (P) 节点数",'
-    'children:(0,D.jsx)(z.Z,{options:[{label:"1",value:1},{label:"2",value:2},{label:"3",value:3},{label:"4",value:4}],defaultValue:1})}))'
+    'children:(0,D.jsx)(z.Z,{options:[{label:"1",value:1},{label:"2",value:2},{label:"3",value:3},{label:"4",value:4}],defaultValue:1})})'
     ',(0,D.jsx)(k.Z.Item,{name:"num_d",label:"decode (D) 节点数",'
     'children:(0,D.jsx)(z.Z,{options:[{label:"1",value:1},{label:"2",value:2},{label:"3",value:3},{label:"4",value:4}],defaultValue:1})}))}'
     'if(pp){out.push((0,D.jsx)(k.Z.Item,{name:"num_pipeline",label:"流水线并行度 (节点/GPU 数)",'
@@ -144,6 +144,33 @@ if t == orig:
     print("!! field group no-op")
     sys.exit(1)
 print("deploy_architecture field group ok")
+
+# 配平守卫: 注入片段手写括号, 历史上出过 item 结尾多 ')' 的失衡 — 产物
+# 语法坏了浏览器才在懒加载时报 "Loading chunk 8671 failed". 注入后立刻
+# 用括号计数 + node 语法检查兜底 (node 不可用时退回纯计数).
+_bal = t[ci:ci + len(FIELD_GROUP)]
+_depth = 0
+for _c in _bal:
+    if _c in "([{":
+        _depth += 1
+    elif _c in ")]}":
+        _depth -= 1
+    if _depth < 0:
+        print("!! injected field group unbalanced at char %d" % _bal.index(_c))
+        sys.exit(1)
+if _depth != 0:
+    print("!! injected field group unbalanced (depth=%d)" % _depth)
+    sys.exit(1)
+try:
+    import subprocess
+    subprocess.run(["node", "--check", "/dev/stdin"],
+                   input=t.encode(), timeout=30, check=True)
+    print("inject syntax check (node): OK")
+except FileNotFoundError:
+    print("inject balance check: OK (node unavailable, count-only)")
+except subprocess.CalledProcessError as e:
+    print("!! injected chunk fails node --check")
+    sys.exit(1)
 
 write(f, t)
 regen_gz(f)
