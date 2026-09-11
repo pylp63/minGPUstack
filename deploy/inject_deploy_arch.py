@@ -134,14 +134,6 @@ FIELD_GROUP = (
     'if(!pd&&!pp){return null}'
     'var out=[];'
     'if(pd){out.push('
-    '(0,D.jsx)(k.Z.Item,{name:"prefill_gpu_count",'
-    'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:1,min:1,max:64,'
-    'label:e.formatMessage({id:"models.form.servingTopology.prefill"})})}'
-    '),'
-    '(0,D.jsx)(k.Z.Item,{name:"decode_gpu_count",'
-    'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:1,min:1,max:64,'
-    'label:e.formatMessage({id:"models.form.servingTopology.decode"})})}'
-    '),'
     '(0,D.jsx)(k.Z.Item,{name:"prefill_groups",'
     'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:1,min:1,max:64,'
     'label:e.formatMessage({id:"models.form.servingTopology.pgroups"})})}'
@@ -149,6 +141,14 @@ FIELD_GROUP = (
     '(0,D.jsx)(k.Z.Item,{name:"decode_groups",'
     'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:1,min:1,max:64,'
     'label:e.formatMessage({id:"models.form.servingTopology.dgroups"})})}'
+    '),'
+    '(0,D.jsx)(k.Z.Item,{name:"prefill_gpu_count",'
+    'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:1,min:1,max:64,'
+    'label:e.formatMessage({id:"models.form.servingTopology.prefill"})})}'
+    '),'
+    '(0,D.jsx)(k.Z.Item,{name:"decode_gpu_count",'
+    'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:1,min:1,max:64,'
+    'label:e.formatMessage({id:"models.form.servingTopology.decode"})})}'
     '))}'
     'if(pp){out.push('
     '(0,D.jsx)(k.Z.Item,{name:"pipeline_parallel_size",'
@@ -217,7 +217,7 @@ for lf in [f] + glob.glob(os.path.join(JS, "*.chunk.js")) + umis:
     labels = [
         ("models.form.servingTopology.mode", "服务拓扑"),
         ("models.form.servingTopology.tips",
-         "选择后按该拓扑部署，PD 分离将分别创建 Prefill 与 Decode 实例"),
+         "选择后按该拓扑部署，PD 分离将分别创建 Prefill 与 Decode 实例，节点数量 >1 即多 P 多 D 水平扩展"),
         ("models.form.servingTopology.placeholder", "默认单机部署"),
         ("models.form.servingTopology.standalone", "单机部署"),
         ("models.form.servingTopology.pd", "PD 分离"),
@@ -225,8 +225,8 @@ for lf in [f] + glob.glob(os.path.join(JS, "*.chunk.js")) + umis:
         ("models.form.servingTopology.prefill", "Prefill GPU 数"),
         ("models.form.servingTopology.decode", "Decode GPU 数"),
         ("models.form.servingTopology.ppSize", "流水线并行度"),
-        ("models.form.servingTopology.pgroups", "Prefill 组数"),
-        ("models.form.servingTopology.dgroups", "Decode 组数"),
+        ("models.form.servingTopology.pgroups", "Prefill节点数量"),
+        ("models.form.servingTopology.dgroups", "Decode数量"),
     ]
     changed = False
     for k, v in labels:
