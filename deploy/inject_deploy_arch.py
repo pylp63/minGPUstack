@@ -3,8 +3,8 @@
 目标: 高级 tab 之后新增「多机」分段, 支持一个模型放不下跨多台机器的场景:
   - standalone       单机部署 (默认, 现状)
   - pipeline_parallel 流水线并行 (几个节点一起跑放不下的模型)
-  - pd_disaggregated  PD 分离 (prefill/decode 拆开)
-  - multi_pd         多P多D
+  - pd_disaggregated  PD 分离 (prefill/decode 拆开; 组数 >1 即多 P 多 D,
+                      原 multi_pd 选项已合并进来)
 
 实现:
 1) Ze 数组 (tab 定义) 末尾追加 multiNode 项.
@@ -119,7 +119,6 @@ FIELD_GROUP = (
     'options:['
     '{label:e.formatMessage({id:"models.form.servingTopology.standalone"}),value:"standalone"},'
     '{label:e.formatMessage({id:"models.form.servingTopology.pd"}),value:"pd_disaggregated"},'
-    '{label:e.formatMessage({id:"models.form.servingTopology.multipd"}),value:"multi_pd"},'
     '{label:e.formatMessage({id:"models.form.servingTopology.pipeline"}),value:"pipeline_parallel"}],'
     'onChange:function(v){'
     'n.setFieldValue("backend_parameters",[]);'
@@ -130,7 +129,7 @@ FIELD_GROUP = (
     'shouldUpdate:function(a,b){return a.serving_topology!==b.serving_topology},'
     'children:function(fv){'
     'var arch=fv.serving_topology;'
-    'var pd=(arch==="pd_disaggregated"||arch==="multi_pd");'
+    'var pd=(arch==="pd_disaggregated");'
     'var pp=(arch==="pipeline_parallel");'
     'if(!pd&&!pp){return null}'
     'var out=[];'
@@ -142,6 +141,14 @@ FIELD_GROUP = (
     '(0,D.jsx)(k.Z.Item,{name:"decode_gpu_count",'
     'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:1,min:1,max:64,'
     'label:e.formatMessage({id:"models.form.servingTopology.decode"})})}'
+    '),'
+    '(0,D.jsx)(k.Z.Item,{name:"prefill_groups",'
+    'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:1,min:1,max:64,'
+    'label:e.formatMessage({id:"models.form.servingTopology.pgroups"})})}'
+    '),'
+    '(0,D.jsx)(k.Z.Item,{name:"decode_groups",'
+    'children:(0,D.jsx)(Y.Z.Input,{type:"number",defaultValue:1,min:1,max:64,'
+    'label:e.formatMessage({id:"models.form.servingTopology.dgroups"})})}'
     '))}'
     'if(pp){out.push('
     '(0,D.jsx)(k.Z.Item,{name:"pipeline_parallel_size",'
@@ -214,11 +221,12 @@ for lf in [f] + glob.glob(os.path.join(JS, "*.chunk.js")) + umis:
         ("models.form.servingTopology.placeholder", "默认单机部署"),
         ("models.form.servingTopology.standalone", "单机部署"),
         ("models.form.servingTopology.pd", "PD 分离"),
-        ("models.form.servingTopology.multipd", "多 P 多 D"),
         ("models.form.servingTopology.pipeline", "流水线并行"),
         ("models.form.servingTopology.prefill", "Prefill GPU 数"),
         ("models.form.servingTopology.decode", "Decode GPU 数"),
         ("models.form.servingTopology.ppSize", "流水线并行度"),
+        ("models.form.servingTopology.pgroups", "Prefill 组数"),
+        ("models.form.servingTopology.dgroups", "Decode 组数"),
     ]
     changed = False
     for k, v in labels:

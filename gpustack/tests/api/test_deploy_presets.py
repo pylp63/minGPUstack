@@ -112,11 +112,17 @@ def test_pd_kv_flags_symmetric():
         assert "server-type" not in params
 
 
-def test_multi_pd_kv_flags_symmetric():
+def test_multi_pd_merged_into_pd_disaggregated():
+    """多 P 多 D 已合并进 PD 分离: 组数通过 prefill_groups/decode_groups
+    表达, 不再有独立的 multi_pd 架构."""
+    assert not hasattr(DeploymentArchitectureEnum, "MULTI_PD")
     plan = _preset_plan(
-        DeploymentArchitectureEnum.MULTI_PD, kv_transfer=True
+        DeploymentArchitectureEnum.PD_DISAGGREGATED,
+        prefill_groups=2, decode_groups=3, kv_transfer=True,
     )
     by_name = {p["name"]: p for p in plan.payloads}
+    assert by_name["testmodel-prefill"]["replicas"] == 2
+    assert by_name["testmodel-decode"]["replicas"] == 3
     assert "kv_producer" in _flat_params(by_name["testmodel-prefill"])
     assert "kv_consumer" in _flat_params(by_name["testmodel-decode"])
 
@@ -202,7 +208,7 @@ def test_standalone_single_payload_no_dup_ternary():
 
 def test_topology_units_validate_against_modelcreate():
     """部署单元的字段必须能构造 ModelCreate (deploy 端点 P0 修复)."""
-    for shape in ("single_node_tp", "pd_disaggregated", "multi_pd"):
+    for shape in ("single_node_tp", "pd_disaggregated"):
         req = _topo_req(shape=shape)
         plan = build_topology_plan(req)
         assert plan.units, f"{shape}: no units"

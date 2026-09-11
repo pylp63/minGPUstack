@@ -10,9 +10,9 @@
                        每个 stage 内 TP 由 gpus_per_replica 决定.
 * ``pd_disaggregated`` PD 分离: 2 个 Model (<name>-prefill / -decode,
                        引擎 server-type/kv-transfer 参数互连) +
-                       1 个 ModelRoute 聚合 (对外一个入口).
-* ``multi_pd``        多 P 多 D: 同 PD 分离, 但 prefill_replicas /
-                       decode_replicas 可 >1, ModelRoute 聚合.
+                       1 个 ModelRoute 聚合 (对外一个入口);
+                       prefill_replicas/decode_replicas >1 即多 P 多 D
+                       (原 ``multi_pd`` 形态已合并进来).
 * ``custom``          自定义拓扑: 角色列表 (role/replicas/gpu_ids/env/
                        backend_parameters), 每角色一个 Model + 聚合
                        ModelRoute (可选).
@@ -47,7 +47,6 @@ class DeployTopologyRequest(BaseModel):
         SINGLE_NODE_TP = "single_node_tp"
         PP_MULTINODE = "pp_multinode"
         PD_DISAGGREGATED = "pd_disaggregated"
-        MULTI_PD = "multi_pd"
         CUSTOM = "custom"
 
     shape: ShapeEnum = ShapeEnum.SINGLE_NODE_TP
@@ -64,7 +63,7 @@ class DeployTopologyRequest(BaseModel):
     # 多机流水线: N 个节点 (每个节点 = 1 个 PP stage), 每节点 TP 卡数
     pp_node_gpu_ids: Optional[List[List[str]]] = None  # [[w1:0,w1:1],[w2:0]]
     pp_tp_per_stage: Optional[int] = Field(default=None, ge=1, le=64)
-    # PD / 多P多D
+    # PD 分离 (replicas 即组数, >1 = 多 P 多 D)
     prefill_gpu_ids: Optional[List[str]] = None
     decode_gpu_ids: Optional[List[str]] = None
     prefill_replicas: int = Field(default=1, ge=1, le=64)
@@ -76,7 +75,7 @@ class DeployTopologyRequest(BaseModel):
     backend_parameters: Optional[List[str]] = None
     # 自定义拓扑
     roles: Optional[List[TopologyRole]] = None
-    # 路由 (PD/multi_pd/custom 自动创建; 也可显式关闭)
+    # 路由 (PD/custom 自动创建; 也可显式关闭)
     create_route: bool = True
     route_name: Optional[str] = None
 
@@ -150,11 +149,7 @@ SHAPE_DESCRIPTIONS = {
     ),
     DeployTopologyRequest.ShapeEnum.PD_DISAGGREGATED: (
         "PD 分离 — Prefill 与 Decode 独立成组, ModelRoute 聚合对外, "
-        "KV 由引擎传输层搬运."
-    ),
-    DeployTopologyRequest.ShapeEnum.MULTI_PD: (
-        "多 P 多 D — P 组与 D 组各自多副本, Router 加权聚合, "
-        "支持扩缩 D 不中断流量."
+        "KV 由引擎传输层搬运; 组数 >1 即多 P 多 D."
     ),
     DeployTopologyRequest.ShapeEnum.CUSTOM: (
         "自定义拓扑 — 每个角色独立配置节点/副本/GPU/参数/环境变量."
@@ -281,11 +276,8 @@ def build_topology_plan(req: DeployTopologyRequest) -> DeployTopologyPlan:
         plan.yaml_preview = _yaml_of(plan)
         return plan
 
-    if shape in (
-        DeployTopologyRequest.ShapeEnum.PD_DISAGGREGATED,
-        DeployTopologyRequest.ShapeEnum.MULTI_PD,
-    ):
-        # P 组
+    if shape == DeployTopologyRequest.ShapeEnum.PD_DISAGGREGATED:
+        # P 组 (replicas 即组数, >1 = 多 P 多 D)
         pp_ = _base_fields(req)
         pp_["name"] = f"{req.model_name}-prefill"
         pp_["replicas"] = req.prefill_replicas

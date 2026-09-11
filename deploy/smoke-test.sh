@@ -104,8 +104,8 @@ PASS "dev1 配额 = $QUOTA"
 STEP "8. 部署架构 presets"
 PRESETS=$(curl -sf -b "$JAR_ADMIN" "$API/deploy-presets")
 N=$(echo "$PRESETS" | jq 'len(d)')
-[ "$N" = "5" ] || FAIL "应有 5 种架构 (standalone/pd/multi_pd/pp/custom), 实际 $N"
-PASS "5 种架构: $(echo "$PRESETS" | jq '",".join(x["architecture"] for x in d)')"
+[ "$N" = "4" ] || FAIL "应有 4 种架构 (standalone/pd/pp/custom, 多P多D已合并进 PD 分离), 实际 $N"
+PASS "4 种架构: $(echo "$PRESETS" | jq '",".join(x["architecture"] for x in d)')"
 
 PLAN=$(curl -sf -b "$JAR_ADMIN" -X POST "$API/deploy-presets/plan" \
   -H "Content-Type: application/json" \
@@ -115,6 +115,14 @@ PN=$(echo "$PLAN" | jq 'len(d["payloads"])')
 PPARAMS=$(echo "$PLAN" | jq 'd["payloads"][0].get("backend_parameters")')
 echo "  PD 分离 payload[0] 参数: $PPARAMS"
 PASS "PD 分离展开为 prefill + decode"
+
+PLAN_MP=$(curl -sf -b "$JAR_ADMIN" -X POST "$API/deploy-presets/plan" \
+  -H "Content-Type: application/json" \
+  -d '{"architecture":"pd_disaggregated","model_name":"mp","model_source":"Qwen/Qwen2.5-0.5B-Instruct","prefill_groups":2,"decode_groups":3}')
+PR=$(echo "$PLAN_MP" | jq 'd["payloads"][0]["replicas"]')
+DR=$(echo "$PLAN_MP" | jq 'd["payloads"][1]["replicas"]')
+[ "$PR" = "2" ] && [ "$DR" = "3" ] || FAIL "PD 分离组数未生效 (P=$PR D=$DR, 应 2/3)"
+PASS "多 P 多 D 已合并进 PD 分离 (prefill_groups=2, decode_groups=3)"
 
 PLAN2=$(curl -sf -b "$JAR_ADMIN" -X POST "$API/deploy-presets/plan" \
   -H "Content-Type: application/json" \

@@ -5,8 +5,8 @@
 * ``standalone``       单机(多卡 TP), 支持多实例 replicas.
 * ``pipeline_parallel`` 多机流水线: N 节点各跑一个 PP stage, 每 stage 可配 TP,
                         stage 索引与 PP_SIZE 通过环境变量注入.
-* ``pd_disaggregated``  PD 分离: P/D 各选节点数, 每组可配 TP.
-* ``multi_pd``          多 P 多 D: P/D 各多副本.
+* ``pd_disaggregated``  PD 分离: P/D 各选 GPU 数与组数 (组数 >1 即
+                        多 P 多 D, 原 ``multi_pd`` 已合并进来).
 * ``custom``            自定义拓扑: 调用方直接给出完整 roles 规格.
 
 所有形态统一展开为 ``PresetDeployPlan``:
@@ -15,7 +15,7 @@
   - plan_yaml: 完整计划 YAML (可下载).
   - payloads: 按顺序可 POST 的 ModelCreate payload 列表.
 
-引擎互连参数 (PD/multi_pd, 二开修复 — 原版两个引擎都不认):
+引擎互连参数 (PD 分离, 二开修复 — 原版两个引擎都不认):
   - vLLM:   --kv-transfer-config '{"kv_role":"kv_producer"|"kv_consumer",...}'
             (官方 PD 文档语法; producer/consumer 两侧对称注入)
   - SGLang: --disaggregation-mode prefill|decode
@@ -36,7 +36,6 @@ from pydantic import BaseModel, Field
 class DeploymentArchitectureEnum(str, Enum):
     STANDALONE = "standalone"
     PD_DISAGGREGATED = "pd_disaggregated"
-    MULTI_PD = "multi_pd"
     PIPELINE_PARALLEL = "pipeline_parallel"
     CUSTOM = "custom"
 
@@ -75,11 +74,11 @@ class PresetDeployRequest(BaseModel):
     backend: Optional[str] = None
     # 单机多实例 (standalone)
     replicas: int = Field(default=1, ge=1, le=64)
-    # PD / multi-PD
+    # PD 分离 (组数 >1 = 多 P 多 D)
     prefill_gpu_count: int = Field(default=1, ge=1, le=1024)
     decode_gpu_count: int = Field(default=1, ge=1, le=1024)
-    prefill_replicas: int = Field(default=1, ge=1, le=64)
-    decode_replicas: int = Field(default=1, le=64, ge=1)
+    prefill_groups: int = Field(default=1, ge=1, le=64)
+    decode_groups: int = Field(default=1, le=64, ge=1)
     router_replicas: int = Field(default=1, ge=1, le=64)
     # KV 传输 (KV-aware 路由的运行时开关, 透传给后端)
     kv_transfer: bool = False
@@ -126,12 +125,8 @@ PRESET_DESCRIPTIONS = {
         "单机(多卡)部署 — 单模型实例, 支持 TP 多卡与多副本."
     ),
     DeploymentArchitectureEnum.PD_DISAGGREGATED: (
-        "PD 分离 — 独立 Prefill / Decode 实例组, 各自节点池; "
-        "Router 自动路由 (同 owner 模型名即可聚合)."
-    ),
-    DeploymentArchitectureEnum.MULTI_PD: (
-        "多 P 多 D — Prefill / Decode 各多副本, Router 多副本, "
-        "支持 KV 传输参数透传 (KV-aware 路由)."
+        "PD 分离 — 独立 Prefill / Decode 实例组; Prefill/Decode 组数 >1 "
+        "即多 P 多 D 水平扩展, Router 自动聚合."
     ),
     DeploymentArchitectureEnum.PIPELINE_PARALLEL: (
         "多机流水线 — N 节点各跑一个 PP stage, 每 stage 可配 TP, "
@@ -322,7 +317,7 @@ def build_preset_payloads(req: PresetDeployRequest) -> PresetDeployPlan:
         )
         return _finalize(arch.value, [role], [payload])
 
-    # ---------------- PD 分离 ----------------
+    # ---------------- PD 分离 (组数>1 = 多 P 多 D) ----------------
     if arch == DeploymentArchitectureEnum.PD_DISAGGREGATED:
         p_flags = (
             [f"--tensor-parallel-size={req.prefill_gpu_count}"]
@@ -334,76 +329,39 @@ def build_preset_payloads(req: PresetDeployRequest) -> PresetDeployPlan:
             + _engine_role_parameters(req.backend, "decode",
                                       req.kv_transfer)
         )
-        p_payload = _base_payload(req, name=f"{req.model_name}-prefill")
+        # 组数即副本数: prefill_groups/decode_groups (合并进来的多 P 多 D)
+        p_payload = _base_payload(
+            req, name=f"{req.model_name}-prefill",
+            replicas=req.prefill_groups,
+        )
         _merge_backend_parameters(p_payload, p_flags)
-        d_payload = _base_payload(req, name=f"{req.model_name}-decode")
+        d_payload = _base_payload(
+            req, name=f"{req.model_name}-decode",
+            replicas=req.decode_groups,
+        )
         _merge_backend_parameters(d_payload, d_flags)
         roles = [
             _role_plan("prefill", f"{req.model_name}-prefill",
-                       req.prefill_replicas, 1, req.prefill_gpu_count,
+                       req.prefill_groups, 1, req.prefill_gpu_count,
                        req.prefill_gpu_count,
                        {"ROLE": "prefill", **(req.env or {})},
                        p_flags,
                        f"vllm serve {req.model_source} --tensor-parallel-size="
-                       f"{req.prefill_gpu_count} (prefill)",
+                       f"{req.prefill_gpu_count} (prefill, x{req.prefill_groups})",
                        depends_on=[]),
             _role_plan("decode", f"{req.model_name}-decode",
-                       req.decode_replicas, 1, req.decode_gpu_count,
+                       req.decode_groups, 1, req.decode_gpu_count,
                        req.decode_gpu_count,
                        {"ROLE": "decode", **(req.env or {})},
                        d_flags,
                        f"vllm serve {req.model_source} --tensor-parallel-size="
-                       f"{req.decode_gpu_count} (decode)",
+                       f"{req.decode_gpu_count} (decode, x{req.decode_groups})",
                        depends_on=["prefill"]),
             _role_plan("router", f"{req.model_name}-router",
                        req.router_replicas, 1, 0, 0,
                        {"ROLE": "router", **(req.env or {})},
                        [],
                        "gpustack model-route (同 owner 自动聚合路由)",
-                       depends_on=["prefill", "decode"]),
-        ]
-        return _finalize(arch.value, roles, [p_payload, d_payload])
-
-    # ---------------- 多 P 多 D ----------------
-    if arch == DeploymentArchitectureEnum.MULTI_PD:
-        p_flags = (
-            [f"--tensor-parallel-size={req.prefill_gpu_count}"]
-            + _engine_role_parameters(req.backend, "prefill",
-                                      req.kv_transfer)
-        )
-        d_flags = (
-            [f"--tensor-parallel-size={req.decode_gpu_count}"]
-            + _engine_role_parameters(req.backend, "decode",
-                                      req.kv_transfer)
-        )
-        p_payload = _base_payload(
-            req, name=f"{req.model_name}-prefill", replicas=req.prefill_replicas
-        )
-        _merge_backend_parameters(p_payload, p_flags)
-        d_payload = _base_payload(
-            req, name=f"{req.model_name}-decode", replicas=req.decode_replicas
-        )
-        _merge_backend_parameters(d_payload, d_flags)
-        roles = [
-            _role_plan("prefill", f"{req.model_name}-prefill",
-                       req.prefill_replicas, 1, req.prefill_gpu_count,
-                       req.prefill_gpu_count,
-                       {"ROLE": "prefill", **(req.env or {})},
-                       p_flags,
-                       f"vllm serve ... --tensor-parallel-size="
-                       f"{req.prefill_gpu_count} (x{req.prefill_replicas})"),
-            _role_plan("decode", f"{req.model_name}-decode",
-                       req.decode_replicas, 1, req.decode_gpu_count,
-                       req.decode_gpu_count,
-                       {"ROLE": "decode", **(req.env or {})},
-                       d_flags,
-                       f"vllm serve ... --tensor-parallel-size="
-                       f"{req.decode_gpu_count} (x{req.decode_replicas})",
-                       depends_on=["prefill"]),
-            _role_plan("router", f"{req.model_name}-router",
-                       req.router_replicas, 1, 0, 0,
-                       {"ROLE": "router", **(req.env or {})},
-                       [], "model-route 多副本聚合路由",
                        depends_on=["prefill", "decode"]),
         ]
         return _finalize(arch.value, roles, [p_payload, d_payload])

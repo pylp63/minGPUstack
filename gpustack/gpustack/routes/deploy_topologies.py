@@ -93,7 +93,7 @@ async def deploy_topology(
             )
             created.append(model)
 
-        # ModelRoute 聚合 (PD/multi_pd/custom 多单元形态)
+        # ModelRoute 聚合 (PD/custom 多单元形态)
         if plan.route and req.create_route:
             try:
                 # 二开修复: ModelRouteCreate.targets 只接受

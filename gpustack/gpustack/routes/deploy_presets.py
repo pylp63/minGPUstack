@@ -39,10 +39,9 @@ async def list_presets():
     out = []
     for arch, desc in PRESET_DESCRIPTIONS.items():
         params: List[str] = []
-        if arch in (DeploymentArchitectureEnum.PD_DISAGGREGATED,
-                    DeploymentArchitectureEnum.MULTI_PD):
+        if arch == DeploymentArchitectureEnum.PD_DISAGGREGATED:
             params = ["prefill_gpu_count", "decode_gpu_count",
-                      "prefill_replicas", "decode_replicas",
+                      "prefill_groups", "decode_groups",
                       "router_replicas", "kv_transfer"]
         elif arch == DeploymentArchitectureEnum.PIPELINE_PARALLEL:
             params = ["pipeline_parallel_size", "tensor_parallel_size"]

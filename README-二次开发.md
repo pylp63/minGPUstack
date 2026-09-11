@@ -65,8 +65,7 @@ curl -X POST $API/v2/workers/2/access -H "Authorization: Bearer ***" \
 | 架构 | 说明 |
 |------|------|
 | `standalone` | 单机部署 — 单实例调度到单节点 (可 TP 多卡、多副本) |
-| `pd_disaggregated` | PD 分离 — 独立 prefill / decode 实例组,各自 GPU 池 |
-| `multi_pd` | 多P多D — prefill 与 decode 均多副本水平扩展 |
+| `pd_disaggregated` | PD 分离 — 独立 prefill / decode 实例组, 各自 GPU 池; Prefill/Decode 组数 >1 即多 P 多 D 水平扩展 (原 `multi_pd` 已合并) |
 | `pipeline_parallel` | 流水线并行 — 跨节点/GPU 的 pipeline 并行 |
 | `custom` | 自定义拓扑 — 直接指定角色/节点/副本/环境变量 |
 
