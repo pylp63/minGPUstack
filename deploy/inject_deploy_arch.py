@@ -110,6 +110,13 @@ if ci == -1:
 # 改为记录所选架构, 提交时由表单 JS 调 /v2/deploy-presets/deploy
 # 展开 (PD 分离 => prefill+decode 两个模型), backend_parameters 留空.
 FIELD_GROUP = (
+    # 外层: 仅 backend===SGLang 时渲染整个服务拓扑字段组
+    # (vLLM/SGLang 的 PD/PP 参数逻辑完全不同, 服务拓扑只支持 SGLang)
+    '(0,D.jsx)(k.Z.Item,{noStyle:!0,'
+    'shouldUpdate:function(a,b){return a.backend!==b.backend},'
+    'children:function(fb){'
+    'if(fb.getFieldValue("backend")!=="SGLang"){return null}'
+    'return (0,D.jsx)(D.Fragment,{children:['
     '(0,D.jsx)(k.Z.Item,{name:"serving_topology","data-field":"serving_topology",'
     'style:{scrollMarginTop:200},'
     'children:(0,D.jsx)(z.Z,{allowNull:!0,'
@@ -162,6 +169,8 @@ FIELD_GROUP = (
     'label:e.formatMessage({id:"models.form.servingTopology.ppSize"})})}'
     '))}'
     'return (0,D.jsx)(D.Fragment,{children:out})'
+    '}})'
+    ']})'
     '}})'
     ','
 )
