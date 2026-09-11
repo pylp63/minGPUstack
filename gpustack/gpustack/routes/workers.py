@@ -930,10 +930,24 @@ async def worker_ssh_exec(
         raise InvalidException(message="command is required")
 
     import aiohttp
+    import ipaddress
+
+    assert worker is not None
+    # fake-IP DNS 代理环境: worker.ip 可能落在 198.18.0.0/15 (代理网段,
+    # 不可路由)。单机一体模式 (server 内嵌 worker) 下该 worker 就在本
+    # 进程, 回落到 127.0.0.1 即可到达。
+    w = worker
+    try:
+        if ipaddress.ip_address(worker.ip or "") in ipaddress.ip_network(
+            "198.18.0.0/15"
+        ):
+            w = worker.model_copy(update={"ip": "127.0.0.1"})
+    except ValueError:
+        pass
 
     try:
         _, resp_body = await request_to_worker(
-            worker=worker,
+            worker=w,
             method="POST",
             path="files/exec",
             proxy_client=request.app.state.http_client,
