@@ -180,7 +180,14 @@ print("wrote " + os.path.basename(f))
 
 # ============================================================
 # 3. locale 文案注入
-for lf in [f] + glob.glob(os.path.join(JS, "*.chunk.js")):
+# locale 注入范围: 不止三份语言 chunk — umi.js 本体内嵌了一份 zh 表
+# (默认中文界面从它查询), 漏掉它 label 就回显 key 原文.
+umis = [x for x in glob.glob(os.path.join(JS, "umi.*.js")) if not x.endswith(".gz")]
+_seen = set()
+for lf in [f] + glob.glob(os.path.join(JS, "*.chunk.js")) + umis:
+    if lf in _seen:
+        continue
+    _seen.add(lf)
     try:
         lt = read(lf)
     except Exception:
@@ -190,15 +197,15 @@ for lf in [f] + glob.glob(os.path.join(JS, "*.chunk.js")):
     labels = [
         ("models.form.servingTopology.mode", "服务拓扑"),
         ("models.form.servingTopology.tips",
-         "选择服务拓扑后按该架构部署; PD 分离将创建 prefill/decode 两组实例"),
-        ("models.form.servingTopology.placeholder", "选择服务拓扑 (默认单机部署)"),
+         "选择后按该拓扑部署，PD 分离将分别创建 Prefill 与 Decode 实例"),
+        ("models.form.servingTopology.placeholder", "默认单机部署"),
         ("models.form.servingTopology.standalone", "单机部署"),
-        ("models.form.servingTopology.pd", "PD 分离 (prefill + decode)"),
+        ("models.form.servingTopology.pd", "PD 分离"),
         ("models.form.servingTopology.multipd", "多 P 多 D"),
-        ("models.form.servingTopology.pipeline", "流水线并行 (跨节点)"),
+        ("models.form.servingTopology.pipeline", "流水线并行"),
         ("models.form.servingTopology.prefill", "Prefill GPU 数"),
         ("models.form.servingTopology.decode", "Decode GPU 数"),
-        ("models.form.servingTopology.ppSize", "流水线并行度 (节点数)"),
+        ("models.form.servingTopology.ppSize", "流水线并行度"),
     ]
     changed = False
     for k, v in labels:
@@ -207,8 +214,10 @@ for lf in [f] + glob.glob(os.path.join(JS, "*.chunk.js")):
             lt = re.sub(pat + '[^"]*"', '"%s":"%s"' % (k, v), lt)
             changed = True
         elif '"models.form.categories":"' in lt:
+            # 每一处 categories (en/zh/... 每语言一张表) 都要插,
+            # 只插第一处会让其余语言回显 key 原文.
             lt = lt.replace('"models.form.categories":"',
-                            '"%s":"%s","models.form.categories":"' % (k, v), 1)
+                            '"%s":"%s","models.form.categories":"' % (k, v))
             changed = True
     if changed:
         write(lf, lt)
