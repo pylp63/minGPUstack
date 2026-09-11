@@ -228,9 +228,9 @@ for lf in [f] + glob.glob(os.path.join(JS, "*.chunk.js")) + umis:
         ("models.form.servingTopology.pipeline", "流水线并行"),
         ("models.form.servingTopology.prefill", "Prefill GPU 数"),
         ("models.form.servingTopology.decode", "Decode GPU 数"),
-        ("models.form.servingTopology.ppSize", "流水线并行度"),
+        ("models.form.servingTopology.ppSize", "流水线并行度PP"),
         ("models.form.servingTopology.pgroups", "Prefill节点数量"),
-        ("models.form.servingTopology.dgroups", "Decode数量"),
+        ("models.form.servingTopology.dgroups", "Decode节点数量"),
     ]
     changed = False
     for k, v in labels:
