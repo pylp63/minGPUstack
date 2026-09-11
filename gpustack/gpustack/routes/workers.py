@@ -1,6 +1,7 @@
 import secrets
 import datetime
 import base64
+import json
 import uuid
 import logging
 import asyncio
@@ -900,3 +901,48 @@ async def get_worker_privatekey(
             "Content-Disposition": f"attachment; filename=worker-{id}-private_key.pem"
         },
     )
+
+
+# ---------------------------------------------------------------- SSH 终端 (二开)
+# 节点页「SSH 终端」的 server 侧转发: /v2/workers/{id}/ssh-exec ->
+# worker 的 /files/exec (request_to_worker 通道, 同 model-config/file-exists)。
+# 权限: 与 privatekey 同级 (org 可写成员) — 命令执行是高危操作。
+
+
+@router.post("/{id}/ssh-exec")
+async def worker_ssh_exec(
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+    request: Request,
+):
+    from gpustack.server.worker_request import request_to_worker
+
+    worker = await Worker.one_by_id(session, id)
+    if worker is not None and worker.deleted_at is not None:
+        worker = None
+    assert_resource_visible(ctx, worker, not_found_message="worker not found")
+    assert_org_owned_writable(ctx, worker, resource_label="worker")
+
+    body = await request.json()
+    command = (body.get("command") or "").strip()
+    if not command:
+        raise InvalidException(message="command is required")
+
+    import aiohttp
+
+    try:
+        _, resp_body = await request_to_worker(
+            worker=worker,
+            method="POST",
+            path="files/exec",
+            proxy_client=request.app.state.http_client,
+            no_proxy_client=request.app.state.http_client_no_proxy,
+            data=json.dumps({"command": command}).encode(),
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=45, sock_connect=5),
+        )
+    except aiohttp.ClientError as e:
+        raise InvalidException(message=f"worker 不可达: {e}")
+
+    return json.loads(resp_body or b'{"returncode": -1, "output": "no response"}')

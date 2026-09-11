@@ -86,11 +86,12 @@ RUN cd / && PKG_UI="$(/opt/venv/bin/python -c 'import gpustack,os;print(os.path.
 
 # 二开: 修补编译后的 UI — 删除计费菜单/页面/计量 tab (含 .gz 重生成),
 # 组织页替换为控制台跳转, 全部固化进镜像
-COPY deploy/patch_ui_dist.py deploy/purge_billing_locale.py deploy/inject_deploy_arch.py deploy/rehash_umi_entry.py /tmp/
+COPY deploy/patch_ui_dist.py deploy/purge_billing_locale.py deploy/inject_deploy_arch.py deploy/inject_workers_page.py deploy/rehash_umi_entry.py /tmp/
 RUN cd / && PKG_UI="$(/opt/venv/bin/python -c 'import gpustack,os;print(os.path.join(os.path.dirname(gpustack.__file__),"ui"))')" \
     && UI_DIR="$PKG_UI" python3 /tmp/patch_ui_dist.py \
     && UI_DIR="$PKG_UI" python3 /tmp/purge_billing_locale.py \
     && UI_DIR="$PKG_UI" python3 /tmp/inject_deploy_arch.py \
+    && UI_DIR="$PKG_UI" python3 /tmp/inject_workers_page.py \
     && UI_DIR="$PKG_UI" python3 /tmp/rehash_umi_entry.py
 
 # 下载后端工具 (gguf-parser / fastfetch). 官方源走 GitHub, 国内网络

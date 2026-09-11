@@ -344,3 +344,51 @@ async def parse_gguf_file(http_request: Request, body: GGUFParseRequest):
         error_detail = traceback.format_exc()
         logger.error(f"Error parsing GGUF file: {e}\nTraceback:\n{error_detail}")
         return GGUFParseResponse(success=False, error=f"{type(e).__name__}: {str(e)}")
+
+
+# ---------------------------------------------------------------- SSH 终端 (二开)
+# worker 侧命令执行端点: 节点页「SSH 终端」的执行后端。
+# 安全边界: worker_auth (只有持有 worker 证书的 server 能调) +
+# 黑名单命令 (rm -rf / 等) + 30s 超时 + 输出截断。
+
+
+_SSH_DENY_PATTERNS = [
+    "rm -rf /", "mkfs", "dd if=", "> /dev/sd", "shutdown", "reboot",
+    "init 0", "init 6", ":(){:|:&};:",
+]
+
+
+@router.post("/files/exec")
+async def exec_command(request: Request, body: Optional[dict] = None):
+    """在 worker 上执行一条 shell 命令并返回输出 (SSH 终端用)."""
+    body = body or {}
+    command = (body.get("command") or "").strip()
+    if not command:
+        raise HTTPException(status_code=400, detail="command is required")
+    lowered = command.lower()
+    for pat in _SSH_DENY_PATTERNS:
+        if pat in lowered:
+            raise HTTPException(
+                status_code=403,
+                detail=f"命令被安全策略拒绝: 含危险模式 '{pat}'",
+            )
+
+    def run():
+        try:
+            result = subprocess.run(
+                ["bash", "-c", command],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=30,
+            )
+            return (
+                result.returncode,
+                result.stdout[:65536].decode(errors="replace"),
+            )
+        except subprocess.TimeoutExpired:
+            return -1, "命令执行超时 (30s)"
+        except Exception as e:  # noqa: BLE001
+            return -1, f"执行失败: {e}"
+
+    returncode, output = await asyncio.to_thread(run)
+    return {"returncode": returncode, "output": output}

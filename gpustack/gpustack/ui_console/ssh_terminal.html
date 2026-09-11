@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SSH 终端</title>
+<style>
+  :root {
+    --fg: #e6e6e6; --muted: #9aa0a6; --accent: #4f8cff; --border: #333;
+    --bg: #1e1e1e; --card: #252526;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "SF Mono", Consolas, "Courier New", monospace; background: var(--bg); color: var(--fg); font-size: 13px; }
+  .header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: var(--card); border-bottom: 1px solid var(--border); }
+  .header .dot { width: 10px; height: 10px; border-radius: 50%; background: #4caf50; }
+  .header .dot.err { background: #f44336; }
+  .header h1 { font-size: 14px; font-weight: 500; }
+  .header .meta { color: var(--muted); font-size: 12px; }
+  #screen { padding: 12px 16px; height: calc(100vh - 108px); overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+  #screen .cmd { color: var(--accent); }
+  #screen .err { color: #ff6b6b; }
+  #screen .sys { color: var(--muted); }
+  .input-row { display: flex; gap: 8px; padding: 10px 16px; background: var(--card); border-top: 1px solid var(--border); }
+  .input-row .prompt { color: #4caf50; user-select: none; }
+  #cmd { flex: 1; background: transparent; border: none; outline: none; color: var(--fg); font: inherit; caret-color: var(--accent); }
+  #run { background: var(--accent); color: #fff; border: none; border-radius: 4px; padding: 4px 14px; cursor: pointer; font: inherit; }
+  #run:disabled { opacity: .5; cursor: not-allowed; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <span class="dot" id="status-dot"></span>
+    <h1>SSH 终端 — <span id="wname">…</span></h1>
+    <span class="meta" id="wmeta"></span>
+  </div>
+  <div id="screen"><span class="sys">连接中…</span></div>
+  <div class="input-row">
+    <span class="prompt">$</span>
+    <input id="cmd" placeholder="输入命令后回车 (如 nvidia-smi / ls / df -h)" autocomplete="off" spellcheck="false">
+    <button id="run">执行</button>
+  </div>
+<script>
+const qs = new URLSearchParams(location.search);
+const WID = qs.get('id');
+const $ = (s) => document.querySelector(s);
+const screen = $('#screen');
+const esc = (s) => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+function print(text, cls) {
+  const span = document.createElement('span');
+  if (cls) span.className = cls;
+  span.textContent = text;
+  screen.appendChild(span);
+  screen.appendChild(document.createTextNode('\n'));
+  screen.scrollTop = screen.scrollHeight;
+}
+
+async function api(path, opts) {
+  const r = await fetch('/v2' + path, Object.assign({credentials: 'include'}, opts));
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).message || ('HTTP ' + r.status));
+  return r.json();
+}
+
+async function runCmd() {
+  const input = $('#cmd');
+  const command = input.value.trim();
+  if (!command || $('#run').disabled) return;
+  input.value = '';
+  print('$ ' + command, 'cmd');
+  $('#run').disabled = true;
+  try {
+    const r = await api(`/workers/${WID}/ssh-exec`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({command}),
+    });
+    if (r.output) print(r.output);
+    if (r.returncode !== 0 && !r.output) print(`[退出码 ${r.returncode}]`, 'sys');
+  } catch (e) {
+    print('错误: ' + e.message, 'err');
+  }
+  $('#run').disabled = false;
+  input.focus();
+}
+
+$('#run').onclick = runCmd;
+$('#cmd').addEventListener('keydown', (e) => { if (e.key === 'Enter') runCmd(); });
+
+// 历史记录 (上下键)
+let history = [], hidx = -1;
+$('#cmd').addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowUp' && history.length) {
+    hidx = Math.min(hidx + 1, history.length - 1);
+    e.target.value = history[history.length - 1 - hidx] || '';
+    e.preventDefault();
+  } else if (e.key === 'ArrowDown') {
+    hidx = Math.max(hidx - 1, -1);
+    e.target.value = hidx === -1 ? '' : history[history.length - 1 - hidx];
+    e.preventDefault();
+  } else if (e.key === 'Enter') {
+    const v = e.target.value.trim();
+    if (v) { history.push(v); hidx = -1; }
+  }
+});
+
+(async function init() {
+  if (!WID) { print('缺少 ?id= 参数', 'err'); return; }
+  try {
+    const data = await api('/workers?perPage=200');
+    const w = (data.items || []).find(x => String(x.id) === String(WID));
+    if (!w) throw new Error('节点不存在');
+    const gpus = ((w.status || {}).gpu_devices || []).length;
+    $('#wname').textContent = w.name;
+    $('#wmeta').textContent = `${w.ip} · ${gpus > 0 ? 'GPU 服务器 (' + gpus + ' 卡)' : 'CPU 服务器'}`;
+    screen.innerHTML = '';
+    print(`已连接 ${w.name} (${w.ip}) — 浏览器端命令通道, 非交互式 shell`, 'sys');
+    print('提示: 每条命令独立执行, 无状态; 交互式程序 (vim/top) 不适用', 'sys');
+    print('', 'sys');
+  } catch (e) {
+    $('#status-dot').className = 'dot err';
+    screen.innerHTML = '';
+    print('初始化失败: ' + e.message, 'err');
+  }
+  $('#cmd').focus();
+})();
+</script>
+</body>
+</html>
