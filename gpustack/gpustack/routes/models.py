@@ -1000,6 +1000,8 @@ async def create_model_route(
             decode_gpu_count=int(topology.get("decode_gpu_count") or 1),
             prefill_groups=int(topology.get("prefill_groups") or 1),
             decode_groups=int(topology.get("decode_groups") or 1),
+            pd_pipeline_size=int(topology.get("pd_pipeline_size") or 1),
+            pd_node_assign=topology.get("pd_node_assign") or None,
             pipeline_parallel_size=int(
                 topology.get("pipeline_parallel_size") or 2
             ),

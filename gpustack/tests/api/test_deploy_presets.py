@@ -127,6 +127,65 @@ def test_multi_pd_merged_into_pd_disaggregated():
     assert "kv_consumer" in _flat_params(by_name["testmodel-decode"])
 
 
+def test_pd_node_assign_one_rank_one_node():
+    """1P1D 单机: 指定哪个节点是 P 哪个是 D — 每 rank 一个 Model,
+    gpu_ids 钉死节点."""
+    plan = _preset_plan(
+        DeploymentArchitectureEnum.PD_DISAGGREGATED,
+        prefill_groups=1, decode_groups=1,
+        prefill_gpu_count=2, decode_gpu_count=2,
+        pd_node_assign={"prefill": [["node-a"]],
+                        "decode": [["node-b"]]},
+    )
+    assert len(plan.payloads) == 2
+    by_name = {p["name"]: p for p in plan.payloads}
+    p = by_name["testmodel-prefill-0"]
+    d = by_name["testmodel-decode-0"]
+    assert p["gpu_selector"]["gpu_ids"] == [
+        "node-a:cuda:0", "node-a:cuda:1"]
+    assert d["gpu_selector"]["gpu_ids"] == [
+        "node-b:cuda:0", "node-b:cuda:1"]
+    # 1P1D 单机: 非分布式
+    assert not p["distributed_inference_across_workers"]
+
+
+def test_pd_node_assign_multi_rank_multi_node_pp():
+    """多P多D + PP=2: 每 rank 两台节点, 分布式 + PP 参数."""
+    plan = _preset_plan(
+        DeploymentArchitectureEnum.PD_DISAGGREGATED,
+        prefill_groups=2, decode_groups=2,
+        prefill_gpu_count=1, decode_gpu_count=1,
+        pd_pipeline_size=2,
+        pd_node_assign={
+            "prefill": [["n1", "n2"], ["n3", "n4"]],
+            "decode": [["n5", "n6"], ["n7", "n8"]],
+        },
+    )
+    assert len(plan.payloads) == 4
+    by_name = {p["name"]: p for p in plan.payloads}
+    p0 = by_name["testmodel-prefill-0"]
+    assert p0["gpu_selector"]["gpu_ids"] == ["n1:cuda:0", "n2:cuda:0"]
+    assert p0["distributed_inference_across_workers"] is True
+    assert "--pipeline-parallel-size=2" in _flat_params(p0)
+    d1 = by_name["testmodel-decode-1"]
+    assert d1["gpu_selector"]["gpu_ids"] == ["n7:cuda:0", "n8:cuda:0"]
+
+
+def test_pd_node_assign_rejects_incomplete():
+    """防浪费: rank 节点数 != PP 或缺节点 -> 直接 ValueError (UI 同步红字)."""
+    with pytest.raises(ValueError, match="未指定节点"):
+        _preset_plan(
+            DeploymentArchitectureEnum.PD_DISAGGREGATED,
+            pd_node_assign={"prefill": [[]], "decode": [["n-b"]]},
+        )
+    with pytest.raises(ValueError, match="需要 2 个节点"):
+        _preset_plan(
+            DeploymentArchitectureEnum.PD_DISAGGREGATED,
+            pd_pipeline_size=2,
+            pd_node_assign={"prefill": [["n-a"]], "decode": [["n-b"]]},
+        )
+
+
 def test_pd_no_kv_transfer_by_default():
     plan = _preset_plan(DeploymentArchitectureEnum.PD_DISAGGREGATED)
     for p in plan.payloads:

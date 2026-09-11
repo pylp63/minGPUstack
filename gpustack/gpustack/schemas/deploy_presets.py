@@ -80,6 +80,11 @@ class PresetDeployRequest(BaseModel):
     prefill_groups: int = Field(default=1, ge=1, le=64)
     decode_groups: int = Field(default=1, le=64, ge=1)
     router_replicas: int = Field(default=1, ge=1, le=64)
+    # 节点级 rank 分配: {"prefill": [[w1], [w2,w3]], "decode": [[w4]]}
+    # 外层索引 = rank, 内层 = 该 rank 的节点列表 (长度 = pd_pipeline_size)
+    pd_node_assign: Optional[Dict[str, List[List[str]]]] = None
+    # PD 分离形态下的流水线并行度 (单 rank 跨几台节点; 1 = 单机放得下)
+    pd_pipeline_size: int = Field(default=1, ge=1, le=16)
     # KV 传输 (KV-aware 路由的运行时开关, 透传给后端)
     kv_transfer: bool = False
     # 流水线并行: N 节点 N stage, 每 stage TP
@@ -329,6 +334,77 @@ def build_preset_payloads(req: PresetDeployRequest) -> PresetDeployPlan:
             + _engine_role_parameters(req.backend, "decode",
                                       req.kv_transfer)
         )
+        # ---- 节点级 rank 分配 (pd_node_assign): 每角色每 rank 指定节点列表.
+        # 有分配时每 rank 一个独立 Model (固定节点, 不靠调度器漂移);
+        # 无分配时保持原行为 (P/D 两个 Model, 组数=replicas 由调度器摆放).
+        assign = req.pd_node_assign or {}
+        pp_size = req.pd_pipeline_size or 1
+        if assign and (assign.get("prefill") or assign.get("decode")):
+            payloads, roles = [], []
+            for role, cnt, gpu_count, flags in (
+                ("prefill", req.prefill_groups,
+                 req.prefill_gpu_count, p_flags),
+                ("decode", req.decode_groups,
+                 req.decode_gpu_count, d_flags),
+            ):
+                nodes_per_rank = assign.get(role) or []
+                for i in range(cnt):
+                    nodes = (
+                        nodes_per_rank[i]
+                        if i < len(nodes_per_rank) else []
+                    )
+                    nodes = [n for n in (nodes or []) if n][:pp_size]
+                    if not nodes:
+                        raise ValueError(
+                            f"{role} rank{i} 未指定节点 "
+                            f"(pd_node_assign.{role}[{i}])"
+                        )
+                    if len(nodes) != pp_size:
+                        raise ValueError(
+                            f"{role} rank{i} 需要 {pp_size} 个节点, "
+                            f"实际 {len(nodes)}: {nodes}"
+                        )
+                    # gpu_ids: 每节点取 gpu_count 张卡 (worker_name:cuda:idx)
+                    gpu_ids = []
+                    for w in nodes:
+                        gpu_ids += [
+                            f"{w}:cuda:{g}" for g in range(gpu_count)
+                        ]
+                    p = _base_payload(
+                        req,
+                        name=f"{req.model_name}-{role}-{i}",
+                        replicas=1,
+                    )
+                    p["gpu_selector"] = {
+                        "gpu_ids": gpu_ids,
+                        "gpus_per_replica": gpu_count,
+                    }
+                    r_flags = list(flags)
+                    if pp_size > 1:
+                        # 跨节点 PP: 分布式推理 + PP 参数
+                        p["distributed_inference_across_workers"] = True
+                        r_flags = [
+                            f"--pipeline-parallel-size={pp_size}",
+                            f"--tensor-parallel-size={gpu_count}",
+                        ] + [
+                            f for f in r_flags
+                            if not f.startswith("--pipeline-parallel-size")
+                            and not f.startswith("--tensor-parallel-size")
+                        ]
+                    _merge_backend_parameters(p, r_flags)
+                    payloads.append(p)
+                    roles.append(_role_plan(
+                        f"{role}-{i}", f"{req.model_name}-{role}-{i}",
+                        1, len(nodes), gpu_count, gpu_count,
+                        {"ROLE": f"{role}-{i}", **(req.env or {})},
+                        r_flags,
+                        f"sglang launch_server ... "
+                        f"(nodes={nodes}, pp={pp_size})",
+                        depends_on=(["prefill-0"] if role == "decode"
+                                    else []),
+                    ))
+            return _finalize(arch.value, roles, payloads)
+        # ---- 无节点分配: 原自动调度路径 ----
         # 组数即副本数: prefill_groups/decode_groups (合并进来的多 P 多 D)
         p_payload = _base_payload(
             req, name=f"{req.model_name}-prefill",

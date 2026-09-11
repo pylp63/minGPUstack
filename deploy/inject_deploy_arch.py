@@ -133,13 +133,15 @@ FIELD_GROUP = (
     'if(n.getFieldValue("prefill_groups")===undefined){n.setFieldValue("prefill_groups",1)}'
     'if(n.getFieldValue("decode_groups")===undefined){n.setFieldValue("decode_groups",1)}'
     'if(n.getFieldValue("prefill_gpu_count")===undefined){n.setFieldValue("prefill_gpu_count",1)}'
-    'if(n.getFieldValue("decode_gpu_count")===undefined){n.setFieldValue("decode_gpu_count",1)}}'
+    'if(n.getFieldValue("decode_gpu_count")===undefined){n.setFieldValue("decode_gpu_count",1)}'
+    'if(n.getFieldValue("pd_pipeline_size")===undefined){n.setFieldValue("pd_pipeline_size",1)}'
+    'if(n.getFieldValue("pd_node_assign")===undefined){n.setFieldValue("pd_node_assign",{prefill:[],decode:[]})}}'
     'if(v==="pipeline_parallel"){'
     'if(n.getFieldValue("pipeline_parallel_size")===undefined){n.setFieldValue("pipeline_parallel_size",2)}}'
     '}})'
     '}),'
     '(0,D.jsx)(k.Z.Item,{noStyle:!0,'
-    'shouldUpdate:function(a,b){return a.serving_topology!==b.serving_topology},'
+    'shouldUpdate:function(a,b){return a.serving_topology!==b.serving_topology||a.prefill_groups!==b.prefill_groups||a.decode_groups!==b.decode_groups||a.pd_pipeline_size!==b.pd_pipeline_size||a.pd_node_assign!==b.pd_node_assign},'
     'children:function(fv){'
     'var arch=fv.getFieldValue("serving_topology");'
     'var pd=(arch==="pd_disaggregated");'
@@ -162,7 +164,40 @@ FIELD_GROUP = (
     '(0,D.jsx)(k.Z.Item,{name:"decode_gpu_count",'
     'children:(0,D.jsx)(Y.Z.Input,{type:"number",min:1,max:64,'
     'label:e.formatMessage({id:"models.form.servingTopology.decode"})})}'
-    '))}'
+    '),'
+    '(0,D.jsx)(k.Z.Item,{name:"pd_pipeline_size",'
+    'children:(0,D.jsx)(Y.Z.Input,{type:"number",min:1,max:16,'
+    'label:e.formatMessage({id:"models.form.servingTopology.ppSize"})})}'
+    '));'
+    # ---- 节点分配: 每 rank 指定节点 (1P1D / 多P多D × 单机 / PP 多机) ----
+    'var pg=fv.getFieldValue("prefill_groups")||1;'
+    'var dg=fv.getFieldValue("decode_groups")||1;'
+    'var ps=fv.getFieldValue("pd_pipeline_size")||1;'
+    'if(ps<1){ps=1}'
+    'var asg=fv.getFieldValue("pd_node_assign")||{};'
+    'var opts=(window.__topoWorkers||[]).map(function(w){return {label:w,value:w}});'
+    'var seen={},dup=!1,incomplete=[];'
+    'var sides=[["prefill",pg],["decode",dg]];'
+    'for(var si=0;si<sides.length;si++){var role=sides[si][0],cnt=sides[si][1];'
+    'for(var i=0;i<cnt;i++){'
+    'var v=(asg[role]||[])[i];if(!Array.isArray(v)){v=v?[v]:[]}'
+    'if(v.length&&v.length!==ps){incomplete.push(role+" rank"+i)}'
+    'for(var k2=0;k2<v.length;k2++){if(seen[v[k2]]){dup=!0}seen[v[k2]]=1}'
+    'var lbl=(role==="prefill"?"Prefill":"Decode")+" rank"+i+" 节点"+(ps>1?"（选"+ps+"台）":"");'
+    'out.push((0,D.jsx)(k.Z.Item,{noStyle:!0,children:'
+    '(0,D.jsx)(z.Z,{mode:ps>1?"multiple":void 0,allowClear:!0,'
+    'value:ps>1?v:(v[0]||void 0),label:lbl,placeholder:"选择节点",options:opts,'
+    'onChange:(function(role,i,ps){return function(val){'
+    'var a=n.getFieldValue("pd_node_assign")||{};'
+    'a[role]=a[role]||[];'
+    'a[role][i]=(ps>1||Array.isArray(val))?(val||[]):(val?[val]:[]);'
+    'n.setFieldValue("pd_node_assign",a)}})(role,i,ps)})}))'
+    '}}'
+    'var warns=[];'
+    'if(incomplete.length){warns.push("节点数不完整: "+incomplete.join("、")+" 各需 "+ps+" 台")}'
+    'if(dup){warns.push("同一节点被重复分配")}'
+    'if(warns.length){out.push((0,D.jsx)("div",{style:{color:"#cf1322",fontSize:"12px",marginTop:"4px"},children:warns.join("；")}))}'
+    '}'
     'if(pp){out.push('
     '(0,D.jsx)(k.Z.Item,{name:"pipeline_parallel_size",'
     'children:(0,D.jsx)(Y.Z.Input,{type:"number",min:2,max:16,'
@@ -176,16 +211,38 @@ FIELD_GROUP = (
 )
 
 # 在 categories 字段前插入多机字段组
+fg_start = ci
 t = t[:ci] + FIELD_GROUP + t[ci:]
 if t == orig:
     print("!! field group no-op")
     sys.exit(1)
 print("deploy_architecture field group ok")
 
+# ============================================================
+# 2b. worker 列表全局注入: PD 节点分配下拉需要集群节点名列表。
+#     注意: 插入点在 D.Fragment 的 children:[ 数组内 — IIFE 必须
+#     以逗号结尾作为数组元素 (分号在数组字面量里是语法错误)。
+#     自执行 fetch (带 cookie), 结果存 window.__topoWorkers;
+#     失败静默 (下拉空, 不阻塞表单)。
+WORKER_FETCH = (
+    '(function(){if(window.__topoWorkersFetched){return}'
+    'window.__topoWorkersFetched=!0;'
+    'fetch("/v2/workers",{credentials:"include"}).then(function(r){return r.json()})'
+    '.then(function(d){window.__topoWorkers=(d.items||[]).map(function(w){return w.name})})'
+    '.catch(function(){})})(),'
+)
+# 插在已注入字段组之后 — categories 锚点已因插入而后移, 重新定位
+ci2 = t.find(categ_anchor_key)
+if ci2 == -1 or ci2 < fg_start:
+    print("!! categories anchor lost after field group insert")
+    sys.exit(1)
+t = t[:ci2] + WORKER_FETCH + t[ci2:]
+print("worker list fetch injected")
+
 # 配平守卫: 注入片段手写括号, 历史上出过 item 结尾多 ')' 的失衡 — 产物
 # 语法坏了浏览器才在懒加载时报 "Loading chunk 8671 failed". 注入后立刻
 # 用括号计数 + node 语法检查兜底 (node 不可用时退回纯计数).
-_bal = t[ci:ci + len(FIELD_GROUP)]
+_bal = t[fg_start:fg_start + len(FIELD_GROUP)]
 _depth = 0
 for _c in _bal:
     if _c in "([{":
