@@ -275,7 +275,10 @@ SCHED_GROUP = (
     'var lbl2=(role==="prefill"?"Prefill":"Decode")+" rank"+i2+" 节点"+(ps>1?"（选"+ps+"台）":"");'
     'out.push((0,D.jsx)(k.Z.Item,{noStyle:!0,children:'
     # allowNull:!0 — seal-select 空值时强制 label 上浮 (与官方「服务拓扑/后端版本」
-    # 同款), 否则 label 停在框中间与 placeholder「选择节点」文字重叠
+    # 同款), 否则 label 停在框中间与 placeholder「选择节点」文字重叠。
+    # 不传 getPopupContainer — 官方 z.Z 字段 (调度方式/后端版本) 均不传
+    # (面板挂 body); 挂 parentNode 会让 rc-trigger 在框内 re-mount 面板,
+    # rc-select 受控状态被重置 (选中值丢失/label 掉落), v6 实测回归, 故回滚。
     '(0,D.jsx)(z.Z,{mode:ps>1?"multiple":void 0,allowClear:!0,allowNull:!0,'
     'value:ps>1?v2:(v2[0]||void 0),label:lbl2,placeholder:"选择节点",options:opts2,'
     'onChange:(function(role,i2,ps){return function(val){'
