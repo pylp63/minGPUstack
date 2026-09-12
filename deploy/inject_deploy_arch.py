@@ -6,18 +6,20 @@
   - pd_disaggregated  PD 分离 (prefill/decode 拆开; 组数 >1 即多 P 多 D,
                       原 multi_pd 选项已合并进来)
 
-实现 (v3 — 节点分配与调度联动):
+实现 (v4 — rank 选点框进 GPU 分配卡 + GPU 选择器让位):
 1) 服务拓扑下拉 (serving_topology) + PD/PP 参数字段注入到「高级」tab
    (categories 之前), 仅 backend===SGLang 时渲染。
 2) PD rank 节点分配 (pd_node_assign) 框注入到「调度」tab 的 GPU 分配方框
-   (sectionCard) 之后 — 前提条件三个:
+   (sectionCard) **内部**, 替换 GPU 选择器的位置 —
       a. backend === SGLang (vLLM/SGLang PD 参数逻辑不同)
       b. serving_topology === pd_disaggregated
-      c. 调度方式 scheduleType === manual (自动调度时节点由调度器摆放,
-         不出现 rank 选点框)
+      c. 调度方式 scheduleType === manual (自动调度时节点由调度器摆放)
+   三条件全满足时渲染 rank 选点框, **GPU 选择器/每副本 GPU 数让位隐藏**
+   (PD 分离下节点级分配与 GPU 级选择器语义冲突, 且 gpu_ids 的 required
+   校验会卡住 PD 提交); 非 PD 场景渲染原 GPU 选择器 (官方行为不变)。
 3) rank 选点互斥: 任一 rank (Prefill rank0..N / Decode rank0..M) 已选的
-   节点在其它 rank 的下拉里置灰不可选 (前端 disabled), 保证 P/D 各 rank
-   节点不重叠; 后端 build_preset_payloads 同样校验 (双保险)。
+   节点在其它 rank 的下拉里置灰不可选, 保证 P/D 各 rank 节点不重叠;
+   后端 build_preset_payloads 同样校验 (双保险)。
 
 用法: UI_DIR=<pkg>/ui python3 inject_deploy_arch.py
 """
@@ -79,40 +81,53 @@ t = read(f)
 orig = t
 
 # ============================================================
-# 0. 幂等清理: 删除历史版本注入的旧字段组 / 旧 rank 分配框
-#    v1/v2: rank 节点框曾跟着服务拓扑组一起注入高级 tab; v3 起拆到调度 tab
-#    且只在手动调度下显示。旧注入的标志是 backend-shouldUpdate 包裹 +
-#    末尾紧跟 worker-fetch IIFE。
+# 0. 幂等清理: 删除历史版本注入
+#    v1/v2: rank 节点框在高级 tab; v3-v5: 在调度 tab GPU 分配卡之后。
+#    v4 起 rank 框进 GPU 分配卡内 (替换 GPU 选择器位置)。
 OLD_START = '(0,D.jsx)(k.Z.Item,{noStyle:!0,shouldUpdate:function(a,b){return a.backend!==b.backend}'
 OLD_FETCH = '(function(){if(window.__topoWorkersFetched)'
 i_old = t.find(OLD_START)
 if i_old != -1:
     i_fetch = t.find(OLD_FETCH, i_old)
     if i_fetch != -1:
-        # 旧注入以 field-group + (IIFE,  ... 形式存在: 删到 IIFE 结束的 "),"
         i_end = t.find('})()', i_fetch)
         if i_end != -1:
             t = t[:i_old] + t[i_end + len('})(),'):]
-            print("0. removed legacy field group + worker fetch (v<=2)")
+            print("0. removed legacy field group + worker fetch (v<=3)")
     else:
-        # 只有 field group 无 IIFE (更早版本)
         i_cat = t.find('(0,D.jsx)(k.Z.Item,{name:"categories"', i_old)
         if i_cat != -1:
             t = t[:i_old] + t[i_cat:]
             print("0. removed legacy field group (no fetch)")
-# 旧版 IIFE 单独残留 (无 field group 配对) 也清掉
 if OLD_FETCH in t:
     i_fetch = t.find(OLD_FETCH)
     i_end = t.find('})()', i_fetch)
     if i_end != -1:
         t = t[:i_fetch] + t[i_end + len('})(),'):]
         print("0. removed stray worker fetch")
+# v3-v5 的调度 tab 注入 (GPU 分配卡之后): shouldUpdate(ab,bb) 开头,
+# 结尾是 ',p===Z.dY.Auto' 前的那个 item
+OLD_SCHED = '(0,D.jsx)(k.Z.Item,{noStyle:!0,shouldUpdate:function(ab,bb){return ab.scheduleType!==bb.scheduleType'
+i_s = t.find(OLD_SCHED)
+if i_s != -1:
+    # 注入体是一个数组元素, 以 ',' 结尾, 下一个是 ',p===Z.dY.Auto' —
+    # 删除从 i_s 到 p===Z.dY.Auto 前的所有内容 (即注入的 item + 尾逗号)
+    i_a = t.find('p===Z.dY.Auto&&(0,D.jsxs)(D.Fragment,{children:[(0,D.jsx)(k.Z.Item,{name:"placement_strategy"', i_s)
+    if i_a != -1:
+        t = t[:i_s] + t[i_a:]
+        print("0. removed legacy scheduling-tab injection (v3-v5)")
+# v4 幂等标记: GPU 选择器替换处 (带 __pdRankSlot 标记的版本重新运行时先还原)
+if '__pdRankSlot' in t:
+    # 已是 v4 注入 — 还原方式: 整段替换块在 fresh 基础上生成, 直接报错让
+    # 用户用干净 dist 重跑 (构建链每次从官方 tarball 解压, 不会走到这)
+    print("0. v4 injection already present (fresh dist expected)")
+    sys.exit(0)
 
 # ============================================================
 # 1. 高级 tab: 服务拓扑下拉 + PD/PP 参数字段 (无节点分配框 — 节点框在调度 tab)
 #    结构: Form.Item(shouldUpdate: backend 变化) -> Fragment:
 #      - serving_topology 下拉 (onChange 播种 PD/PP 默认值)
-#      - Form.Item(shouldUpdate: topology/groups 变化) -> Fragment:
+#      - Form.Item(shouldUpdate: topology 变化) -> Fragment:
 #          - PD: pd_node_assign(hidden 注册) + P/D 组数 + P/D GPU 数 + PP
 #          - PP: pipeline_parallel_size
 #    注: pd_node_assign hidden 注册必须留在高级 tab 的拓扑组里
@@ -218,28 +233,55 @@ t = t[:ci2] + WORKER_FETCH + t[ci2:]
 print("worker list fetch injected")
 
 # ============================================================
-# 3. 调度 tab: PD rank 节点分配框, 插在 GPU 分配方框 (sectionCard) 之后。
-#    渲染条件: scheduleType==="manual" && serving_topology==="pd_disaggregated"
-#    && backend==="SGLang"。互斥: 每个 rank 下拉里, 其它 rank 已选节点置灰。
-#    锚点: GPU 分配方框 (manual 分支的 sectionCard div) 结束后、
-#    p===Z.dY.Auto 放置策略 Fragment 之前 — 即 "]})," 与 ",p===Z.dY.Auto" 之间。
-SCHED_ANCHOR = (
-    ']}),p===Z.dY.Auto&&(0,D.jsxs)(D.Fragment,{children:['
-    '(0,D.jsx)(k.Z.Item,{name:"placement_strategy"'
+# 3. 调度 tab GPU 分配方框: PD 分离时 GPU 选择器让位给 rank 选点框。
+#    原结构 (Cn 组件, manual 分支 sectionCard 内):
+#      x===Z.FH.VGPU ? (wn) : (Fragment:[gpu_ids_item, per_replica_item])
+#    替换为:
+#      x===Z.FH.VGPU ? (wn) : (Fragment:[
+#        isPD ? [rank 选点框...] : [gpu_ids_item, per_replica_item]
+#      ])
+#    isPD = SGLang + pd_disaggregated (调度 tab 此分支必为 manual, 无需再判)。
+#    - rank 框在卡片内 (与 GPU 选择器同位), margin 与官方字段一致
+#    - alwaysFocus:!0 — seal-select label 永久上浮, 空值 blur 不掉落
+#      (onBlur: value||setFocus(false) — undefined 掉; alwaysFocus 钉住)
+#    - 互斥置灰 + 深拷贝写回 (v5 修复) + style width 100% (v8 修复) 保留
+GPU_VGPU_ANCHOR = (
+    ']}),x===Z.FH.VGPU?(0,D.jsx)(wn,{}):(0,D.jsxs)(D.Fragment,{children:['
+    '(0,D.jsx)(k.Z.Item,{"data-field":"gpu_selector.gpu_ids"'
 )
-si = t.find(SCHED_ANCHOR)
-if si == -1:
-    print("!! scheduling anchor not found")
+gi = t.find(GPU_VGPU_ANCHOR)
+if gi == -1:
+    print("!! gpu allocation anchor not found")
     sys.exit(1)
 
-# 节点分配框组件 (插在 ]}), 之后):
-# - Form.Item shouldUpdate 监听 scheduleType/serving_topology/backend/groups/
-#   pipeline_size/pd_node_assign — 任何一项变化都重渲染 (置灰集合实时刷新)
-# - label 用当前组件的 n.formatMessage (Cn 组件作用域内 e->n 变量名不同,
-#   这里在 Cn 内, intl 变量是 n)
-SCHED_GROUP = (
-    # —— PD 节点分配 (仅手动调度 + PD 分离 + SGLang) ——
-    '(0,D.jsx)(k.Z.Item,{noStyle:!0,'
+# GPU 选择器 item + 每副本 item 的原文 (保留, 非 PD 时渲染)。
+# 括号配平定位 Fragment children 数组闭合 (数组内容 = 两个 GPU item)。
+gpu_ids_start = gi + len(']}),x===Z.FH.VGPU?(0,D.jsx)(wn,{}):(0,D.jsxs)(D.Fragment,{children:[')
+_arr_i = gpu_ids_start  # 指向 children 数组首个元素 ('[' 已在 start 前)
+_depth = 1              # 预置数组 '[' 的深度; 归零点即 ']' (数组闭合)
+while _arr_i < len(t):
+    _c = t[_arr_i]
+    if _c in "([{":
+        _depth += 1
+    elif _c in ")]}":
+        _depth -= 1
+        if _depth == 0:
+            break
+    _arr_i += 1
+arr_end = _arr_i                      # children 数组 ']' 下标
+frag_close = arr_end + len("]})")     # Fragment 表达式结束下标
+if t[frag_close:frag_close + 4] != "]}),":
+    print("!! unexpected structure after gpu fragment:", repr(t[frag_close:frag_close + 20]))
+    sys.exit(1)
+gpu_items_src = t[gpu_ids_start:arr_end]  # 两个 item (不含数组括号与 Fragment 闭合)
+
+# rank 选点框生成器 (children 函数内联, 挂在 __pdRankSlot 标记的组件里):
+# 用一个 noStyle Form.Item(shouldUpdate) 感知 topology/backend/groups 变化,
+# 返回 rank 框数组; 非手动+PD 时返回 null (此时外层三元已不进这支,
+# 双保险)。
+RANK_BOXES = (
+    # __pdRankSlot: 构建幂等标记 (fresh dist 无此串)
+    '(0,D.jsx)(k.Z.Item,{noStyle:!0,__pdRankSlot:!0,'
     'shouldUpdate:function(ab,bb){'
     'return ab.scheduleType!==bb.scheduleType'
     '||ab.serving_topology!==bb.serving_topology'
@@ -273,20 +315,22 @@ SCHED_GROUP = (
     'if(rv.indexOf(w)!==-1){return !0}}return !1});'
     'return {label:w,value:w,disabled:taken}});'
     'var lbl2=(role==="prefill"?"Prefill":"Decode")+" rank"+i2+" 节点"+(ps>1?"（选"+ps+"台）":"");'
-    'out.push((0,D.jsx)(k.Z.Item,{noStyle:!0,children:'
-    # allowNull:!0 — seal-select 空值时强制 label 上浮 (与官方「服务拓扑/后端版本」
-    # 同款), 否则 label 停在框中间与 placeholder「选择节点」文字重叠。
-    # 不传 getPopupContainer — 官方 z.Z 字段 (调度方式/后端版本) 均不传
-    # (面板挂 body); 挂 parentNode 会让 rc-trigger 在框内 re-mount 面板,
-    # rc-select 受控状态被重置 (选中值丢失/label 掉落), v6 实测回归, 故回滚。
-    # style width 100% — noStyle Form.Item 无 name, rc-select 拿不到
-    # ant-select-in-form-item class (该 class 才有 width:100% 的 CSS),
-    # 不传时 select 收缩为内容宽 (~82px) 远窄于上下方框; 传 style 撑满。
+    'out.push((0,D.jsx)(k.Z.Item,{noStyle:!0,style:{marginBottom:16},children:'
+    # alwaysFocus:!0 — label 永久上浮: seal-select onBlur 是
+    # (allowNull&&value===null)?保持:(value||setFocus(false)) — 空值是
+    # undefined 不是 null, blur 后 label 掉回框中间、focus 又弹起 = 上下动;
+    # alwaysFocus 钉住 isFocus, label 不再动 (官方 run_command 同款用法)。
+    # allowNull:!0 保留 (空值入场时也上浮, 避免与 placeholder 重叠)。
+    # 不传 getPopupContainer — 官方 z.Z 字段均不传 (面板挂 body);
+    # 挂 parentNode 会让 rc-trigger 在框内 re-mount 面板, rc-select
+    # 受控状态被重置 (v6 实测回归)。
+    # style width 100% — noStyle Form.Item 无 name, 拿不到
+    # ant-select-in-form-item 的 width:100% CSS, 不传会收缩到内容宽。
     '(0,D.jsx)(z.Z,{mode:ps>1?"multiple":void 0,allowClear:!0,allowNull:!0,'
-    'style:{width:"100%"},'
+    'alwaysFocus:!0,style:{width:"100%"},'
     'value:ps>1?v2:(v2[0]||void 0),label:lbl2,placeholder:"选择节点",options:opts2,'
     'onChange:(function(role,i2,ps){return function(val){'
-    # Cn 组件作用域内 d 是 form instance (k.Z.useFormInstance())
+    # Cn 组件作用域内 d 是 form instance (k.Z.useFormInstance())。
     # 深拷贝后再写回: getFieldValue 取出的是 store 里的引用, 原地改再 set
     # 同一引用 — rc-field-form 引用相等跳过通知, shouldUpdate 不触发,
     # 其它 rank 下拉的置灰 (互斥) 不刷新。JSON 深拷贝换新引用即可。
@@ -297,10 +341,32 @@ SCHED_GROUP = (
     '}}'
     'return (0,D.jsx)(D.Fragment,{children:out})'
     '}})'
-    ','
 )
-t = t[:si] + ']}),' + SCHED_GROUP + t[si + len(']}),'):]
-print("scheduling-tab rank assign group injected")
+
+# 替换: 在 Fragment children 数组开头插入条件三元 —
+#   isPD ? (rank框 Form.Item) : (原 gpu_ids + per_replica)
+# isPD 由外层再包一个 noStyle Form.Item(shouldUpdate: serving_topology/backend)
+# 提供 (它内部渲染三元)。
+# 注意: Fragment 头 '(0,D.jsxs)(D.Fragment,{children:[' 在 gpu_ids_start 之前、
+# 尾 '})' 在 arr_end 之后 — 均保留不动。PD_SWITCH 只替换**数组内容**:
+# children:[ PD_SWITCH ] — 一个 Form.Item(shouldUpdate) 其 children 函数按
+# isPD 三元返回 rank 框数组或原 GPU items 数组 (react children 数组合法)。
+PD_SWITCH = (
+    '(0,D.jsx)(k.Z.Item,{noStyle:!0,__pdRankSwitch:!0,'
+    'shouldUpdate:function(ab,bb){'
+    'return ab.serving_topology!==bb.serving_topology||ab.backend!==bb.backend},'
+    'children:function(fw){'
+    'var isPD=(fw.getFieldValue("backend")==="SGLang"'
+    '&&fw.getFieldValue("serving_topology")==="pd_disaggregated");'
+    'return isPD?['
+    + RANK_BOXES +
+    ']:['
+    + gpu_items_src +
+    ']'
+    '}})'
+)
+
+t = t[:gpu_ids_start] + PD_SWITCH + t[arr_end:]
 
 # 配平守卫: 注入片段手写括号, 历史上出过 item 结尾多 ')' 的失衡 — 产物
 # 语法坏了浏览器才在懒加载时报 "Loading chunk 8671 failed". 注入后立刻
@@ -322,7 +388,8 @@ def balance_check(snippet, name):
 
 balance_check(ADV_GROUP, "ADV_GROUP")
 balance_check(WORKER_FETCH.rstrip(","), "WORKER_FETCH")
-balance_check(SCHED_GROUP, "SCHED_GROUP")
+balance_check(RANK_BOXES, "RANK_BOXES")
+balance_check(PD_SWITCH, "PD_SWITCH")
 try:
     import subprocess
     import tempfile
