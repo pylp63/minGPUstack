@@ -69,6 +69,19 @@ curl -X POST $API/v2/workers/2/access -H "Authorization: Bearer ***" \
 | `pipeline_parallel` | 流水线并行 — 跨节点/GPU 的 pipeline 并行 |
 | `custom` | 自定义拓扑 — 直接指定角色/节点/副本/环境变量 |
 
+### PD 分离的 rank 节点分配 (与调度方式联动)
+
+部署表单 (仅 SGLang 后端 + 服务拓扑=PD 分离) 时的节点级编排:
+
+- **位置**: 「调度」tab 的 **GPU 分配方框下方**;
+- **联动**: 仅当**调度方式=手动**时渲染 — 自动调度下节点由调度器摆放,
+  选点框不出现;
+- **互斥**: 每个 rank (Prefill rank0..N / Decode rank0..M) 的下拉里,
+  其它 rank 已选节点**置灰不可选**, 保证 P/D 各 rank 节点不重叠;
+  后端 `build_preset_payloads` 同样校验重复节点并 422 拒绝 (双保险);
+- 每 rank 一个独立 Model, `gpu_ids` 钉死节点; `pd_pipeline_size>1`
+  时每 rank 选多台节点 (跨机 PP)。
+
 引擎互连参数按引擎生成 (vLLM `--kv-transfer-config` / SGLang
 `--disaggregation-mode`,producer/consumer 两侧对称):
 

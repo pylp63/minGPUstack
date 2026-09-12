@@ -1,4 +1,4 @@
-"""构建期 patch: 注入「服务拓扑」字段组到部署表单 (8671 chunk) 高级 tab.
+"""构建期 patch: 注入「服务拓扑」字段组到部署表单 (8671 chunk).
 
 目标: 高级 tab 之后新增「多机」分段, 支持一个模型放不下跨多台机器的场景:
   - standalone       单机部署 (默认, 现状)
@@ -6,14 +6,20 @@
   - pd_disaggregated  PD 分离 (prefill/decode 拆开; 组数 >1 即多 P 多 D,
                       原 multi_pd 选项已合并进来)
 
-实现:
-1) Ze 数组 (tab 定义) 末尾追加 multiNode 项.
-2) deploy_architecture 下拉注入到 categories 之前, 并带 4 架构选项.
-3) 提供数字字段 num_p / num_d / num_pipeline, onChange 把架构翻
-   译成 backend_parameters (vLLM 语法) 写回表单.
-4) locale 注入 deploy.arch.* / deploy.multiNode.tab 文案.
+实现 (v3 — 节点分配与调度联动):
+1) 服务拓扑下拉 (serving_topology) + PD/PP 参数字段注入到「高级」tab
+   (categories 之前), 仅 backend===SGLang 时渲染。
+2) PD rank 节点分配 (pd_node_assign) 框注入到「调度」tab 的 GPU 分配方框
+   (sectionCard) 之后 — 前提条件三个:
+      a. backend === SGLang (vLLM/SGLang PD 参数逻辑不同)
+      b. serving_topology === pd_disaggregated
+      c. 调度方式 scheduleType === manual (自动调度时节点由调度器摆放,
+         不出现 rank 选点框)
+3) rank 选点互斥: 任一 rank (Prefill rank0..N / Decode rank0..M) 已选的
+   节点在其它 rank 的下拉里置灰不可选 (前端 disabled), 保证 P/D 各 rank
+   节点不重叠; 后端 build_preset_payloads 同样校验 (双保险)。
 
-用法: UI_DIR=<pkg>/ui python3 inject_deploy-arch.py
+用法: UI_DIR=<pkg>/ui python3 inject_deploy_arch.py
 """
 import glob
 import gzip
@@ -52,6 +58,7 @@ def regen_gz(p):
 
 # ---- 定位 8671 chunk ----
 chunk = glob.glob(os.path.join(JS, "8671.*.chunk.js"))
+chunk = [c for c in chunk if not c.endswith(".gz")]
 if not chunk:
     cand = None
     for f in glob.glob(os.path.join(JS, "*.chunk.js")):
@@ -72,46 +79,46 @@ t = read(f)
 orig = t
 
 # ============================================================
-# 0. 幂等清理: 删除历史版本注入的旧 deploy_architecture 字段
-#    (旧单下拉: 含 "--pipeline-parallel-size=4" 写死 + alert 引导).
-#    从旧字段的 Form.Item 起点删到下一个 k.Z.Item (或 categories) 之前,
-#    防止新旧两份 deploy_architecture 并存导致下拉重复/行为错乱.
-OLD_ARCH_MARK = 'params=["--pipeline-parallel-size=4"]'
-idx_old = t.find(OLD_ARCH_MARK)
-if idx_old != -1:
-    # 回溯到旧字段 Form.Item 的起点 children:[ 或 (0,D.jsx)(k.Z.Item
-    start = t.rfind('(0,D.jsx)(k.Z.Item,{name:"deploy_architecture"', 0, idx_old)
-    if start == -1:
-        start = t.rfind('(0,D.jsx)(k.Z.Item,{name:"serving_topology"', 0, idx_old)
-    if start != -1:
-        # 终点: 该字段结束后的下一个 (0,D.jsx)(k.Z.Item (即 categories)
-        end = t.find('(0,D.jsx)(k.Z.Item', idx_old)
-        if end != -1 and end > start:
-            t = t[:start] + t[end:]
-            print("0. removed legacy deploy_architecture field")
+# 0. 幂等清理: 删除历史版本注入的旧字段组 / 旧 rank 分配框
+#    v1/v2: rank 节点框曾跟着服务拓扑组一起注入高级 tab; v3 起拆到调度 tab
+#    且只在手动调度下显示。旧注入的标志是 backend-shouldUpdate 包裹 +
+#    末尾紧跟 worker-fetch IIFE。
+OLD_START = '(0,D.jsx)(k.Z.Item,{noStyle:!0,shouldUpdate:function(a,b){return a.backend!==b.backend}'
+OLD_FETCH = '(function(){if(window.__topoWorkersFetched)'
+i_old = t.find(OLD_START)
+if i_old != -1:
+    i_fetch = t.find(OLD_FETCH, i_old)
+    if i_fetch != -1:
+        # 旧注入以 field-group + (IIFE,  ... 形式存在: 删到 IIFE 结束的 "),"
+        i_end = t.find('})()', i_fetch)
+        if i_end != -1:
+            t = t[:i_old] + t[i_end + len('})(),'):]
+            print("0. removed legacy field group + worker fetch (v<=2)")
+    else:
+        # 只有 field group 无 IIFE (更早版本)
+        i_cat = t.find('(0,D.jsx)(k.Z.Item,{name:"categories"', i_old)
+        if i_cat != -1:
+            t = t[:i_old] + t[i_cat:]
+            print("0. removed legacy field group (no fetch)")
+# 旧版 IIFE 单独残留 (无 field group 配对) 也清掉
+if OLD_FETCH in t:
+    i_fetch = t.find(OLD_FETCH)
+    i_end = t.find('})()', i_fetch)
+    if i_end != -1:
+        t = t[:i_fetch] + t[i_end + len('})(),'):]
+        print("0. removed stray worker fetch")
 
 # ============================================================
-# 1. (已移除) 不再单独加「多机」tab — 多机字段组直接放在「高级」tab 内
-#    (categories 之前), 避免与高级 tab 重复/出现未翻译 key.
-
-# ============================================================
-# 2. deploy_architecture 字段组: 在 categories 字段前插入 (干净 chunk 无
-#    deploy_architecture, 直接以 categories 为入口锚点插入多机字段组)
-categ_anchor_key = '(0,D.jsx)(k.Z.Item,{name:"categories","data-field":"categories"'
-
-ci = t.find(categ_anchor_key)
-if ci == -1:
-    print("!! categories anchor not found")
-    sys.exit(1)
-
-# 字段组 (用 + 拼接, 避免 f-string / 转义陷阱)
-# 架构下拉: 不再本地把架构翻译成 backend_parameters (原做法只部署一个
-# 带 prefill 参数的模型, decode 侧缺失, 不是真多机 — 二开修复).
-# 改为记录所选架构, 提交时由表单 JS 调 /v2/deploy-presets/deploy
-# 展开 (PD 分离 => prefill+decode 两个模型), backend_parameters 留空.
-FIELD_GROUP = (
+# 1. 高级 tab: 服务拓扑下拉 + PD/PP 参数字段 (无节点分配框 — 节点框在调度 tab)
+#    结构: Form.Item(shouldUpdate: backend 变化) -> Fragment:
+#      - serving_topology 下拉 (onChange 播种 PD/PP 默认值)
+#      - Form.Item(shouldUpdate: topology/groups 变化) -> Fragment:
+#          - PD: pd_node_assign(hidden 注册) + P/D 组数 + P/D GPU 数 + PP
+#          - PP: pipeline_parallel_size
+#    注: pd_node_assign hidden 注册必须留在高级 tab 的拓扑组里
+#    (调度 tab 的框只在手动+PD 时渲染, 自动调度下字段仍需注册才能提交)。
+ADV_GROUP = (
     # 外层: 仅 backend===SGLang 时渲染整个服务拓扑字段组
-    # (vLLM/SGLang 的 PD/PP 参数逻辑完全不同, 服务拓扑只支持 SGLang)
     '(0,D.jsx)(k.Z.Item,{noStyle:!0,'
     'shouldUpdate:function(a,b){return a.backend!==b.backend},'
     'children:function(fb){'
@@ -141,7 +148,7 @@ FIELD_GROUP = (
     '}})'
     '}),'
     '(0,D.jsx)(k.Z.Item,{noStyle:!0,'
-    'shouldUpdate:function(a,b){return a.serving_topology!==b.serving_topology||a.prefill_groups!==b.prefill_groups||a.decode_groups!==b.decode_groups||a.pd_pipeline_size!==b.pd_pipeline_size||a.pd_node_assign!==b.pd_node_assign},'
+    'shouldUpdate:function(a,b){return a.serving_topology!==b.serving_topology},'
     'children:function(fv){'
     'var arch=fv.getFieldValue("serving_topology");'
     'var pd=(arch==="pd_disaggregated");'
@@ -169,36 +176,7 @@ FIELD_GROUP = (
     '(0,D.jsx)(k.Z.Item,{name:"pd_pipeline_size",'
     'children:(0,D.jsx)(Y.Z.Input,{type:"number",min:1,max:16,'
     'label:e.formatMessage({id:"models.form.servingTopology.ppSize"})})}'
-    '));'
-    # ---- 节点分配: 每 rank 指定节点 (1P1D / 多P多D × 单机 / PP 多机) ----
-    'var pg=fv.getFieldValue("prefill_groups")||1;'
-    'var dg=fv.getFieldValue("decode_groups")||1;'
-    'var ps=fv.getFieldValue("pd_pipeline_size")||1;'
-    'if(ps<1){ps=1}'
-    'var asg=fv.getFieldValue("pd_node_assign")||{};'
-    'var opts=(window.__topoWorkers||[]).map(function(w){return {label:w,value:w}});'
-    'var seen={},dup=!1,incomplete=[];'
-    'var sides=[["prefill",pg],["decode",dg]];'
-    'for(var si=0;si<sides.length;si++){var role=sides[si][0],cnt=sides[si][1];'
-    'for(var i=0;i<cnt;i++){'
-    'var v=(asg[role]||[])[i];if(!Array.isArray(v)){v=v?[v]:[]}'
-    'if(v.length&&v.length!==ps){incomplete.push(role+" rank"+i)}'
-    'for(var k2=0;k2<v.length;k2++){if(seen[v[k2]]){dup=!0}seen[v[k2]]=1}'
-    'var lbl=(role==="prefill"?"Prefill":"Decode")+" rank"+i+" 节点"+(ps>1?"（选"+ps+"台）":"");'
-    'out.push((0,D.jsx)(k.Z.Item,{noStyle:!0,children:'
-    '(0,D.jsx)(z.Z,{mode:ps>1?"multiple":void 0,allowClear:!0,'
-    'value:ps>1?v:(v[0]||void 0),label:lbl,placeholder:"选择节点",options:opts,'
-    'onChange:(function(role,i,ps){return function(val){'
-    'var a=n.getFieldValue("pd_node_assign")||{};'
-    'a[role]=a[role]||[];'
-    'a[role][i]=(ps>1||Array.isArray(val))?(val||[]):(val?[val]:[]);'
-    'n.setFieldValue("pd_node_assign",a)}})(role,i,ps)})}))'
-    '}}'
-    'var warns=[];'
-    'if(incomplete.length){warns.push("节点数不完整: "+incomplete.join("、")+" 各需 "+ps+" 台")}'
-    'if(dup){warns.push("同一节点被重复分配")}'
-    'if(warns.length){out.push((0,D.jsx)("div",{style:{color:"#cf1322",fontSize:"12px",marginTop:"4px"},children:warns.join("；")}))}'
-    '}'
+    '))}'
     'if(pp){out.push('
     '(0,D.jsx)(k.Z.Item,{name:"pipeline_parallel_size",'
     'children:(0,D.jsx)(Y.Z.Input,{type:"number",min:2,max:16,'
@@ -211,20 +189,20 @@ FIELD_GROUP = (
     ','
 )
 
-# 在 categories 字段前插入多机字段组
-fg_start = ci
-t = t[:ci] + FIELD_GROUP + t[ci:]
-if t == orig:
-    print("!! field group no-op")
+categ_anchor_key = '(0,D.jsx)(k.Z.Item,{name:"categories","data-field":"categories"'
+ci = t.find(categ_anchor_key)
+if ci == -1:
+    print("!! categories anchor not found")
     sys.exit(1)
-print("deploy_architecture field group ok")
+t = t[:ci] + ADV_GROUP + t[ci:]
+print("advanced-tab topology group injected")
 
 # ============================================================
-# 2b. worker 列表全局注入: PD 节点分配下拉需要集群节点名列表。
-#     注意: 插入点在 D.Fragment 的 children:[ 数组内 — IIFE 必须
-#     以逗号结尾作为数组元素 (分号在数组字面量里是语法错误)。
-#     自执行 fetch (带 cookie), 结果存 window.__topoWorkers;
-#     失败静默 (下拉空, 不阻塞表单)。
+# 2. worker 列表全局注入: PD 节点分配下拉需要集群节点名列表。
+#    注意: 插入点在 D.Fragment 的 children:[ 数组内 — IIFE 必须
+#    以逗号结尾作为数组元素 (分号在数组字面量里是语法错误)。
+#    自执行 fetch (带 cookie), 结果存 window.__topoWorkers;
+#    失败静默 (下拉空, 不阻塞表单)。
 WORKER_FETCH = (
     '(function(){if(window.__topoWorkersFetched){return}'
     'window.__topoWorkersFetched=!0;'
@@ -232,34 +210,118 @@ WORKER_FETCH = (
     '.then(function(d){window.__topoWorkers=(d.items||[]).map(function(w){return w.name})})'
     '.catch(function(){})})(),'
 )
-# 插在已注入字段组之后 — categories 锚点已因插入而后移, 重新定位
 ci2 = t.find(categ_anchor_key)
-if ci2 == -1 or ci2 < fg_start:
+if ci2 == -1 or ci2 < ci:
     print("!! categories anchor lost after field group insert")
     sys.exit(1)
 t = t[:ci2] + WORKER_FETCH + t[ci2:]
 print("worker list fetch injected")
 
+# ============================================================
+# 3. 调度 tab: PD rank 节点分配框, 插在 GPU 分配方框 (sectionCard) 之后。
+#    渲染条件: scheduleType==="manual" && serving_topology==="pd_disaggregated"
+#    && backend==="SGLang"。互斥: 每个 rank 下拉里, 其它 rank 已选节点置灰。
+#    锚点: GPU 分配方框 (manual 分支的 sectionCard div) 结束后、
+#    p===Z.dY.Auto 放置策略 Fragment 之前 — 即 "]})," 与 ",p===Z.dY.Auto" 之间。
+SCHED_ANCHOR = (
+    ']}),p===Z.dY.Auto&&(0,D.jsxs)(D.Fragment,{children:['
+    '(0,D.jsx)(k.Z.Item,{name:"placement_strategy"'
+)
+si = t.find(SCHED_ANCHOR)
+if si == -1:
+    print("!! scheduling anchor not found")
+    sys.exit(1)
+
+# 节点分配框组件 (插在 ]}), 之后):
+# - Form.Item shouldUpdate 监听 scheduleType/serving_topology/backend/groups/
+#   pipeline_size/pd_node_assign — 任何一项变化都重渲染 (置灰集合实时刷新)
+# - label 用当前组件的 n.formatMessage (Cn 组件作用域内 e->n 变量名不同,
+#   这里在 Cn 内, intl 变量是 n)
+SCHED_GROUP = (
+    # —— PD 节点分配 (仅手动调度 + PD 分离 + SGLang) ——
+    '(0,D.jsx)(k.Z.Item,{noStyle:!0,'
+    'shouldUpdate:function(ab,bb){'
+    'return ab.scheduleType!==bb.scheduleType'
+    '||ab.serving_topology!==bb.serving_topology'
+    '||ab.backend!==bb.backend'
+    '||ab.prefill_groups!==bb.prefill_groups'
+    '||ab.decode_groups!==bb.decode_groups'
+    '||ab.pd_pipeline_size!==bb.pd_pipeline_size'
+    '||ab.pd_node_assign!==bb.pd_node_assign},'
+    'children:function(fs){'
+    'if(fs.getFieldValue("scheduleType")!=="manual"){return null}'
+    'if(fs.getFieldValue("backend")!=="SGLang"){return null}'
+    'if(fs.getFieldValue("serving_topology")!=="pd_disaggregated"){return null}'
+    'var pg=fs.getFieldValue("prefill_groups")||1;'
+    'var dg=fs.getFieldValue("decode_groups")||1;'
+    'var ps=fs.getFieldValue("pd_pipeline_size")||1;'
+    'if(ps<1){ps=1}'
+    'var asg=fs.getFieldValue("pd_node_assign")||{};'
+    'var wnames=window.__topoWorkers||[];'
+    'var sides=[["prefill",pg],["decode",dg]];'
+    'var out=[];'
+    'for(var si2=0;si2<sides.length;si2++){var role=sides[si2][0],cnt=sides[si2][1];'
+    'for(var i2=0;i2<cnt;i2++){'
+    'var v2=(asg[role]||[])[i2];if(!Array.isArray(v2)){v2=v2?[v2]:[]}'
+    # 该 rank 自己的选项: 全部节点, 但其它 rank 已选的置灰 (互斥)
+    'var mine={};for(var m2=0;m2<v2.length;m2++){mine[v2[m2]]=1}'
+    'var opts2=wnames.map(function(w){'
+    'var taken=!mine[w]&&sides.some(function(sd){'
+    'var arr=asg[sd[0]]||[];'
+    'for(var q=0;q<sd[1];q++){var rv=arr[q];'
+    'if(!Array.isArray(rv)){rv=rv?[rv]:[]}'
+    'if(rv.indexOf(w)!==-1){return !0}}return !1});'
+    'return {label:w,value:w,disabled:taken}});'
+    'var lbl2=(role==="prefill"?"Prefill":"Decode")+" rank"+i2+" 节点"+(ps>1?"（选"+ps+"台）":"");'
+    'out.push((0,D.jsx)(k.Z.Item,{noStyle:!0,children:'
+    '(0,D.jsx)(z.Z,{mode:ps>1?"multiple":void 0,allowClear:!0,'
+    'value:ps>1?v2:(v2[0]||void 0),label:lbl2,placeholder:"选择节点",options:opts2,'
+    'onChange:(function(role,i2,ps){return function(val){'
+    # Cn 组件作用域内 d 是 form instance (k.Z.useFormInstance())
+    'var aa=d.getFieldValue("pd_node_assign")||{};'
+    'aa[role]=aa[role]||[];'
+    'aa[role][i2]=(ps>1||Array.isArray(val))?(val||[]):(val?[val]:[]);'
+    'd.setFieldValue("pd_node_assign",aa)}})(role,i2,ps)})}))'
+    '}}'
+    'return (0,D.jsx)(D.Fragment,{children:out})'
+    '}})'
+    ','
+)
+t = t[:si] + ']}),' + SCHED_GROUP + t[si + len(']}),'):]
+print("scheduling-tab rank assign group injected")
+
 # 配平守卫: 注入片段手写括号, 历史上出过 item 结尾多 ')' 的失衡 — 产物
 # 语法坏了浏览器才在懒加载时报 "Loading chunk 8671 failed". 注入后立刻
 # 用括号计数 + node 语法检查兜底 (node 不可用时退回纯计数).
-_bal = t[fg_start:fg_start + len(FIELD_GROUP)]
-_depth = 0
-for _c in _bal:
-    if _c in "([{":
-        _depth += 1
-    elif _c in ")]}":
-        _depth -= 1
-    if _depth < 0:
-        print("!! injected field group unbalanced at char %d" % _bal.index(_c))
+def balance_check(snippet, name):
+    _depth = 0
+    for _c in snippet:
+        if _c in "([{":
+            _depth += 1
+        elif _c in ")]}":
+            _depth -= 1
+        if _depth < 0:
+            print("!! %s unbalanced at char %d" % (name, snippet.index(_c)))
+            sys.exit(1)
+    if _depth != 0:
+        print("!! %s unbalanced (depth=%d)" % (name, _depth))
         sys.exit(1)
-if _depth != 0:
-    print("!! injected field group unbalanced (depth=%d)" % _depth)
-    sys.exit(1)
+
+
+balance_check(ADV_GROUP, "ADV_GROUP")
+balance_check(WORKER_FETCH.rstrip(","), "WORKER_FETCH")
+balance_check(SCHED_GROUP, "SCHED_GROUP")
 try:
     import subprocess
-    subprocess.run(["node", "--check", "/dev/stdin"],
-                   input=t.encode(), timeout=30, check=True)
+    import tempfile
+    # node --check 不支持 /dev/stdin (v24 报 ENOENT), 落临时文件检查
+    with tempfile.NamedTemporaryFile(suffix=".js", delete=False) as tf:
+        tf.write(t.encode())
+        tmp_name = tf.name
+    try:
+        subprocess.run(["node", "--check", tmp_name], timeout=30, check=True)
+    finally:
+        os.unlink(tmp_name)
     print("inject syntax check (node): OK")
 except FileNotFoundError:
     print("inject balance check: OK (node unavailable, count-only)")
@@ -272,7 +334,7 @@ regen_gz(f)
 print("wrote " + os.path.basename(f))
 
 # ============================================================
-# 3. locale 文案注入
+# 4. locale 文案注入
 # locale 注入范围: 不止三份语言 chunk — umi.js 本体内嵌了一份 zh 表
 # (默认中文界面从它查询), 漏掉它 label 就回显 key 原文.
 umis = [x for x in glob.glob(os.path.join(JS, "umi.*.js")) if not x.endswith(".gz")]

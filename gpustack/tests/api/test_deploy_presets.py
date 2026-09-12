@@ -186,6 +186,34 @@ def test_pd_node_assign_rejects_incomplete():
         )
 
 
+def test_pd_node_assign_rejects_duplicate_nodes():
+    """互斥: 同一节点不得被两个 rank (P/D 任意组合) 重复认领 —
+    UI 端已置灰已选节点, 后端双保险拒绝."""
+    # P rank0 与 D rank0 撞同一台节点
+    with pytest.raises(ValueError, match="不能重叠"):
+        _preset_plan(
+            DeploymentArchitectureEnum.PD_DISAGGREGATED,
+            pd_node_assign={"prefill": [["node-a"]],
+                            "decode": [["node-a"]]},
+        )
+    # 多 P: prefill rank0 与 rank1 撞同一台节点
+    with pytest.raises(ValueError, match="node-x"):
+        _preset_plan(
+            DeploymentArchitectureEnum.PD_DISAGGREGATED,
+            prefill_groups=2,
+            pd_node_assign={"prefill": [["node-x"], ["node-x"]],
+                            "decode": [["node-y"]]},
+        )
+    # PP>1 时同 rank 内节点也不重复 (重复节点同样是撞车)
+    with pytest.raises(ValueError, match="不能重叠"):
+        _preset_plan(
+            DeploymentArchitectureEnum.PD_DISAGGREGATED,
+            pd_pipeline_size=2,
+            pd_node_assign={"prefill": [["n-a", "n-a"]],
+                            "decode": [["n-b", "n-c"]]},
+        )
+
+
 def test_pd_no_kv_transfer_by_default():
     plan = _preset_plan(DeploymentArchitectureEnum.PD_DISAGGREGATED)
     for p in plan.payloads:

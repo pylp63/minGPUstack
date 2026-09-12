@@ -340,6 +340,22 @@ def build_preset_payloads(req: PresetDeployRequest) -> PresetDeployPlan:
         assign = req.pd_node_assign or {}
         pp_size = req.pd_pipeline_size or 1
         if assign and (assign.get("prefill") or assign.get("decode")):
+            # 互斥兜底 (UI 前端已置灰已选节点, 这里双保险):
+            # 任一节点不得同时出现在两个不同 rank 的分配里 — P/D 各 rank
+            # 的节点集合两两不相交, 否则同一台机被钉给两个实例.
+            _owner: dict = {}
+            for _role in ("prefill", "decode"):
+                for _i, _rank_nodes in enumerate(assign.get(_role) or []):
+                    for _n in _rank_nodes or []:
+                        if not _n:
+                            continue
+                        if _n in _owner:
+                            raise ValueError(
+                                f"节点 {_n} 被重复分配: "
+                                f"{_owner[_n]} 与 {_role} rank{_i} "
+                                f"(PD 各 rank 节点不能重叠)"
+                            )
+                        _owner[_n] = f"{_role} rank{_i}"
             payloads, roles = [], []
             for role, cnt, gpu_count, flags in (
                 ("prefill", req.prefill_groups,

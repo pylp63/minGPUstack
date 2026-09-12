@@ -147,8 +147,15 @@ if t == orig:
 # ---- 语法守卫 (同 inject_deploy_arch 模式) ----
 try:
     import subprocess
-    subprocess.run(["node", "--check", "/dev/stdin"],
-                   input=t.encode(), timeout=30, check=True)
+    import tempfile
+    # node --check 不支持 /dev/stdin (v24 报 ENOENT), 落临时文件检查
+    with tempfile.NamedTemporaryFile(suffix=".js", delete=False) as tf:
+        tf.write(t.encode())
+        tmp_name = tf.name
+    try:
+        subprocess.run(["node", "--check", tmp_name], timeout=30, check=True)
+    finally:
+        os.unlink(tmp_name)
     print("workers chunk syntax check (node): OK")
 except FileNotFoundError:
     print("(node unavailable — count-only)")
