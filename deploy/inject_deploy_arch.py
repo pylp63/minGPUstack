@@ -294,6 +294,19 @@ RANK_BOXES = (
     'if(fs.getFieldValue("scheduleType")!=="manual"){return null}'
     'if(fs.getFieldValue("backend")!=="SGLang"){return null}'
     'if(fs.getFieldValue("serving_topology")!=="pd_disaggregated"){return null}'
+    # 多选 rank 框高度放开 (一次性注入, __pdRankCss 幂等):
+    # seal-select 外壳链 (外层 div / wrapper / ant-select) 都是固定 54px,
+    # multiple 的 tag 行需要 ~36px 内容高 + 20px label 区 = 放不下,
+    # tag 被 overflow:hidden 裁切。:has 命中多选框后 height:auto,
+    # 单选框 (无 .ant-select-multiple) 不受影响。
+    'if(!window.__pdRankCss){window.__pdRankCss=1;'
+    'var st=document.createElement("style");st.textContent='
+    '".seal-select-wrapper:has(.ant-select-multiple){height:auto;min-height:54px}"'
+    '+".seal-select-wrapper:has(.ant-select-multiple) .ant-select{height:auto}"'
+    '+".seal-select-wrapper:has(.ant-select-multiple) .ant-select-content{height:auto;overflow:visible}"'
+    '+".seal-select-wrapper:has(.ant-select-multiple) .__inner__{height:auto}"'
+    '+":has(> .seal-select-wrapper .ant-select-multiple){height:auto;min-height:54px}";'
+    'document.head.appendChild(st)}'
     'var pg=fs.getFieldValue("prefill_groups")||1;'
     'var dg=fs.getFieldValue("decode_groups")||1;'
     'var ps=fs.getFieldValue("pd_pipeline_size")||1;'
@@ -328,7 +341,29 @@ RANK_BOXES = (
     # ant-select-in-form-item 的 width:100% CSS, 不传会收缩到内容宽。
     '(0,D.jsx)(z.Z,{mode:ps>1?"multiple":void 0,allowClear:!0,allowNull:!0,'
     'alwaysFocus:!0,style:{width:"100%"},'
-    'value:ps>1?v2:(v2[0]||void 0),label:lbl2,placeholder:"选择节点",options:opts2,'
+    # maxTagCount:1 — multiple 模式 (PP>1) 只显示首个 tag + 「+N」计数:
+    # 框高固定 54px (label 区 20px + 内容 34px), 多个 32px tag 换行时
+    # 超出 content 盒被 overflow:hidden 裁切 (tag 底部切 16px, 实测);
+    # 单 tag + 计数保持单行高度, 不裁切 (官方 GPU 选择器 cascader 同款做法)。
+    # placeholder: 多选模式 (PP>1) 下留空 — rc-select 多选的 placeholder 字形
+    # (16px, 从 padding 区起) 与上浮 label 字形真实交叠 ~5px (Range 实测);
+    # 单选模式 placeholder 21px 盒字形居中, 与 label 错开无重叠。
+    # 多选时 label 自带「（选N台）」已是足够提示 (官方 GPU 选择器同款留空做法)。
+    'value:ps>1?v2:(v2[0]||void 0),label:lbl2,placeholder:ps>1?"":"选择节点",'
+    # multiple 模式紧凑 tag: 框高 54px 里 label 区占 20px, 剩 18px 可视高度;
+    # 默认 tag 32px 被 overflow:hidden 裁切 16px (文字切半)。
+    # tagRender 自定义 18px 紧凑 tag (antd 标准 prop, seal-select {...S} 透传);
+    # maxTagCount:1 只留首个 tag + 计数, 防多 tag 换行进一步超高
+    # (官方 GPU 选择器 cascader 同款单行策略)。
+    'maxTagCount:ps>1?1:void 0,maxTagTextLength:18,'
+    'tagRender:function(pr){return (0,D.jsx)("span",{'
+    'style:{display:"inline-flex",alignItems:"center",height:20,'
+    'lineHeight:"20px",fontSize:12,padding:"0 6px",margin:"0 4px 0 0",'
+    'borderRadius:4,background:"var(--ant-color-fill-secondary)",'
+    'color:"var(--ant-color-text)",maxWidth:320,overflow:"hidden",'
+    'whiteSpace:"nowrap",textOverflow:"ellipsis"},'
+    'children:pr.label})},'
+    'options:opts2,'
     'onChange:(function(role,i2,ps){return function(val){'
     # Cn 组件作用域内 d 是 form instance (k.Z.useFormInstance())。
     # 深拷贝后再写回: getFieldValue 取出的是 store 里的引用, 原地改再 set
