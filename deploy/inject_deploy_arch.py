@@ -274,11 +274,16 @@ SCHED_GROUP = (
     'return {label:w,value:w,disabled:taken}});'
     'var lbl2=(role==="prefill"?"Prefill":"Decode")+" rank"+i2+" 节点"+(ps>1?"（选"+ps+"台）":"");'
     'out.push((0,D.jsx)(k.Z.Item,{noStyle:!0,children:'
-    '(0,D.jsx)(z.Z,{mode:ps>1?"multiple":void 0,allowClear:!0,'
+    # allowNull:!0 — seal-select 空值时强制 label 上浮 (与官方「服务拓扑/后端版本」
+    # 同款), 否则 label 停在框中间与 placeholder「选择节点」文字重叠
+    '(0,D.jsx)(z.Z,{mode:ps>1?"multiple":void 0,allowClear:!0,allowNull:!0,'
     'value:ps>1?v2:(v2[0]||void 0),label:lbl2,placeholder:"选择节点",options:opts2,'
     'onChange:(function(role,i2,ps){return function(val){'
     # Cn 组件作用域内 d 是 form instance (k.Z.useFormInstance())
-    'var aa=d.getFieldValue("pd_node_assign")||{};'
+    # 深拷贝后再写回: getFieldValue 取出的是 store 里的引用, 原地改再 set
+    # 同一引用 — rc-field-form 引用相等跳过通知, shouldUpdate 不触发,
+    # 其它 rank 下拉的置灰 (互斥) 不刷新。JSON 深拷贝换新引用即可。
+    'var aa=JSON.parse(JSON.stringify(d.getFieldValue("pd_node_assign")||{}));'
     'aa[role]=aa[role]||[];'
     'aa[role][i2]=(ps>1||Array.isArray(val))?(val||[]):(val?[val]:[]);'
     'd.setFieldValue("pd_node_assign",aa)}})(role,i2,ps)})}))'
