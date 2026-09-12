@@ -328,7 +328,11 @@ RANK_BOXES = (
     'if(rv.indexOf(w)!==-1){return !0}}return !1});'
     'return {label:w,value:w,disabled:taken}});'
     'var lbl2=(role==="prefill"?"Prefill":"Decode")+" rank"+i2+" 节点"+(ps>1?"（选"+ps+"台）":"");'
-    'out.push((0,D.jsx)(k.Z.Item,{noStyle:!0,style:{marginBottom:16},children:'
+    # noStyle Form.Item 不渲染 ant-form-item 包装 (style.marginBottom 无效),
+    # 多 rank 框会 0 间距挤在一起 — 外包 div 提供间距 (官方字段 24px,
+    # rank 序列用 16px 略紧凑, 与卡片内字段节奏一致)
+    'out.push((0,D.jsx)("div",{style:{marginBottom:16},children:'
+    '(0,D.jsx)(k.Z.Item,{noStyle:!0,children:'
     # alwaysFocus:!0 — label 永久上浮: seal-select onBlur 是
     # (allowNull&&value===null)?保持:(value||setFocus(false)) — 空值是
     # undefined 不是 null, blur 后 label 掉回框中间、focus 又弹起 = 上下动;
@@ -372,8 +376,11 @@ RANK_BOXES = (
     'var aa=JSON.parse(JSON.stringify(d.getFieldValue("pd_node_assign")||{}));'
     'aa[role]=aa[role]||[];'
     'aa[role][i2]=(ps>1||Array.isArray(val))?(val||[]):(val?[val]:[]);'
-    'd.setFieldValue("pd_node_assign",aa)}})(role,i2,ps)})}))'
-    '}}'
+    # 闭合链 (从内到外): zZ / Item / div 各一组花括加圆括, 再闭 out.push、
+    # children 函数、外层 Item props (外层 jsx call 的闭括在末行收尾)
+    'd.setFieldValue("pd_node_assign",aa)}})(role,i2,ps)})})'
+    '})'
+    ')}}'
     'return (0,D.jsx)(D.Fragment,{children:out})'
     '}})'
 )

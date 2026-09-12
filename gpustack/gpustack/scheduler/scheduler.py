@@ -459,8 +459,8 @@ async def find_candidate(
 
     owner = getattr(model, "owner_principal_id", None)
     owner_is_restricted = False
-    if owner_id is not None:
-        owned = await Principal.one_by_id(session, owner_id)
+    if owner is not None:
+        owned = await Principal.one_by_id(session, owner)
         if (
             owned is not None
             and owned.kind == PrincipalType.USER
@@ -469,7 +469,8 @@ async def find_candidate(
             owner_is_restricted = True
     if owner_is_restricted:
         # 二开: 授权集合 = 用户本人 + 其所属用户组 的并集, 支持「对组做资源隔离」
-        grant_ids = set(await user_or_group_worker_ids(session, int(owner_id)))
+        # owner 在此分支必为非 None (owner_is_restricted 只在 owner 非 None 时置位)
+        grant_ids = set(await user_or_group_worker_ids(session, int(owner)))  # type: ignore[arg-type]
         if not grant_ids:
             grant_ids = {-1}  # force empty candidate set
         filters.append(WorkerAccessFilter(model, grant_ids))
