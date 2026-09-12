@@ -279,7 +279,11 @@ SCHED_GROUP = (
     # 不传 getPopupContainer — 官方 z.Z 字段 (调度方式/后端版本) 均不传
     # (面板挂 body); 挂 parentNode 会让 rc-trigger 在框内 re-mount 面板,
     # rc-select 受控状态被重置 (选中值丢失/label 掉落), v6 实测回归, 故回滚。
+    # style width 100% — noStyle Form.Item 无 name, rc-select 拿不到
+    # ant-select-in-form-item class (该 class 才有 width:100% 的 CSS),
+    # 不传时 select 收缩为内容宽 (~82px) 远窄于上下方框; 传 style 撑满。
     '(0,D.jsx)(z.Z,{mode:ps>1?"multiple":void 0,allowClear:!0,allowNull:!0,'
+    'style:{width:"100%"},'
     'value:ps>1?v2:(v2[0]||void 0),label:lbl2,placeholder:"选择节点",options:opts2,'
     'onChange:(function(role,i2,ps){return function(val){'
     # Cn 组件作用域内 d 是 form instance (k.Z.useFormInstance())
