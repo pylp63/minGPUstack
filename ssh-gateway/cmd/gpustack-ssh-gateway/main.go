@@ -150,10 +150,11 @@ var tickets = NewTicketStore()
 // nodeCred — 每节点 SSH 凭据 (弹窗录入 / 轮换写入)。
 // 旧状态文件 (只有 ip/pw) 可兼容反序列化: User/Port 为零值时回落默认。
 type nodeCred struct {
-	IP   string `json:"ip"`
-	User string `json:"user"`
-	Pw   string `json:"pw"`
-	Port int    `json:"port"`
+	IP        string `json:"ip"`
+	User      string `json:"user"`
+	Pw        string `json:"pw"`
+	Port      int    `json:"port"`
+	RotatedAt string `json:"rotated_at,omitempty"`
 }
 
 func (c *nodeCred) user() string {
@@ -260,50 +261,17 @@ func rotateRemotePassword(c *nodeCred, newPw string) error {
 	return sess.Run("chpasswd")
 }
 
-// rotateLoop — 定期轮换所有已保存凭据的节点 (仅 SSHGW_ROTATE_PASSWORDS=true)。
+// rotateLoop — 兼容保留: 环境变量 SSHGW_ROTATE_PASSWORDS 开关已迁移到
+// rotate-config API (页面设置); checker 每 30s 读取配置评估到期。
 func rotateLoop(ctx context.Context) {
 	if !loadCfg.RotateEnabled {
-		return
+		return // 默认关; 页面 rotate-config 可随时开启 (与 env 无关)
 	}
-	tk := time.NewTicker(loadCfg.RotateEvery)
-	defer tk.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-tk.C:
-			credState.mu.RLock()
-			ids := make([]uint, 0, len(credState.creds))
-			for id := range credState.creds {
-				ids = append(ids, id)
-			}
-			credState.mu.RUnlock()
-			for _, id := range ids {
-				credState.mu.RLock()
-				old := credState.creds[id]
-				credState.mu.RUnlock()
-				if old.IP == "" || old.Pw == "" {
-					continue
-				}
-				np, err := genPassword()
-				if err != nil {
-					continue
-				}
-				if err := rotateRemotePassword(&old, np); err != nil {
-					log.Printf("[rotate] worker %d (%s) 轮换失败: %v", id, old.IP, err)
-					continue
-				}
-				old.Pw = np
-				credState.mu.Lock()
-				credState.creds[id] = old
-				credState.mu.Unlock()
-				log.Printf("[rotate] worker %d (%s) 密码已轮换", id, old.IP)
-			}
-			saveState()
-		}
+	rc := readRotate()
+	if !rc.Enabled {
+		writeRotate(RotateConfig{Enabled: true, Days: rc.Days})
 	}
 }
-
 // saveState / loadState — 0600 状态文件, 重启恢复。
 func saveState() {
 	credState.mu.RLock()
@@ -545,12 +513,21 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/ssh/ticket", handleTicket)
 	mux.HandleFunc("/api/ssh/credentials", handleCredentials)
+	mux.HandleFunc("/api/ssh/cred/list", handleCredList)
+	mux.HandleFunc("/api/ssh/cred/delete", handleCredDelete)
+	mux.HandleFunc("/api/ssh/rotate-config", handleRotateConfig)
+	mux.HandleFunc("/api/ssh/rotate-now", handleRotateNow)
+	mux.HandleFunc("/api/ssh/upload", handleUpload)
+	mux.HandleFunc("/api/ssh/download", handleDownload)
 	mux.HandleFunc("/ws/ssh", handleTerminal)
 	mux.Handle("/", http.FileServer(http.FS(webFS)))
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	go rotateLoop(ctx)
+	rotateLoop(ctx) // env 兼容: SSHGW_ROTATE_PASSWORDS=true 时初始化配置
+	stop := make(chan struct{})
+	go rotateChecker(stop)
+	defer close(stop)
 
 	srv := &http.Server{Addr: loadCfg.ListenAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	log.Printf("[ssh-gateway] listening on %s (rotate=%v)", loadCfg.ListenAddr, loadCfg.RotateEnabled)

@@ -99,12 +99,15 @@ if 'id:"49"' not in u:
     u = u.replace(anchor_m.group(1), anchor_m.group(1) + new_items, 1)
     print("C1: menu item 49+51 added (控制台 + 节点凭证)")
 elif 'id:"51"' not in u:
+    # 49 已有 (旧构建), 仅补 51
     m51 = re.search(r'(49:\{[^{}]*?id:"49"\},)', u)
+    item51 = new_items[new_items.find('51:{'):]
     if m51:
-        u = u.replace(m51.group(1), m51.group(1) + new_items.split("49:{", 1)[1].join(["", ""]) if False else new_items[new_items.find("51:{"):], 1)
+        u = u.replace(m51.group(1), m51.group(1) + item51, 1)
         print("C1: menu item 51 added (节点凭证)")
     else:
         print("!! cannot anchor 51 insert")
+        sys.exit(1)
 else:
     print("C1: menu items already exist")
 
@@ -137,6 +140,24 @@ elif "49:k.lazy" not in u:
     extra = ",49:" + lazy_expr + ",51:" + lazy_expr
     u = u[:j] + extra + u[j:]
     print("C2: component binding 49/51 added (balanced anchor)")
+else:
+    # 49 已有 (旧构建) 而 51 无: 在 49 的绑定后补 51
+    i49 = u.find("49:k.lazy")
+    depth = 0
+    j = i49 + len("49:")
+    start_expr = j
+    while j < len(u):
+        c = u[j]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                j += 1
+                break
+        j += 1
+    u = u[:j] + ",51:" + u[start_expr:j] + u[j:]
+    print("C2: component binding 51 added (after 49)")
 
 if u != orig:
     write(UMI, u)
@@ -147,6 +168,8 @@ if u != orig:
 LABELS = {
     "menu.models.console": "控制台",
     "menu.accessControl.organizations": "用户组",
+    # 资源组新增「节点凭证」(菜单表 name=sshCredentials -> menu.resources.sshCredentials)
+    "menu.resources.sshCredentials": "节点凭证",
 }
 patched = 0
 for lf in sorted(glob.glob(os.path.join(JS, "*.chunk.js")) + [UMI]):
@@ -161,12 +184,13 @@ for lf in sorted(glob.glob(os.path.join(JS, "*.chunk.js")) + [UMI]):
         if '"%s":"' % k in t2:
             t2 = re.sub(r'"%s":"[^"]*"' % re.escape(k), '"%s":"%s"' % (k, v), t2)
         else:
-            # 新增 key: 在『每一处』menu.accessControl.organizations 前都插入,
-            # 保证 en + zh (乃至 tr/ru) 每套 locale 都拿到这个 key。
-            # 之前用 replace(..., 1) 只插第一处, 中文界面查不到就回显原始 key。
+            # 新增 key: 在『每一处』锚 key 前都插入, 保证 en + zh (乃至 tr/ru)
+            # 每套 locale 都拿到这个 key。之前用 replace(..., 1) 只插第一处,
+            # 中文界面查不到就回显原始 key。
+            anchor = "menu.resources.workers" if k.startswith("menu.resources.") else "menu.accessControl.organizations"
             t2 = t2.replace(
-                '"menu.accessControl.organizations":"',
-                '"%s":"%s","menu.accessControl.organizations":"' % (k, v),
+                '"%s":"' % anchor,
+                '"%s":"%s","%s":"' % (k, v, anchor),
             )
     # 组名兜底
     t2 = t2.replace("使用量与计费", "使用量").replace("Usage & Billing", "Usage")
@@ -222,12 +246,19 @@ if not org_files:
 #   /models/console (菜单"控制台")          → 默认视图 (申请 + admin审批)
 # (二开修复: 原注释里的 wizard.html 已删除 — 它调用 deploy-topologies
 #  API 且无任何入口引用; 统一走 deploy_wizard.html + deploy-presets.)
+# 二开 v2: 同一组件 (42/49/51 共用) 按当前 hash 路由到不同 console 页面:
+#   /access-control/organizations → 用户组 (tab=groups)
+#   /models/console              → 控制台首页
+#   /resources/ssh-credentials   → 节点凭证管理 (ssh_credentials.html)
 STUB = (
     '"use strict";(self.webpackChunk=self.webpackChunk||[]).push([[9675],{'
     '87924:function(e,t,i){i.r(t);'
     'var R=i(75271);'
     't.default=function(){'
+    'var h=(typeof window!=="undefined"?window.location.hash:"")||"";'
     'var src="/console/?embed=1&tab=groups";'
+    'if(h.indexOf("/resources/ssh-credentials")!==-1){src="/console/ssh_credentials.html"}'
+    'else if(h.indexOf("/models/console")!==-1){src="/console/?embed=1"}'
     'return R.createElement("iframe",{'
     'src:src,'
     'style:{width:"100%",height:Math.max(360,(typeof window!=="undefined"?window.innerHeight:600)-96)+"px",border:0,display:"block"},'

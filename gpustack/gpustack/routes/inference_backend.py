@@ -347,10 +347,9 @@ def get_runner_versions_and_configs(
                 version_configs.root[version.version] = VersionConfig(
                     built_in_frameworks=backend_list,
                 )
-                # 二开: 按框架聚合该版本的 runner 镜像全名 (UI 浅灰字展示)。
-                # 一个框架可能对应多个 runtime 镜像 (cuda13.0 / cuda12.9),
-                # framework_images 的 value 为「 · 」连接的全部镜像。
-                fw_images: Dict[str, str] = {}
+                # 二开: 按框架聚合该版本的 runner 镜像全名 (UI 逐行浅灰展示)。
+                # 一个框架可能对应多个 runtime 镜像 (cuda13.0 / cuda12.9), 全列。
+                fw_images: Dict[str, List[str]] = {}
                 for be in version.backends or []:
                     fw = f"{be.backend}"
                     if fw in fw_images:
@@ -359,7 +358,7 @@ def get_runner_versions_and_configs(
                         overrides, service, version.version, fw
                     )
                     if imgs:
-                        fw_images[fw] = " · ".join(imgs)
+                        fw_images[fw] = imgs
                 if fw_images:
                     version_configs.root[version.version].framework_images = fw_images
                 if default_version is None:

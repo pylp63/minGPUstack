@@ -15,7 +15,11 @@ import aiohttp
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from gpustack.api.exceptions import InvalidException, NotFoundException
+from gpustack.api.exceptions import (
+    ForbiddenException,
+    InvalidException,
+    NotFoundException,
+)
 from gpustack.api.tenant import assert_resource_visible
 from gpustack.server.deps import SessionDep, TenantContextDep
 from gpustack.schemas.workers import Worker
@@ -25,6 +29,160 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 SSHGW_BASE = "http://127.0.0.1:10170"
+
+# 直通 (无 body 变换) 的网关端点: method -> gateway path。
+# 鉴权: 本函数统一做 worker 可见性校验 (针对带 {worker_id} 的调用)。
+_DIRECT_ROUTES = {
+    ("GET", "list"): ("GET", "/api/ssh/cred/list"),
+    ("POST", "rotate-config"): ("POST", "/api/ssh/rotate-config"),
+    ("POST", "rotate-now"): ("POST", "/api/ssh/rotate-now"),
+    ("POST", "upload"): ("POST", "/api/ssh/upload"),
+    ("GET", "download"): ("GET", "/api/ssh/download"),
+    ("DELETE", "delete"): ("DELETE", "/api/ssh/cred/delete"),
+}
+
+
+async def _proxy_direct(
+    gw_method: str,
+    gw_path: str,
+    request: Request,
+    session: SessionDep,
+    ctx: TenantContextDep,
+    require_worker: bool = True,
+):
+    """透明转发到 Go 网关 (登录态 + 可选 worker 可见性校验)。"""
+    if require_worker:
+        wid = request.query_params.get("worker_id")
+        if not wid and request.method == "POST" and "application/json" in (
+            request.headers.get("content-type") or ""
+        ):
+            try:
+                wid = (await request.json()).get("worker_id")
+            except Exception:
+                wid = None
+        if wid:
+            try:
+                await _worker_and_ip(int(wid), session, ctx)
+            except (ValueError, NotFoundException):
+                raise NotFoundException(message="worker not found")
+
+    url = f"{SSHGW_BASE}{gw_path}"
+    headers = {}
+    body = None
+    if request.method == "POST" and "multipart/form-data" not in (
+        request.headers.get("content-type") or ""
+    ):
+        body = await request.body()
+        headers["Content-Type"] = request.headers.get("content-type", "")
+    elif request.method == "POST":
+        # multipart (上传): aiohttp 整包透传
+        body = await request.body()
+        headers["Content-Type"] = request.headers.get("content-type", "")
+
+    connector = aiohttp.TCPConnector(limit=4, force_close=True)
+    try:
+        async with aiohttp.ClientSession(connector=connector) as sess:
+            async with sess.request(
+                gw_method,
+                url + ("?" + request.url.query if request.url.query else ""),
+                data=body,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=None if body else 60,
+                                              sock_connect=5),
+            ) as resp:
+                payload = await resp.read()
+                ct = resp.headers.get("content-type", "application/json")
+                from fastapi.responses import Response
+
+                return Response(
+                    content=payload,
+                    status_code=resp.status,
+                    media_type=ct.split(";")[0],
+                    headers={
+                        k: v
+                        for k, v in resp.headers.items()
+                        if k.lower()
+                        in ("content-disposition", "content-length")
+                    },
+                )
+    except aiohttp.ClientError as e:
+        raise InvalidException(message=f"ssh-gateway 不可达: {e}")
+    finally:
+        await connector.close()
+
+
+@router.get("/credentials")
+async def ssh_gw_cred_list(
+    request: Request,
+    session: SessionDep,
+    ctx: TenantContextDep,
+):
+    """节点凭证列表 (密码不回传)。"""
+    return await _proxy_direct("GET", "/api/ssh/cred/list", request, session, ctx,
+                               require_worker=False)
+
+
+@router.delete("/credentials/{worker_id}")
+async def ssh_gw_cred_delete(
+    worker_id: int,
+    request: Request,
+    session: SessionDep,
+    ctx: TenantContextDep,
+):
+    """删除节点凭据。"""
+    await _worker_and_ip(worker_id, session, ctx)
+    request.scope["query_string"] = f"id={worker_id}".encode()
+    return await _proxy_direct("DELETE", "/api/ssh/cred/delete", request, session,
+                               ctx, require_worker=False)
+
+
+@router.get("/rotate-config")
+@router.post("/rotate-config")
+async def ssh_gw_rotate_config(
+    request: Request,
+    session: SessionDep,
+    ctx: TenantContextDep,
+):
+    """随机密码轮换设置 (页面顶部: 开关 + 天数)。仅平台管理员。"""
+    if not ctx.is_platform_admin:
+        raise ForbiddenException(message="Platform admin permission required")
+    return await _proxy_direct(
+        request.method, "/api/ssh/rotate-config", request, session, ctx,
+        require_worker=False,
+    )
+
+
+@router.post("/rotate-now")
+async def ssh_gw_rotate_now(
+    request: Request,
+    session: SessionDep,
+    ctx: TenantContextDep,
+):
+    """立即轮换 (?id=N 指定节点, 缺省全部)。仅平台管理员。"""
+    if not ctx.is_platform_admin:
+        raise ForbiddenException(message="Platform admin permission required")
+    return await _proxy_direct("POST", "/api/ssh/rotate-now", request, session, ctx,
+                               require_worker=False)
+
+
+@router.post("/upload")
+async def ssh_gw_upload(
+    request: Request,
+    session: SessionDep,
+    ctx: TenantContextDep,
+):
+    """SFTP 上传 (multipart: file + worker_id + remote_path)。"""
+    return await _proxy_direct("POST", "/api/ssh/upload", request, session, ctx)
+
+
+@router.get("/download")
+async def ssh_gw_download(
+    request: Request,
+    session: SessionDep,
+    ctx: TenantContextDep,
+):
+    """SFTP 下载 (?worker_id=&path=), 流式回传。"""
+    return await _proxy_direct("GET", "/api/ssh/download", request, session, ctx)
 
 
 async def _worker_and_ip(worker_id: int, session, ctx):

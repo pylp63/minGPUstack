@@ -39,7 +39,7 @@ try {
 
 /* inject_backends_images.py 的镜像行片段 (IIFE) 语法自检 */
 try {
-  const imgRow = '(function(){var fi=a.framework_images;if(!fi||!Object.keys(fi).length){return null}var parts=[];Object.keys(fi).forEach(function(fw){if(fi[fw]){parts.push(fw+": "+fi[fw])}});if(!parts.length){return null}var txt=parts.join("  /  ");return txt})()';
+  const imgRow = '(function(){var fi=a.framework_images;if(!fi||!Object.keys(fi).length){return null}var rows=[];Object.keys(fi).forEach(function(fw){var arr=Array.isArray(fi[fw])?fi[fw]:[fi[fw]];arr.forEach(function(img){if(img){rows.push(fw+": "+img)}})});if(!rows.length){return null}return rows.length})();';
   new Function('a', 'return ' + imgRow);
   console.log('inject 预检: 镜像行片段语法 OK');
 } catch (e) {

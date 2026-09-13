@@ -89,20 +89,25 @@ if t.count(FRAME_HEAD) != 1:
 # framework_images = {framework: "img1 · img2"}; 有数据才渲染。
 IMG_ROW = (
     FRAME_HEAD + ','
-    # ---- 二开: 镜像全名行 (浅灰) ----
+    # ---- 二开: 镜像全名多行列表 (浅灰) ----
+    # framework_images = {framework: "img1 · img2"}; 拆开为每镜像一行:
+    #   镜像: cuda: gpustack/runner:cuda13.0-vllm0.27.1
+    #         cuda: gpustack/runner:cuda12.9-vllm0.27.1
+    #         rocm: gpustack/runner:rocm7.2-vllm0.27.1
     '(function(){var fi=a.framework_images;'
     'if(!fi||!Object.keys(fi).length){return null}'
-    # 按框架顺序拼接: "cuda: img1 · img2  /  rocm: img3"
-    'var parts=[];'
+    'var rows=[];'
     'Object.keys(fi).forEach(function(fw){'
-    'if(fi[fw]){parts.push(fw+": "+fi[fw])}});'
-    'if(!parts.length){return null}'
-    'var txt=parts.join("  /  ");'
-    'return (0,Se.jsxs)("div",{style:{marginTop:2,display:"flex",gap:6},children:['
-    '(0,Se.jsx)("span",{className:"label",style:{fontSize:12,flexShrink:0},children:"镜像:"}),'
-    '(0,Se.jsx)("span",{title:txt,style:{fontSize:12,color:"var(--ant-color-text-tertiary)",'
-    'overflow:"hidden",whiteSpace:"nowrap",textOverflow:"ellipsis"},'
-    'children:txt})'
+    'var arr=Array.isArray(fi[fw])?fi[fw]:[fi[fw]];'
+    'arr.forEach(function(img){'
+    'if(img){rows.push(fw+": "+img)}})});'
+    'if(!rows.length){return null}'
+    'return (0,Se.jsxs)("div",{style:{marginTop:2,fontSize:12,'
+    'color:"var(--ant-color-text-tertiary)",lineHeight:"18px"},children:['
+    '(0,Se.jsx)("span",{className:"label",style:{flexShrink:0},children:"镜像:"}),'
+    '(0,Se.jsx)("div",{children:rows.map(function(r,idx){'
+    'return (0,Se.jsx)("div",{title:r,style:{whiteSpace:"nowrap",'
+    'overflow:"hidden",textOverflow:"ellipsis",maxWidth:"420px"},children:r},idx)})})'
     ']})})()'
 )
 t = t.replace(FRAME_HEAD, IMG_ROW, 1)

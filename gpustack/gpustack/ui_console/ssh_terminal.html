@@ -20,6 +20,9 @@
   .dot.err { background: #f44336; }
   .dot.wait { background: #ff9800; }
   a.hint { color: #4f8cff; text-decoration: none; cursor: pointer; }
+  a.hint.disabled { color: #666; cursor: not-allowed; }
+  #xfer { display: none; margin-top: 4px; height: 3px; background: #333; border-radius: 2px; overflow: hidden; }
+  #xfer .bar { height: 100%; width: 0; background: #4f8cff; transition: width .15s; }
 
   /* ---------- 凭据弹窗 ---------- */
   #cred-mask {
@@ -71,8 +74,12 @@
   <span class="dot wait" id="dot"></span>
   <span class="name" id="wname">SSH</span>
   <span class="meta" id="wmeta">连接中…</span>
+  <a class="hint" onclick="pickUpload()">⬆ 上传</a>
+  <a class="hint" onclick="promptDownload()">⬇ 下载</a>
   <a class="hint" onclick="location.reload()">重新连接</a>
+  <input type="file" id="up-file" style="display:none" onchange="doUpload(this)">
 </div>
+<div id="xfer"><div class="bar"></div></div>
 <div id="term"></div>
 
 <!-- SSH 凭据弹窗 (自动发现节点: 首次连接 / 凭据失效时录入) -->
@@ -287,6 +294,89 @@
       term.write('\r\n\x1b[31m[无法建立连接: ' + e.message + ']\x1b[0m\r\n');
     });
   }
+
+  // ================= 文件传输 (SFTP) =================
+  function xferProgress(pct) {
+    var box = document.getElementById('xfer');
+    if (pct === null) { box.style.display = 'none'; return; }
+    box.style.display = 'block';
+    box.querySelector('.bar').style.width = Math.min(100, pct) + '%';
+  }
+
+  window.pickUpload = function () {
+    if (!workerId) return;
+    document.getElementById('up-file').click();
+  };
+
+  window.doUpload = function (inp) {
+    var f = inp.files && inp.files[0];
+    inp.value = '';
+    if (!f) return;
+    var remote = prompt('上传到远程路径 (目录或完整路径):', '/tmp');
+    if (remote === null) return;
+    var fd = new FormData();
+    fd.append('file', f);
+    fd.append('worker_id', workerId);
+    fd.append('remote_path', remote);
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/v2/ssh-gw/upload');
+    xhr.withCredentials = true;
+    setDot('wait', '上传中 ' + f.name + ' …');
+    xferProgress(3);
+    xhr.upload.onprogress = function (e) {
+      if (e.lengthComputable) xferProgress(e.loaded / e.total * 100);
+    };
+    xhr.onload = function () {
+      xferProgress(null);
+      try {
+        var j = JSON.parse(xhr.responseText);
+        if (j.ok) {
+          setDot('', '已连接 · 上传完成');
+          term.write('\r\n\x1b[32m[已上传 ' + j.path + ' (' + j.bytes + ' 字节)]\x1b[0m\r\n');
+          term.focus();
+        } else {
+          setDot('err', '上传失败');
+          term.write('\r\n\x1b[31m[上传失败: ' + (j.message || xhr.status) + ']\x1b[0m\r\n');
+        }
+      } catch (e) {
+        setDot('err', '上传失败');
+        term.write('\r\n\x1b[31m[上传失败: HTTP ' + xhr.status + ']\x1b[0m\r\n');
+      }
+    };
+    xhr.onerror = function () {
+      xferProgress(null);
+      setDot('err', '上传失败');
+      term.write('\r\n\x1b[31m[上传失败: 网络错误]\x1b[0m\r\n');
+    };
+    xhr.send(fd);
+  };
+
+  window.promptDownload = function () {
+    if (!workerId) return;
+    var p = prompt('要下载的远程文件绝对路径:', '');
+    if (!p) return;
+    // 触发浏览器下载 (登录态 cookie 同源)
+    var url = '/v2/ssh-gw/download?worker_id=' + workerId + '&path=' + encodeURIComponent(p);
+    fetch(url, { credentials: 'include' }).then(function (r) {
+      if (!r.ok) return r.json().catch(function () { return {}; }).then(function (j) {
+        throw new Error(j.message || ('HTTP ' + r.status));
+      });
+      var cd = r.headers.get('content-disposition') || '';
+      var name = cd.match(/filename="([^"]+)"/);
+      return r.blob().then(function (b) {
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(b);
+        a.download = name ? name[1] : p.split('/').pop();
+        a.click();
+        URL.revokeObjectURL(a.href);
+        term.write('\r\n\x1b[32m[已下载 ' + a.download + ']\x1b[0m\r\n');
+        term.focus();
+      });
+    }).catch(function (e) {
+      setDot('err', '下载失败');
+      term.write('\r\n\x1b[31m[下载失败: ' + e.message + ']\x1b[0m\r\n');
+    });
+  };
 
   window.addEventListener('resize', function () { fit.fit(); });
   connect();
