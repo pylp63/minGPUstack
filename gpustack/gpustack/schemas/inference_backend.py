@@ -55,6 +55,10 @@ class VersionConfig(BaseModel):
     # runner-catalog versions the UI renders without a badge.
     source_name: Optional[str] = Field(None)
     source_type: Optional[SourceTypeEnum] = Field(None)
+    # 二开: 内置版本按框架聚合的 runner 镜像全名 (UI 版本条目下的浅灰字展示)。
+    # {framework: docker_image}, 例如 {"cuda": "gpustack/runner:cuda13.0-vllm0.27.1"}。
+    # 仅内置版本由 runner 目录填充; 用户自建版本为 None (镜像走 image_name)。
+    framework_images: Optional[Dict[str, str]] = Field(None)
 
 
 class VersionConfigDict(RootModel[Dict[str, VersionConfig]]):

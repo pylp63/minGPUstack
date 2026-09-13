@@ -36,3 +36,13 @@ try {
   console.error('!! 注入片段语法错误: ' + e.message);
   process.exit(1);
 }
+
+/* inject_backends_images.py 的镜像行片段 (IIFE) 语法自检 */
+try {
+  const imgRow = '(function(){var fi=a.framework_images;if(!fi||!Object.keys(fi).length){return null}var parts=[];Object.keys(fi).forEach(function(fw){if(fi[fw]){parts.push(fw+": "+fi[fw])}});if(!parts.length){return null}var txt=parts.join("  /  ");return txt})()';
+  new Function('a', 'return ' + imgRow);
+  console.log('inject 预检: 镜像行片段语法 OK');
+} catch (e) {
+  console.error('!! 镜像行片段语法错误: ' + e.message);
+  process.exit(1);
+}

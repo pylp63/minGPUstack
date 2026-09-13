@@ -279,6 +279,34 @@ BUILTIN_BACKEND_SPEC = SourceConfigSpec(
 )
 
 
+def _catalog_images_for_version(
+    overrides: List, service: str, service_version: str, framework: str
+) -> List[str]:
+    """二开: 内置版本某框架下的全部 runner 镜像全名 (去重保序)。
+
+    与 get_runner_versions_and_configs 同源的 overrides 感知查询:
+    overrides 存在时目录被整体替换, 镜像必须从替换后的行取,
+    否则展示与实际部署不一致。
+    """
+    try:
+        from gpustack.schemas.runner_source import merged_runners
+
+        rows = merged_runners(
+            list(overrides or []),
+            backend=framework,
+            service=service,
+            service_version=service_version,
+        )
+        seen: List[str] = []
+        for r in rows or []:
+            img = getattr(r, "docker_image", None)
+            if img and img not in seen:
+                seen.append(img)
+        return seen
+    except Exception:  # 目录异常不影响主流程
+        return []
+
+
 def get_runner_versions_and_configs(
     backend_name: str, overrides: List[RunnerOverrideEntry], **kwargs
 ) -> Tuple[Dict[str, ServiceVersionedRunner], VersionConfigDict, Optional[str]]:
@@ -319,6 +347,21 @@ def get_runner_versions_and_configs(
                 version_configs.root[version.version] = VersionConfig(
                     built_in_frameworks=backend_list,
                 )
+                # 二开: 按框架聚合该版本的 runner 镜像全名 (UI 浅灰字展示)。
+                # 一个框架可能对应多个 runtime 镜像 (cuda13.0 / cuda12.9),
+                # framework_images 的 value 为「 · 」连接的全部镜像。
+                fw_images: Dict[str, str] = {}
+                for be in version.backends or []:
+                    fw = f"{be.backend}"
+                    if fw in fw_images:
+                        continue
+                    imgs = _catalog_images_for_version(
+                        overrides, service, version.version, fw
+                    )
+                    if imgs:
+                        fw_images[fw] = " · ".join(imgs)
+                if fw_images:
+                    version_configs.root[version.version].framework_images = fw_images
                 if default_version is None:
                     default_version = version.version
 

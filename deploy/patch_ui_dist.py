@@ -90,19 +90,31 @@ new_items = (
     '49:{name:"console",path:"/models/console",key:"console",'
     'icon:"icon-rocket-launch1",selectedIcon:"icon-rocket-launch-fill",'
     'defaultIcon:"icon-rocket-launch1",parentId:"9",id:"49"},'
+    # 51: 资源组 → 节点凭证 (SSH 凭据管理 + 随机密码轮换天数设置)
+    '51:{name:"sshCredentials",path:"/resources/ssh-credentials",key:"sshCredentials",'
+    'icon:"icon-credential-outline",selectedIcon:"icon-credential-filled",'
+    'defaultIcon:"icon-credential-outline",parentId:"30",id:"51"},'
 )
 if 'id:"49"' not in u:
     u = u.replace(anchor_m.group(1), anchor_m.group(1) + new_items, 1)
-    print("C1: menu item 49 added (模型服务组 → 控制台)")
+    print("C1: menu item 49+51 added (控制台 + 节点凭证)")
+elif 'id:"51"' not in u:
+    m51 = re.search(r'(49:\{[^{}]*?id:"49"\},)', u)
+    if m51:
+        u = u.replace(m51.group(1), m51.group(1) + new_items.split("49:{", 1)[1].join(["", ""]) if False else new_items[new_items.find("51:{"):], 1)
+        print("C1: menu item 51 added (节点凭证)")
+    else:
+        print("!! cannot anchor 51 insert")
 else:
-    print("C1: menu item already exists")
+    print("C1: menu items already exist")
 
 # --- C2: 组件绑定表新增 49/50 (复用 42 组织页的 chunk 加载链)
 # 宽松正则: 官方 UI tarball 更新会改变 chunk id/模块 id, 精确字符串会漂移;
 # 用正则从 42 的绑定链提取实际加载代码, 49/50 复用同一段。
-if "49:k.lazy" in u:
-    print("C2: binding 49 already exists")
-else:
+if "51:k.lazy" in u:
+    print("C2: binding 49/51 already exists")
+elif "49:k.lazy" not in u:
+    # 首次: 同时绑 49 + 51
     i42 = u.find("42:k.lazy")
     if i42 == -1:
         print("!! cannot anchor component binding (42 pattern changed)")
@@ -122,9 +134,9 @@ else:
                 break
         j += 1
     lazy_expr = u[start_expr:j]  # 42 完整的 lazy 加载链
-    extra = ",49:" + lazy_expr
+    extra = ",49:" + lazy_expr + ",51:" + lazy_expr
     u = u[:j] + extra + u[j:]
-    print("C2: component binding 49/50 added (balanced anchor)")
+    print("C2: component binding 49/51 added (balanced anchor)")
 
 if u != orig:
     write(UMI, u)
