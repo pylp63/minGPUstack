@@ -1,25 +1,29 @@
 // Package main — GPUStack SSH 网关 (二开)
 //
 // 功能:
-//  1. WebSocket 终端代理: 浏览器 (xterm.js) <-> /ws/ssh?id=<worker_id> <-> 节点 SSH (crypto/ssh)
-//  2. 会话认证: 一次性 ticket (由 GPUStack 主服务签发, 用后即焚, 10 秒有效)
-//  3. SSH 密码轮换: 定期把节点登录用户密码改为高强度随机密码 (默认关闭, 环境变量开启)
-//     - 密码仅存在内存 + 权限 0600 的本地状态文件 (重启恢复会话)
-//     - 密码历史不落盘; 轮换周期可配
+//  1. WebSocket 终端代理: 浏览器 (xterm.js) <-> /ws/ssh?ticket=... <-> 节点 SSH (crypto/ssh)
+//  2. 会话认证: 一次性 ticket (GPUStack 主服务签发, 用后即焚, 10 秒有效)
+//  3. 节点凭据管理 (自动发现节点的配套设计): 集群节点通过 worker 注册/K8S
+//     自动发现, 系统不预知 SSH 凭据 — 首次连接时前端弹窗录入
+//     (POST /api/ssh/credentials), 网关先实际登录验证, 通过才保存。
+//  4. 连接失败分类: 端口不通 (unreachable) / 用户名密码错误 (auth_failed) /
+//     未配置凭据 (no_credentials) / 其它 SSH 错误 (ssh_error), 以
+//     {type:"error",code,message} JSON 消息下发, 前端按类型弹窗。
+//  5. SSH 密码轮换 (可选, SSHGW_ROTATE_PASSWORDS=true): 定期把节点登录
+//     密码改为高强度随机密码。
 //
 // 安全设计:
 //  - ticket 一次性 + 短时效, 防重放
-//  - SSH 会话用节点随机密码登录 (不是静态凭据)
-//  - 网关进程与 GPUStack 主服务同容器部署, 只监听 127.0.0.1
-//  - 密码生成用 crypto/rand, 32 字符 (大小写+数字+符号, 混淆字符剔除)
+//  - 凭据仅存内存 + 0600 状态文件 (容器卷内, 重启恢复); 密码经 stdin 传给
+//    chpasswd / 只用于 crypto/ssh 认证, 不进命令行参数与日志
+//  - 网关只监听 127.0.0.1, 必须经 GPUStack 主服务 (登录态) 才能触达
 package main
 
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -39,13 +43,13 @@ import (
 // ---------- 配置 ----------
 
 type Config struct {
-	ListenAddr    string // 网关监听地址 (默认 127.0.0.1:10170, 经主服务反代)
-	SSHUser       string // 节点 SSH 用户 (默认 root)
-	SSHPort       int    // 节点 SSH 端口 (默认 22)
+	ListenAddr    string
+	SSHUser       string // 弹窗默认用户名 (默认 root)
+	SSHPort       int    // 弹窗默认端口 (默认 22)
 	TicketTTL     time.Duration
-	RotateEnabled bool          // 是否开启定期随机密码轮换
-	RotateEvery   time.Duration // 轮换周期 (默认 24h)
-	StateFile     string        // 密码状态文件 (0600, 重启恢复)
+	RotateEnabled bool
+	RotateEvery   time.Duration
+	StateFile     string
 }
 
 func loadConfig() Config {
@@ -83,6 +87,8 @@ func envOrInt(k string, d int) int {
 	return d
 }
 
+var loadCfg = loadConfig()
+
 // ---------- 一次性 ticket ----------
 
 type Ticket struct {
@@ -100,15 +106,13 @@ func NewTicketStore() *TicketStore {
 	return &TicketStore{byToken: map[string]*Ticket{}}
 }
 
-// Issue 签发一次性 ticket (token 32 字节随机 hex)。
 func (s *TicketStore) Issue(workerID uint, ip string) string {
 	b := make([]byte, 32)
 	_, _ = rand.Read(b)
-	tok := hex.EncodeToString(b)
+	tok := fmt.Sprintf("%x", b)
 	s.mu.Lock()
 	s.byToken[tok] = &Ticket{WorkerID: workerID, IP: ip, Expires: time.Now().Add(loadCfg.TicketTTL)}
 	s.mu.Unlock()
-	// 惰性清理
 	go s.sweep()
 	return tok
 }
@@ -139,24 +143,58 @@ func (s *TicketStore) sweep() {
 	s.mu.Unlock()
 }
 
-var loadCfg = loadConfig() // 包级配置 (Issue 等处引用 TTL)
+var tickets = NewTicketStore()
 
-// ---------- 密码轮换 ----------
+// ---------- 节点凭据 ----------
 
-// PwState — 每节点当前随机密码 (内存为主, 状态文件恢复)。
-type nodePw struct {
-	IP string `json:"ip"`
-	Pw string `json:"pw"`
+// nodeCred — 每节点 SSH 凭据 (弹窗录入 / 轮换写入)。
+// 旧状态文件 (只有 ip/pw) 可兼容反序列化: User/Port 为零值时回落默认。
+type nodeCred struct {
+	IP   string `json:"ip"`
+	User string `json:"user"`
+	Pw   string `json:"pw"`
+	Port int    `json:"port"`
 }
 
-type PwState struct {
+func (c *nodeCred) user() string {
+	if c.User == "" {
+		return loadCfg.SSHUser
+	}
+	return c.User
+}
+
+func (c *nodeCred) port() int {
+	if c.Port == 0 {
+		return loadCfg.SSHPort
+	}
+	return c.Port
+}
+
+type CredState struct {
 	mu   sync.RWMutex
-	pwds map[uint]nodePw // worker_id -> {节点 IP, 当前密码}
+	creds map[uint]nodeCred
 }
 
-var pwState = &PwState{pwds: map[uint]nodePw{}}
+var credState = &CredState{creds: map[uint]nodeCred{}}
 
-// genPassword — crypto/rand 高强度密码, 32 字符, 剔除易混淆字符 (0O1lI|`'").
+func getCred(workerID uint) *nodeCred {
+	credState.mu.RLock()
+	defer credState.mu.RUnlock()
+	c, ok := credState.creds[workerID]
+	if !ok {
+		return nil
+	}
+	return &c
+}
+
+func saveCred(workerID uint, c nodeCred) {
+	credState.mu.Lock()
+	credState.creds[workerID] = c
+	credState.mu.Unlock()
+	saveState()
+}
+
+// genPassword — crypto/rand 高强度密码, 32 字符, 剔除易混淆字符。
 const pwAlphabet = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*()-_=+[]{};:,.?/"
 
 func genPassword() (string, error) {
@@ -173,47 +211,42 @@ func genPassword() (string, error) {
 	return string(out), nil
 }
 
-// ensurePassword — 取节点当前密码; 没有则生成 + 立即改到节点 (chpasswd via SSH)。
-func ensurePassword(workerID uint, host string) (string, error) {
-	pwState.mu.RLock()
-	np, ok := pwState.pwds[workerID]
-	pwState.mu.RUnlock()
-	if ok && np.IP == host {
-		return np.Pw, nil
-	}
-	if ok && np.IP != host {
-		// 节点 IP 变了 (重装/漂移): 旧密码对新 IP 无意义, 重新引导
-		ok = false
-	}
-	// 首次: 需要「引导密码」登录改密。引导凭据来自环境 (现场实施时注入一次),
-	// 轮换开启后引导凭据即作废 (密码已被随机值替换)。
-	bootstrap := os.Getenv("SSHGW_BOOTSTRAP_PASSWORD")
-	if bootstrap == "" {
-		return "", fmt.Errorf("节点 %d 无已知密码且未设置 SSHGW_BOOTSTRAP_PASSWORD", workerID)
-	}
-	newPw, err := genPassword()
-	if err != nil {
-		return "", err
-	}
-	if err := rotateRemotePassword(host, bootstrap, newPw); err != nil {
-		return "", fmt.Errorf("首次改密失败 (节点 %s): %w", host, err)
-	}
-	pwState.mu.Lock()
-	pwState.pwds[workerID] = nodePw{IP: host, Pw: newPw}
-	pwState.mu.Unlock()
-	savePwState()
-	return newPw, nil
-}
-
-// rotateRemotePassword — 用旧密码 SSH 登录, chpasswd 改新密码。
-func rotateRemotePassword(host, oldPw, newPw string) error {
+// sshDial — 用凭据建立 SSH 连接。
+func sshDial(c *nodeCred) (*ssh.Client, error) {
 	cfg := &ssh.ClientConfig{
-		User:            loadCfg.SSHUser,
+		User:            c.user(),
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // 内网节点, 首版不做 known_hosts
-		Auth:            []ssh.AuthMethod{ssh.Password(oldPw)},
+		Auth:            []ssh.AuthMethod{ssh.Password(c.Pw)},
 		Timeout:         10 * time.Second,
 	}
-	cli, err := ssh.Dial("tcp", net.JoinHostPort(host, fmt.Sprint(loadCfg.SSHPort)), cfg)
+	return ssh.Dial("tcp", net.JoinHostPort(c.IP, fmt.Sprint(c.port())), cfg)
+}
+
+// classifyErr — 连接失败分类: 端口不通 / 认证失败 / 其它。
+// 前端按 code 弹窗 (unreachable 提示检查 sshd/端口/防火墙,
+// auth_failed 提示重新录入密码)。
+func classifyErr(err error) (code, message string) {
+	if err == nil {
+		return "", ""
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return "unreachable", fmt.Sprintf("SSH 端口不通或网络不可达 (%v)", opErr.Err)
+	}
+	s := err.Error()
+	if strings.Contains(s, "unable to authenticate") ||
+		strings.Contains(s, "authentication failed") {
+		return "auth_failed", "用户名或密码错误"
+	}
+	if strings.Contains(s, "i/o timeout") || strings.Contains(s, "no route to host") {
+		return "unreachable", "SSH 端口不通或网络不可达 (超时)"
+	}
+	return "ssh_error", s
+}
+
+// rotateRemotePassword — 用旧密码登录, chpasswd 改新密码 (密码走 stdin, 不进 ps)。
+func rotateRemotePassword(c *nodeCred, newPw string) error {
+	cli, err := sshDial(c)
 	if err != nil {
 		return err
 	}
@@ -223,12 +256,11 @@ func rotateRemotePassword(host, oldPw, newPw string) error {
 		return err
 	}
 	defer sess.Close()
-	// chpasswd 从 stdin 读 "user:newpass" — 密码不进命令行 (ps 不可见)
-	sess.Stdin = strings.NewReader(loadCfg.SSHUser + ":" + newPw + "\n")
+	sess.Stdin = strings.NewReader(c.user() + ":" + newPw + "\n")
 	return sess.Run("chpasswd")
 }
 
-// rotateLoop — 定期轮换所有已管理节点。
+// rotateLoop — 定期轮换所有已保存凭据的节点 (仅 SSHGW_ROTATE_PASSWORDS=true)。
 func rotateLoop(ctx context.Context) {
 	if !loadCfg.RotateEnabled {
 		return
@@ -240,16 +272,16 @@ func rotateLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-tk.C:
-			pwState.mu.Lock()
-			ids := make([]uint, 0, len(pwState.pwds))
-			for id := range pwState.pwds {
+			credState.mu.RLock()
+			ids := make([]uint, 0, len(credState.creds))
+			for id := range credState.creds {
 				ids = append(ids, id)
 			}
-			pwState.mu.Unlock()
+			credState.mu.RUnlock()
 			for _, id := range ids {
-				pwState.mu.RLock()
-				old := pwState.pwds[id]
-				pwState.mu.RUnlock()
+				credState.mu.RLock()
+				old := credState.creds[id]
+				credState.mu.RUnlock()
 				if old.IP == "" || old.Pw == "" {
 					continue
 				}
@@ -257,87 +289,101 @@ func rotateLoop(ctx context.Context) {
 				if err != nil {
 					continue
 				}
-				if err := rotateRemotePassword(old.IP, old.Pw, np); err != nil {
+				if err := rotateRemotePassword(&old, np); err != nil {
 					log.Printf("[rotate] worker %d (%s) 轮换失败: %v", id, old.IP, err)
 					continue
 				}
-				pwState.mu.Lock()
-				pwState.pwds[id] = nodePw{IP: old.IP, Pw: np}
-				pwState.mu.Unlock()
+				old.Pw = np
+				credState.mu.Lock()
+				credState.creds[id] = old
+				credState.mu.Unlock()
 				log.Printf("[rotate] worker %d (%s) 密码已轮换", id, old.IP)
 			}
-			savePwState()
+			saveState()
 		}
 	}
 }
 
-// savePwState / loadPwState — 0600 状态文件, 重启恢复 (轮换场景必须)。
-func savePwState() {
-	pwState.mu.RLock()
-	data, _ := json.Marshal(pwState.pwds)
-	pwState.mu.RUnlock()
+// saveState / loadState — 0600 状态文件, 重启恢复。
+func saveState() {
+	credState.mu.RLock()
+	data, _ := json.Marshal(credState.creds)
+	credState.mu.RUnlock()
 	_ = os.WriteFile(loadCfg.StateFile, data, 0600)
 }
 
-func loadPwState() {
+func loadState() {
 	data, err := os.ReadFile(loadCfg.StateFile)
 	if err != nil {
 		return
 	}
-	m := map[uint]nodePw{}
+	m := map[uint]nodeCred{}
 	if json.Unmarshal(data, &m) == nil {
-		pwState.mu.Lock()
-		pwState.pwds = m
-		pwState.mu.Unlock()
+		credState.mu.Lock()
+		credState.creds = m
+		credState.mu.Unlock()
 	}
 }
 
 // ---------- WebSocket 终端 ----------
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true }, // 同源反代
+	CheckOrigin: func(r *http.Request) bool { return true },
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
 }
 
-// wsMsg — xterm 前端协议 {type:"input"|"resize"|"ping", data, cols, rows}
+// wsMsg — xterm 前端协议 (input/resize/ping) + 网关下行 (pong/error)。
 type wsMsg struct {
 	Type  string `json:"type"`
-	Data  string `json:"data"`
-	Cols  int    `json:"cols"`
-	Rows  int    `json:"rows"`
+	Code  string `json:"code,omitempty"`
+	Data  string `json:"data,omitempty"`
+	Cols  int    `json:"cols,omitempty"`
+	Rows  int    `json:"rows,omitempty"`
+}
+
+func sendErr(ws *websocket.Conn, code, msg string) {
+	_ = ws.WriteJSON(wsMsg{Type: "error", Code: code, Data: msg})
+	_ = ws.WriteControl(websocket.CloseMessage,
+		websocket.FormatCloseMessage(1011, code), time.Now().Add(time.Second))
 }
 
 func handleTerminal(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	tok := q.Get("ticket")
-	workerID, host, ok := tickets.Consume(tok)
+	workerID, host, ok := tickets.Consume(q.Get("ticket"))
 	if !ok || host == "" {
 		http.Error(w, "invalid or expired ticket", http.StatusUnauthorized)
 		return
 	}
-	pw, err := ensurePassword(workerID, host)
+
+	// 先升级 WebSocket: 凭据/连接类失败不作为 HTTP 错误返回 (那样前端
+	// 只能看到「连接已断开」), 而是升级后以 {type:"error"} 消息下发,
+	// 前端按 code 弹窗 (区分端口不通 / 密码错误 / 未配置凭据)。
+	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		http.Error(w, "password provision failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
+	defer ws.Close()
 
-	// SSH 连接
-	cfg := &ssh.ClientConfig{
-		User:            loadCfg.SSHUser,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Auth:            []ssh.AuthMethod{ssh.Password(pw)},
-		Timeout:         10 * time.Second,
+	creds := getCred(workerID)
+	if creds == nil {
+		sendErr(ws, "no_credentials",
+			"该节点为自动发现, 尚未保存 SSH 登录凭据")
+		return
 	}
-	cli, err := ssh.Dial("tcp", net.JoinHostPort(host, fmt.Sprint(loadCfg.SSHPort)), cfg)
+	creds.IP = host // ticket 携带的是 API 侧最新可达地址
+
+	cli, err := sshDial(creds)
 	if err != nil {
-		http.Error(w, "ssh dial failed: "+err.Error(), http.StatusBadGateway)
+		code, msg := classifyErr(err)
+		sendErr(ws, code, fmt.Sprintf("%s (目标 %s:%d)", msg, creds.IP, creds.port()))
 		return
 	}
 	defer cli.Close()
+
 	sess, err := cli.NewSession()
 	if err != nil {
-		http.Error(w, "ssh session failed: "+err.Error(), http.StatusBadGateway)
+		sendErr(ws, "ssh_error", "会话创建失败: "+err.Error())
 		return
 	}
 	defer sess.Close()
@@ -348,22 +394,16 @@ func handleTerminal(w http.ResponseWriter, r *http.Request) {
 		ssh.TTY_OP_OSPEED: 14400,
 	}
 	if err := sess.RequestPty("xterm-256color", 40, 120, modes); err != nil {
-		http.Error(w, "pty failed: "+err.Error(), http.StatusBadGateway)
+		sendErr(ws, "ssh_error", "PTY 申请失败: "+err.Error())
 		return
 	}
 	stdin, _ := sess.StdinPipe()
 	stdout, _ := sess.StdoutPipe()
 	stderr, _ := sess.StderrPipe()
 	if err := sess.Shell(); err != nil {
-		http.Error(w, "shell failed: "+err.Error(), http.StatusBadGateway)
+		sendErr(ws, "ssh_error", "Shell 启动失败: "+err.Error())
 		return
 	}
-
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		return
-	}
-	defer ws.Close()
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -416,12 +456,12 @@ func handleTerminal(w http.ResponseWriter, r *http.Request) {
 }
 
 // multiReader — 顺序读 stdout 再 stderr (简单聚合)。
-type readCloser interface {
+type reader interface {
 	Read(p []byte) (int, error)
 }
 
 type multiReader struct {
-	a, b readCloser
+	a, b reader
 }
 
 func (m multiReader) Read(p []byte) (int, error) {
@@ -437,9 +477,8 @@ func (m multiReader) Read(p []byte) (int, error) {
 
 // ---------- HTTP 路由 ----------
 
-var tickets = NewTicketStore()
-
-// handleTicket — 签发 ticket (主服务反代后走 GPUStack 登录态; 直连时校验头)。
+// handleTicket — 签发一次性 ticket (由 GPUStack 主服务反代调用,
+// 登录态与节点可见性在主服务侧校验)。
 func handleTicket(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
@@ -458,12 +497,55 @@ func handleTicket(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"ticket": tok})
 }
 
+type credResp struct {
+	OK      bool   `json:"ok"`
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+// handleCredentials — 前端弹窗「验证并连接」: 先实际 SSH 登录验证,
+// 通过才保存凭据; 失败按原因分类返回 (前端弹窗提示)。
+func handleCredentials(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		WorkerID uint   `json:"worker_id"`
+		IP       string `json:"ip"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Port     int    `json:"port"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil ||
+		req.WorkerID == 0 || req.IP == "" || req.Username == "" || req.Password == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	c := nodeCred{IP: req.IP, User: req.Username, Pw: req.Password, Port: req.Port}
+	if c.Port == 0 {
+		c.Port = loadCfg.SSHPort
+	}
+	w.Header().Set("Content-Type", "application/json")
+	cli, err := sshDial(&c)
+	if err != nil {
+		code, msg := classifyErr(err)
+		_ = json.NewEncoder(w).Encode(credResp{OK: false, Code: code, Message: msg})
+		return
+	}
+	cli.Close()
+	saveCred(req.WorkerID, c)
+	log.Printf("[credentials] worker %d (%s@%s:%d) 凭据已验证并保存",
+		req.WorkerID, c.User, c.IP, c.Port)
+	_ = json.NewEncoder(w).Encode(credResp{OK: true})
+}
+
 func main() {
-	loadPwState()
+	loadState()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/ssh/ticket", handleTicket)
+	mux.HandleFunc("/api/ssh/credentials", handleCredentials)
 	mux.HandleFunc("/ws/ssh", handleTerminal)
-	// 静态终端页 (构建时嵌入)
 	mux.Handle("/", http.FileServer(http.FS(webFS)))
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -481,10 +563,4 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
-}
-
-// debug 哈希 (不暴露明文)
-func pwHash(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(h[:8])
 }

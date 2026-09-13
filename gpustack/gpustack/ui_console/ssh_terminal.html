@@ -19,7 +19,51 @@
   .dot { width: 9px; height: 9px; border-radius: 50%; background: #4caf50; }
   .dot.err { background: #f44336; }
   .dot.wait { background: #ff9800; }
-  a.hint { color: #4f8cff; text-decoration: none; }
+  a.hint { color: #4f8cff; text-decoration: none; cursor: pointer; }
+
+  /* ---------- 凭据弹窗 ---------- */
+  #cred-mask {
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(0,0,0,.55); display: none;
+    align-items: center; justify-content: center;
+  }
+  #cred-mask.show { display: flex; }
+  .dlg {
+    width: 420px; background: #252526; border: 1px solid #3c3c3c;
+    border-radius: 10px; box-shadow: 0 12px 40px rgba(0,0,0,.5);
+    font-family: -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+  }
+  .dlg h3 {
+    margin: 0; padding: 14px 18px; font-size: 15px; color: #e6e6e6;
+    border-bottom: 1px solid #3c3c3c; font-weight: 600;
+  }
+  .dlg .body { padding: 14px 18px; }
+  .dlg p.tip { margin: 0 0 12px; font-size: 12px; color: #9aa0a6; line-height: 1.6; }
+  .dlg label { display: block; font-size: 12px; color: #bbb; margin: 10px 0 4px; }
+  .dlg input {
+    width: 100%; box-sizing: border-box; padding: 7px 10px;
+    background: #1e1e1e; border: 1px solid #3c3c3c; border-radius: 6px;
+    color: #e6e6e6; font-size: 13px; outline: none;
+  }
+  .dlg input:focus { border-color: #4f8cff; }
+  .dlg .err-msg {
+    display: none; margin: 12px 0 0; padding: 8px 10px; border-radius: 6px;
+    font-size: 12px; line-height: 1.5;
+  }
+  .dlg .err-msg.show { display: block; }
+  .dlg .err-msg.unreachable { background: rgba(255,152,0,.12); color: #ffb74d; }
+  .dlg .err-msg.auth_failed { background: rgba(244,67,54,.12); color: #ef9a9a; }
+  .dlg .err-msg.other { background: rgba(158,158,158,.12); color: #bdbdbd; }
+  .dlg .foot {
+    display: flex; justify-content: flex-end; gap: 10px;
+    padding: 12px 18px; border-top: 1px solid #3c3c3c;
+  }
+  .dlg button {
+    padding: 6px 16px; border-radius: 6px; border: 1px solid #3c3c3c;
+    background: #2d2d2d; color: #ccc; font-size: 13px; cursor: pointer;
+  }
+  .dlg button.primary { background: #4f8cff; border-color: #4f8cff; color: #fff; }
+  .dlg button.primary:disabled { opacity: .55; cursor: not-allowed; }
 </style>
 </head>
 <body>
@@ -27,31 +71,151 @@
   <span class="dot wait" id="dot"></span>
   <span class="name" id="wname">SSH</span>
   <span class="meta" id="wmeta">连接中…</span>
-  <a class="hint" id="reconnect" href="javascript:location.reload()">重新连接</a>
+  <a class="hint" onclick="location.reload()">重新连接</a>
 </div>
 <div id="term"></div>
+
+<!-- SSH 凭据弹窗 (自动发现节点: 首次连接 / 凭据失效时录入) -->
+<div id="cred-mask">
+  <div class="dlg">
+    <h3 id="dlg-title">连接到节点</h3>
+    <div class="body">
+      <p class="tip" id="dlg-tip">该节点由集群自动发现, 需要输入 SSH 登录凭据。
+        凭据经实际登录验证后保存, 下次连接免输入。</p>
+      <label>用户名</label>
+      <input id="cred-user" value="root" autocomplete="off">
+      <label>密码</label>
+      <input id="cred-pass" type="password" autocomplete="off"
+             placeholder="节点 SSH 登录密码">
+      <label>SSH 端口</label>
+      <input id="cred-port" type="number" value="22" min="1" max="65535">
+      <div class="err-msg" id="cred-err"></div>
+    </div>
+    <div class="foot">
+      <button onclick="closeCredDlg(true)">取消</button>
+      <button class="primary" id="cred-ok" onclick="submitCredentials()">验证并连接</button>
+    </div>
+  </div>
+</div>
+
 <script src="/console/xterm.js"></script>
 <script src="/console/xterm-addon-fit.js"></script>
 <script>
 (function () {
   var qs = new URLSearchParams(location.search);
   var workerId = parseInt(qs.get('id'), 10);
-  var dot = document.getElementById('dot');
   var $ = function (s) { return document.querySelector(s); };
+  var term, fit, connected = false;
 
-  var term = new Terminal({
-    cursorBlink: true,
-    fontSize: 13,
-    fontFamily: 'Menlo, Consolas, "Courier New", monospace',
-    theme: { background: '#1e1e1e' },
-    scrollback: 10000
+  function setDot(cls, msg) {
+    $('#dot').className = 'dot ' + cls;
+    $('#wmeta').textContent = msg;
+  }
+
+  // ================= 凭据弹窗 =================
+  var dlgTitle = $('#dlg-title'), dlgTip = $('#dlg-tip');
+  function showCredDlg(title, tip) {
+    dlgTitle.textContent = title || '连接到节点';
+    if (tip) dlgTip.textContent = tip;
+    $('#cred-err').className = 'err-msg';
+    $('#cred-err').textContent = '';
+    $('#cred-mask').classList.add('show');
+    setTimeout(function () { $('#cred-pass').focus(); }, 50);
+  }
+  window.closeCredDlg = function (cancelled) {
+    $('#cred-mask').classList.remove('show');
+    if (cancelled && !connected) {
+      setDot('err', '未连接 — 已取消凭据输入');
+      term.write('\r\n\x1b[90m[已取消 — 点击「重新连接」重试]\x1b[0m\r\n');
+    }
+  };
+
+  // 错误分类映射: code -> {弹窗样式, 提示, 是否重新弹凭据框}
+  var ERR_META = {
+    no_credentials: {
+      cls: 'other', title: '连接到节点',
+      tip: '该节点由集群自动发现, 需要输入 SSH 登录凭据。凭据经实际登录验证后保存, 下次连接免输入。',
+      text: '尚未保存该节点的 SSH 凭据', recred: true
+    },
+    auth_failed: {
+      cls: 'auth_failed', title: 'SSH 用户名或密码错误',
+      tip: '凭据验证未通过, 请重新输入 (保存的旧密码可能已被修改)。',
+      text: '用户名或密码错误', recred: true
+    },
+    unreachable: {
+      cls: 'unreachable', title: 'SSH 端口不通',
+      tip: '无法建立 TCP 连接。请检查: 节点 sshd 是否运行、端口是否正确、防火墙/安全组是否放行。',
+      text: 'SSH 端口不通或网络不可达', recred: true
+    },
+    ssh_error: { cls: 'other', title: 'SSH 连接失败', text: '', recred: true }
+  };
+
+  function handleGwError(code, message) {
+    var meta = ERR_META[code] || ERR_META.ssh_error;
+    setDot('err', meta.text + (code === 'unreachable' ? '' : ''));
+    term.write('\r\n\x1b[31m[' + (message || meta.text) + ']\x1b[0m\r\n');
+    if (meta.recred) {
+      var err = $('#cred-err');
+      err.className = 'err-msg show ' + meta.cls;
+      err.textContent = (message || meta.text) + (code === 'unreachable' ? '' : '');
+      showCredDlg(meta.title, meta.tip);
+      // 端口不通时预填端口并聚焦端口 (用户可能要改端口)
+      if (code === 'unreachable') setTimeout(function () { $('#cred-port').focus(); }, 60);
+      else setTimeout(function () { $('#cred-pass').focus(); }, 60);
+    }
+  }
+
+  // 验证凭据 (走 GPUStack 反代, 登录态): 先实际登录验证, 通过才保存
+  window.submitCredentials = function () {
+    var btn = $('#cred-ok');
+    var user = $('#cred-user').value.trim();
+    var pass = $('#cred-pass').value;
+    var port = parseInt($('#cred-port').value, 10) || 22;
+    if (!user || !pass) {
+      var err = $('#cred-err');
+      err.className = 'err-msg show auth_failed';
+      err.textContent = '请填写用户名和密码';
+      return;
+    }
+    btn.disabled = true; btn.textContent = '验证中…';
+    fetch('/v2/ssh-gw/credentials/' + workerId, {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: user, password: pass, port: port })
+    }).then(function (r) { return r.json(); }).then(function (j) {
+      if (j.ok) {
+        $('#cred-mask').classList.remove('show');
+        // 验证通过 — 重新走完整连接
+        connect();
+      } else {
+        var meta = ERR_META[j.code] || ERR_META.ssh_error;
+        var err = $('#cred-err');
+        err.className = 'err-msg show ' + meta.cls;
+        err.textContent = j.message || meta.text;
+        btn.disabled = false; btn.textContent = '验证并连接';
+        $('#cred-pass').select();
+      }
+    }).catch(function (e) {
+      var err = $('#cred-err');
+      err.className = 'err-msg show other';
+      err.textContent = '请求失败: ' + e.message;
+      btn.disabled = false; btn.textContent = '验证并连接';
+    });
+  };
+  $('#cred-pass').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') submitCredentials();
   });
-  var fit = new FitAddon.FitAddon();
+
+  // ================= 终端 =================
+  term = new Terminal({
+    cursorBlink: true, fontSize: 13,
+    fontFamily: 'Menlo, Consolas, "Courier New", monospace',
+    theme: { background: '#1e1e1e' }, scrollback: 10000
+  });
+  fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open($('#term'));
   fit.fit();
-
-  function setDot(cls, msg) { dot.className = 'dot ' + cls; $('#wmeta').textContent = msg; }
 
   if (!workerId) {
     setDot('err', '缺少 ?id= 参数');
@@ -59,7 +223,6 @@
     return;
   }
 
-  // 节点信息 (顺带验证登录态)
   fetch('/v2/workers?perPage=200', { credentials: 'include' })
     .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
     .then(function (d) {
@@ -71,52 +234,62 @@
     })
     .catch(function (e) { setDot('err', '节点信息获取失败: ' + e.message); });
 
-  // 1) 一次性 ticket (GPUStack 登录态 + worker 可见性在服务端校验)
-  fetch('/v2/ssh-gw/ticket/' + workerId, {
-    method: 'POST', credentials: 'include'
-  }).then(function (r) {
-    if (!r.ok) return r.json().then(function (j) { throw new Error(j.message || ('HTTP ' + r.status)); });
-    return r.json();
-  }).then(function (d) {
-    // 2) WebSocket 交互终端 (Go 网关 PTY)
-    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    var ws = new WebSocket(proto + '//' + location.host + '/v2/ssh-gw/ws?ticket=' + encodeURIComponent(d.ticket));
-    ws.binaryType = 'arraybuffer';
-    var ping = null;
+  function connect() {
+    setDot('wait', '连接中…');
+    fetch('/v2/ssh-gw/ticket/' + workerId, {
+      method: 'POST', credentials: 'include'
+    }).then(function (r) {
+      if (!r.ok) return r.json().then(function (j) { throw new Error(j.message || ('HTTP ' + r.status)); });
+      return r.json();
+    }).then(function (d) {
+      var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      var ws = new WebSocket(proto + '//' + location.host + '/v2/ssh-gw/ws?ticket=' + encodeURIComponent(d.ticket));
+      ws.binaryType = 'arraybuffer';
+      var ping = null;
 
-    ws.onopen = function () {
-      setDot('', '已连接');
-      term.focus();
-      ping = setInterval(function () {
-        if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping' }));
-      }, 15000);
-    };
-    ws.onmessage = function (ev) {
-      if (typeof ev.data === 'string') {
-        try { var m = JSON.parse(ev.data); if (m.type === 'pong') return; } catch (e) {}
-        return;
-      }
-      term.write(new Uint8Array(ev.data));
-    };
-    ws.onclose = function () {
-      if (ping) clearInterval(ping);
-      setDot('err', '连接已断开');
-      term.write('\r\n\x1b[31m[连接已断开 — 可点「重新连接」]\x1b[0m\r\n');
-    };
-    ws.onerror = function () { setDot('err', '连接错误'); };
+      ws.onopen = function () {
+        setDot('', '已连接');
+        term.focus();
+        connected = true;
+        ping = setInterval(function () {
+          if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping' }));
+        }, 15000);
+      };
+      ws.onmessage = function (ev) {
+        if (typeof ev.data === 'string') {
+          try {
+            var m = JSON.parse(ev.data);
+            if (m.type === 'pong') return;
+            if (m.type === 'error') { handleGwError(m.code, m.data); return; }
+          } catch (e) {}
+          return;
+        }
+        term.write(new Uint8Array(ev.data));
+      };
+      ws.onclose = function () {
+        if (ping) clearInterval(ping);
+        connected = false;
+        // 错误弹窗已处理的不重复提示 (handleGwError 已显示)
+        if ($('#cred-mask').classList.contains('show')) return;
+        setDot('err', '连接已断开');
+        term.write('\r\n\x1b[31m[连接已断开 — 可点「重新连接」]\x1b[0m\r\n');
+      };
+      ws.onerror = function () {};
 
-    term.onData(function (data) {
-      if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'input', data: data }));
+      term.onData(function (data) {
+        if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'input', data: data }));
+      });
+      term.onResize(function (cols, rows) {
+        if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', cols: cols, rows: rows }));
+      });
+    }).catch(function (e) {
+      setDot('err', '无法建立连接: ' + e.message);
+      term.write('\r\n\x1b[31m[无法建立连接: ' + e.message + ']\x1b[0m\r\n');
     });
-    term.onResize(function (cols, rows) {
-      if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', cols: cols, rows: rows }));
-    });
-  }).catch(function (e) {
-    setDot('err', '无法建立连接: ' + e.message);
-    term.write('\r\n\x1b[31m[无法建立连接: ' + e.message + ']\x1b[0m\r\n');
-  });
+  }
 
   window.addEventListener('resize', function () { fit.fit(); });
+  connect();
 })();
 </script>
 </body>
