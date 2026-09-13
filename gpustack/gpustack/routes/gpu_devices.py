@@ -75,10 +75,38 @@ async def get_gpus(
 
     extra_conditions = tenant_list_conditions(ctx, GPUDevice)
 
+    # User isolation (feature one): a non-admin caller also sees GPUs on
+    # workers the admin explicitly granted them (same grant union as the
+    # workers list — 本人授权 ∪ 所属用户组授权), so the 资源/GPU page shows
+    # granted machines once the resource menu is opened to regular users.
+    from gpustack.schemas.worker_access import user_or_group_worker_ids
+
+    _granted_worker_ids: set = set()
+    if not (bypass_tenant_filter(ctx) or cluster_scoped_system(ctx)):
+        async with async_session() as grant_session:
+            grant_ids = set(
+                await user_or_group_worker_ids(grant_session, ctx.user.id)
+            )
+        if grant_ids:
+            from sqlalchemy import or_
+
+            _granted_worker_ids = grant_ids
+            gpu_cond = GPUDevice.worker_id.in_(list(grant_ids))
+            if extra_conditions:
+                extra_conditions = [
+                    or_(cond, gpu_cond) for cond in extra_conditions
+                ]
+            else:
+                extra_conditions = [gpu_cond]
+
     def _gpu_visible(g) -> bool:
         if cluster_scoped_system(ctx):
             return scoped_cluster_row_visible(ctx, g)
         if bypass_tenant_filter(ctx):
+            return True
+        # granted worker GPUs stay visible (extra_conditions widened above;
+        # the row filter must match or pagination drops them)
+        if getattr(g, "worker_id", None) in _granted_worker_ids:
             return True
         org_id = getattr(g, "owner_principal_id", None)
         if (

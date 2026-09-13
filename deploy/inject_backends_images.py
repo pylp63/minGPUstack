@@ -102,7 +102,7 @@ IMG_ROW = (
     'arr.forEach(function(img){'
     'if(img){rows.push(fw+": "+img)}})});'
     'if(!rows.length){return null}'
-    'return (0,Se.jsxs)("div",{style:{marginTop:2,fontSize:12,'
+    'return (0,Se.jsxs)("div",{style:{gridColumn:"1 / -1",marginTop:2,fontSize:12,'
     'color:"var(--ant-color-text-tertiary)",lineHeight:"18px"},children:['
     '(0,Se.jsx)("span",{className:"label",style:{flexShrink:0},children:"镜像:"}),'
     '(0,Se.jsx)("div",{children:rows.map(function(r,idx){'

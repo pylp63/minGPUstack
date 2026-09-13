@@ -175,6 +175,40 @@ async def ssh_gw_upload(
     return await _proxy_direct("POST", "/api/ssh/upload", request, session, ctx)
 
 
+@router.get("/ls")
+async def ssh_gw_ls(
+    request: Request,
+    session: SessionDep,
+    ctx: TenantContextDep,
+):
+    """SFTP 目录浏览 (?worker_id=&path=, 含隐藏文件)。"""
+    return await _proxy_direct("GET", "/api/ssh/ls", request, session, ctx)
+
+
+@router.post("/complete")
+async def ssh_gw_complete(
+    request: Request,
+    session: SessionDep,
+    ctx: TenantContextDep,
+):
+    """Tab 补全候选 (body: worker_id/line/cursor; 失败静默返回空列表)。"""
+    return await _proxy_direct("POST", "/api/ssh/complete", request, session, ctx)
+
+
+@router.api_route("/global-cred", methods=["GET", "POST", "DELETE"])
+async def ssh_gw_global_cred(
+    request: Request,
+    session: SessionDep,
+    ctx: TenantContextDep,
+):
+    """通用凭据 (一批服务器的统一账号): GET 查看 / POST 验证保存 / DELETE 删除。
+    仅平台管理员。"""
+    if not ctx.is_platform_admin:
+        raise ForbiddenException(message="Platform admin permission required")
+    return await _proxy_direct(request.method, "/api/ssh/global-cred", request,
+                               session, ctx, require_worker=False)
+
+
 @router.get("/download")
 async def ssh_gw_download(
     request: Request,

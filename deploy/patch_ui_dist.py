@@ -111,6 +111,33 @@ elif 'id:"51"' not in u:
 else:
     print("C1: menu items already exist")
 
+# --- C1b (二开): 资源菜单开放给普通用户 ---
+# 后端 workers API 已做视图隔离 (admin 授权节点 -> 用户可见自己的节点)。
+# 菜单侧: 资源组 (30) 去掉 admin-only; 集群(32)/云凭证(35)/节点凭证(51)
+# 保持 admin 专属; 节点(33)/GPU(34) 对所有登录用户开放 (数据隔离兜底)。
+if 'id:"30"' in u:
+    # 30: 资源组去 access
+    m30 = re.search(r'30:\{name:"resources",path:"/resources",key:"resources",access:"canSeeOrgAdmin"', u)
+    if m30:
+        u = u.replace(m30.group(0),
+                      '30:{name:"resources",path:"/resources",key:"resources"', 1)
+        print("C1b: resources group opened to all users")
+    # 32: 集群 -> admin only
+    m32 = re.search(r'(32:\{name:"clusters",path:"/resources/clusters/list",key:"clusters",icon:"icon-cluster2-outline",selectedIcon:"icon-cluster2-filled",defaultIcon:"icon-cluster2-outline")', u)
+    if m32 and 'access' not in u[m32.start(1):m32.end(1)]:
+        u = u.replace(m32.group(1), m32.group(1) + ',access:"canSeeOrgAdmin"', 1)
+        print("C1b: clusters menu -> admin only")
+    # 35: 云凭证 -> admin only
+    m35 = re.search(r'(35:\{name:"credentials",path:"/resources/credentials",key:"credentials",icon:"icon-credential-outline",selectedIcon:"icon-credential-filled",defaultIcon:"icon-credential-outline")', u)
+    if m35 and 'access' not in u[m35.start(1):m35.end(1)]:
+        u = u.replace(m35.group(1), m35.group(1) + ',access:"canSeeOrgAdmin"', 1)
+        print("C1b: credentials menu -> admin only")
+    # 51: 节点凭证 -> admin only
+    m51 = re.search(r'(51:\{name:"sshCredentials",path:"/resources/ssh-credentials",key:"sshCredentials",icon:"icon-credential-outline",selectedIcon:"icon-credential-filled",defaultIcon:"icon-credential-outline")', u)
+    if m51 and 'access' not in u[m51.start(1):m51.end(1)]:
+        u = u.replace(m51.group(1), m51.group(1) + ',access:"canSeeOrgAdmin"', 1)
+        print("C1b: sshCredentials menu -> admin only")
+
 # --- C2: 组件绑定表新增 49/50 (复用 42 组织页的 chunk 加载链)
 # 宽松正则: 官方 UI tarball 更新会改变 chunk id/模块 id, 精确字符串会漂移;
 # 用正则从 42 的绑定链提取实际加载代码, 49/50 复用同一段。

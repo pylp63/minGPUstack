@@ -335,9 +335,14 @@ func handleTerminal(w http.ResponseWriter, r *http.Request) {
 
 	creds := getCred(workerID)
 	if creds == nil {
-		sendErr(ws, "no_credentials",
-			"该节点为自动发现, 尚未保存 SSH 登录凭据")
-		return
+		// 二开: 无节点级凭据时尝试「通用凭据」(一批服务器的统一账号) 自动派生
+		gc, gerr := applyGlobalCred(workerID, host)
+		if gerr != nil {
+			sendErr(ws, "no_credentials",
+				"该节点为自动发现, 尚未保存 SSH 登录凭据")
+			return
+		}
+		creds = gc
 	}
 	creds.IP = host // ticket 携带的是 API 侧最新可达地址
 
@@ -519,6 +524,9 @@ func main() {
 	mux.HandleFunc("/api/ssh/rotate-now", handleRotateNow)
 	mux.HandleFunc("/api/ssh/upload", handleUpload)
 	mux.HandleFunc("/api/ssh/download", handleDownload)
+	mux.HandleFunc("/api/ssh/ls", handleLs)
+	mux.HandleFunc("/api/ssh/complete", handleComplete)
+	mux.HandleFunc("/api/ssh/global-cred", handleGlobalCred)
 	mux.HandleFunc("/ws/ssh", handleTerminal)
 	mux.Handle("/", http.FileServer(http.FS(webFS)))
 
