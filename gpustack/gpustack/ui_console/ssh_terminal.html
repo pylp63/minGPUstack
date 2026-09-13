@@ -313,7 +313,7 @@
         eraseGhostNow();
         if (ghostMarker) { ghostMarker.dispose(); ghostMarker = null; }
         ghostMarker = term.registerMarker(0);
-        term.write('\x1b[90m' + text + '\x1b[0m\x1b[' + w + 'D');
+        term.write('\x1b[38;5;245m' + text + '\x1b[0m\x1b[' + w + 'D');
         ghost = { col: col, w: w };
       });
     })();
@@ -347,70 +347,48 @@
     }).catch(function () {});
   }
 
-  // ---------- Tab 列表 (按 Tab 列出全部候选, 依旧不写入) ----------
-  var hintShown = false;     // 当前输入行下方有提示块
-  var hintRows = 0;          // 提示块占的行数 (多清一行空白行无害, 宁多勿少)
-  var hintMarker = null;     // 输入行 marker (随 buffer 滚动/裁剪自动跟踪行号)
+  // ---------- Tab 列表 (HTML 浮层, 不碰 xterm buffer) ----------
+  // 画进 buffer 的候选块有三宗罪: 空白行残留 (擦除后行还在)、与命令
+  // 输出混排 (过期响应画在滚动输出上)、光标错位 (shell 不知道这些行)。
+  // HTML 浮层完全不进 buffer — 终端区域上方绝对定位, shell 输出/滚动/
+  // 回车互不干扰, 关闭即消失无残留。样式浅灰, 与幽灵文本同一视觉语言。
+  var hintBox = null;        // 浮层 DOM (创建于首次 Tab)
+  var hintShown = false;
 
-  // 光标从当前位置移动到 (absRow, col) (buffer 绝对坐标)
-  function moveCursor(absRow, col) {
-    var b = term.buffer.active;
-    var s = '';
-    var up = b.cursorY + b.baseY - absRow;
-    if (up > 0) s += '\x1b[' + up + 'A';
-    else if (up < 0) s += '\x1b[' + (-up) + 'B';
-    var right = col - b.cursorX;
-    if (right > 0) s += '\x1b[' + right + 'C';
-    else if (right < 0) s += '\x1b[' + (-right) + 'D';
-    term.write(s);
-  }
-  // 清除 Tab 列表提示块: 用 marker 定位输入行 (滚动/裁剪后行号依然正确),
-  // 光标移到块首逐行清空, 再还原到调用时的光标位置。
-  // marker 被裁剪 (输入行已滚出 scrollback) 时放弃清除 — 此时提示
-  // 早已不可见, 清了也没意义。
-  function clearHintBlock() {
-    if (!hintShown) return;
+  function hideHintBox() {
+    if (hintBox) { hintBox.style.display = 'none'; }
     hintShown = false;
-    var row = (hintMarker && !hintMarker.isDisposed) ? hintMarker.line : -1;
-    if (hintMarker) { hintMarker.dispose(); hintMarker = null; }
-    if (row < 0) return;
-    var b = term.buffer.active;
-    var curRow = b.cursorY + b.baseY, curCol = b.cursorX;
-    var s = '';
-    var down = (row + 1) - curRow;
-    if (down > 0) s += '\x1b[' + down + 'B';
-    else if (down < 0) s += '\x1b[' + (-down) + 'A';
-    for (var i = 0; i < hintRows; i++) s += '\r\x1b[K' + (i < hintRows - 1 ? '\x1b[B' : '');
-    term.write(s);
-    moveCursor(curRow, curCol);
   }
-  // 渲染 Tab 候选列表: 亮灰流式排列, 超出 60 项截断提示缩小范围。
-  // 写完把光标还原回原输入行。
+  function showHintBox(list) {
+    if (!hintBox) {
+      hintBox = document.createElement('div');
+      hintBox.style.cssText =
+        'position:absolute;z-index:50;display:none;pointer-events:none;' +
+        'background:rgba(30,30,30,.97);border:1px solid #3c3c3c;border-radius:6px;' +
+        'padding:6px 10px;color:rgb(138,138,138);' +
+        'font:12px/1.7 Menlo,Consolas,monospace;max-width:92%;' +
+        'box-shadow:0 6px 24px rgba(0,0,0,.5);white-space:pre-wrap;word-break:break-all';
+      document.querySelector('.main').appendChild(hintBox);
+    }
+    // 浮层内容: 候选空格分隔, 浅灰; 超过 60 项截断提示
+    var shown = Math.min(list.length, 60);
+    var text = list.slice(0, shown).join('  ');
+    if (list.length > shown) text += '  …还有 ' + (list.length - shown) + ' 项 (继续输入缩小范围)';
+    hintBox.textContent = text;
+    hintBox.style.display = 'block';
+    // 定位: 终端区域内左下角 (输入行总在视口底部附近)
+    var mainEl = document.querySelector('.main');
+    var mainRect = mainEl.getBoundingClientRect();
+    var boxRect = hintBox.getBoundingClientRect();
+    var top = mainRect.height - boxRect.height - 10;
+    if (top < 10) top = 10;
+    hintBox.style.left = '10px';
+    hintBox.style.top = top + 'px';
+    hintShown = true;
+  }
   function renderCompletions(list) {
-    // 同步点: 先等此前写入 (回显/幽灵擦除) 解析完, 坐标才准
-    term.write('', function () {
-      if (hintShown) { clearHintBlock(); }
-      eraseGhostNow();
-      var b = term.buffer.active;
-      var saveCol = b.cursorX;
-      if (hintMarker) { hintMarker.dispose(); hintMarker = null; }
-      hintMarker = term.registerMarker(0);
-      var parts = [], shown = Math.min(list.length, 60);
-      for (var i = 0; i < shown; i++) {
-        parts.push('\x1b[90m' + list[i] + '\x1b[0m');
-      }
-      var more = list.length - shown;
-      var tip = more > 0 ? '  \x1b[90m…还有 ' + more + ' 项 (继续输入缩小范围)\x1b[0m' : '';
-      var body = parts.join('  ') + tip;
-      // 提示块行数 = 起始换行 1 + 候选文本按宽度折行数 (宁多清一行)
-      hintRows = 1 + Math.max(1, Math.ceil(termWidth(body) / Math.max(1, term.cols)));
-      hintShown = true;
-      term.write('\r\n' + body + '\r\n', function () {
-        if (hintMarker && !hintMarker.isDisposed) {
-          moveCursor(hintMarker.line, saveCol);
-        }
-      });
-    });
+    eraseGhostNow();
+    showHintBox(list);
   }
   function requestCompletion() {
     if (!connected) return;
@@ -418,14 +396,19 @@
     if (!lw && !lineBuf.trim()) return;
     if (completing) return;
     completing = true;
+    // 失效保护: 记录发起时的行; Tab 的 PTY 补全请求要走一次 SSH 登录
+    // (几百毫秒), 期间用户可能已回车 — 响应回来时行已清空/变了就丢弃,
+    // 否则候选列表会画在正在滚动的命令输出上 (与输出混排)。
+    var line = lineBuf;
     fetch('/v2/ssh-gw/complete', {
       method: 'POST', credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ worker_id: workerId, line: lineBuf, cursor: lineBuf.length })
+      body: JSON.stringify({ worker_id: workerId, line: line, cursor: line.length })
     }).then(function (r) { return r.json(); }).then(function (j) {
       completing = false;
       var list = j.completions || [];
       if (!list.length) return;
+      if (lineBuf !== line) return;               // 行已变 (回车/继续敲字), 响应过期
       var lw2 = lastWord();
       if (list.length === 1 && list[0] === lw2) return; // 词已完整
       renderCompletions(list);
@@ -584,7 +567,7 @@
 
   // ================= 终端 =================
   term = new Terminal({
-    cursorBlink: true, fontSize: 13,
+    cursorBlink: true, cursorStyle: 'bar', fontSize: 13,
     fontFamily: 'Menlo, Consolas, "Courier New", monospace',
     theme: { background: '#1e1e1e' }, scrollback: 10000
   });
@@ -646,16 +629,16 @@
         var frame = new Uint8Array(ev.data);
         lastOutputAt = Date.now();
         // shell 输出帧到达: 先擦旧幽灵再写帧 — write 队列 FIFO 保序,
-        // 帧永远不会画在幽灵残影上。Tab 列表块同样清掉。
-        if (ghost || hintShown) {
+        // 帧永远不会画在幽灵残影上。Tab 候选是 HTML 浮层, 直接隐藏。
+        if (ghost) {
           term.write('', function () {
             eraseGhostNow();
-            clearHintBlock();
             term.write(frame);
           });
         } else {
           term.write(frame);
         }
+        if (hintShown) hideHintBox();
       };
       ws.onclose = function () {
         if (ping) clearInterval(ping);
@@ -673,7 +656,8 @@
         if (data === '\r') {
           // 回车执行: 撤幽灵/列表, shell 输出从干净行开始
           cancelGhost();
-          term.write('', function () { eraseGhostNow(); clearHintBlock(); });
+          term.write('', function () { eraseGhostNow(); });
+          if (hintShown) hideHintBox();
           lineBuf = '';
         }
         else if (data === '\u007f') {
