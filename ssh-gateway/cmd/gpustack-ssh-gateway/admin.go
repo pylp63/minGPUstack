@@ -468,8 +468,14 @@ func handleLs(w http.ResponseWriter, r *http.Request) {
 // ---------- Tab 补全 (独立 exec 会话, 不干扰交互 PTY) ----------
 
 // handleComplete — ?worker_id=&line=&cursor= 返回补全候选。
-// 用 bash -c 'compgen -A file ...' 在节点上求值; 无凭据/失败时返回空列表
+// 用 compgen 在节点上求值; 无凭据/失败时返回空列表
 // (前端静默降级, 不报错弹窗)。
+//
+// 二开: 别名 (ll / l. 等) 只在交互 login shell 里生效 — /etc/profile.d/*.sh
+// 开头有 [ ! -t 0 ] && return 守卫, 非交互 bash -c 根本不加载。因此
+// 命令位补全改走 PTY + bash -lic (ECHO 关闭, 输出无回显污染), 并把
+// -A alias 的结果并进候选 — 敲 l 提示 ll 才成为可能。
+// 文件位补全沿用普通 bash -c (快, 别名无关), 目录名尾部补 '/' 标记。
 func handleComplete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
@@ -502,40 +508,61 @@ func handleComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	defer sess.Close()
 
-	// 取光标前的命令片段; 转义后用 compgen 双通道求值:
-	// - 命令位 (第一个词): -A command; 其它: -A file (bash 默认)
+	// 取光标前的命令片段; 转义后用 compgen 求值:
+	// - 命令位 (第一个词): -A command + -A alias (PTY 交互 shell, 别名可见)
+	// - 其它: -A file (bash 默认), 目录尾部加 /
 	line := req.Line
 	cur := req.Cursor
 	if cur < 0 || cur > len(line) {
 		cur = len(line)
 	}
 	frag := line[:cur]
-	// 最后一个词
 	words := strings.Fields(frag)
 	var lastWord string
 	if len(words) > 0 {
 		lastWord = words[len(words)-1]
 	}
-	// 词里有路径前缀时补全用文件名, 否则同上
 	isFirst := len(words) <= 1
-	script := ""
-	esc := strings.ReplaceAll(lastWord, "'", "'\\''")
+	var out []byte
 	if isFirst {
-		script = "compgen -A command -- '" + esc + "' ; compgen -A function -- '" + esc + "'"
+		// 命令位: PTY + 交互 login shell (别名在这里才存在)。
+		// ECHO=0 + ICANON 保留: 无回显、行缓冲可用, 输出即 compgen 结果。
+		modes := ssh.TerminalModes{
+			ssh.ECHO:          0,
+			ssh.TTY_OP_ISPEED: 14400,
+			ssh.TTY_OP_OSPEED: 14400,
+		}
+		if err := sess.RequestPty("xterm-256color", 5, 200, modes); err != nil {
+			writeJSON(w, map[string]interface{}{"completions": []string{}})
+			return
+		}
+		esc := strings.ReplaceAll(lastWord, "'", "'\\''")
+		script := "compgen -A command -- '" + esc + "' 2>/dev/null; " +
+			"compgen -A alias -- '" + esc + "' 2>/dev/null; echo __X9__"
+		out, err = sess.Output("bash -lic " + shQuote(script))
 	} else {
-		script = "compgen -A file -- '" + esc + "'"
+		// 文件位: 普通 exec (别名无关), 目录尾部加 '/'
+		esc := strings.ReplaceAll(lastWord, "'", "'\\''")
+		script := "compgen -A file -- '" + esc + "' | while read -r f; do " +
+			"[ -d \"$f\" ] && printf '%s/\\n' \"$f\" || printf '%s\\n' \"$f\"; done; echo __X9__"
+		out, err = sess.Output("bash -c " + shQuote(script) + " 2>/dev/null")
 	}
-	out, err := sess.Output("bash -c " + shQuote(script) + " 2>/dev/null")
 	if err != nil && len(out) == 0 {
 		writeJSON(w, map[string]interface{}{"completions": []string{}})
 		return
 	}
-	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	text := strings.ReplaceAll(string(out), "\r", "")
+	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
 	comps := make([]string, 0, len(lines))
+	seen := map[string]bool{}
 	for _, l := range lines {
-		if l != "" {
-			comps = append(comps, l)
+		// 注意: 不能 TrimRight("/") — 文件位目录的 '/' 尾巴是目录标记,
+		// 前端原样显示; 命令位候选本来就不带 '/'
+		if l == "" || l == "__X9__" || seen[l] {
+			continue
 		}
+		seen[l] = true
+		comps = append(comps, l)
 	}
 	if len(comps) > 200 {
 		comps = comps[:200]

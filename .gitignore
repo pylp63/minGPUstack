@@ -19,3 +19,4 @@ deploy/.env
 *.swp
 # GitHub push token (deploy/git_push.sh)
 .gh_token
+ssh-gateway/gpustack-ssh-gateway
