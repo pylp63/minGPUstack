@@ -185,6 +185,16 @@ async def ssh_gw_ls(
     return await _proxy_direct("GET", "/api/ssh/ls", request, session, ctx)
 
 
+@router.get("/cwd")
+async def ssh_gw_cwd(
+    request: Request,
+    session: SessionDep,
+    ctx: TenantContextDep,
+):
+    """终端交互 shell 的当前目录 (?worker_id=; 文件面板跟随 cd 用)。"""
+    return await _proxy_direct("GET", "/api/ssh/cwd", request, session, ctx)
+
+
 @router.post("/complete")
 async def ssh_gw_complete(
     request: Request,

@@ -192,6 +192,7 @@ func saveCred(workerID uint, c nodeCred) {
 	credState.mu.Lock()
 	credState.creds[workerID] = c
 	credState.mu.Unlock()
+	poolBumpGen() // 凭据变了: 池内旧连接全部作废
 	saveState()
 }
 
@@ -525,6 +526,7 @@ func main() {
 	mux.HandleFunc("/api/ssh/upload", handleUpload)
 	mux.HandleFunc("/api/ssh/download", handleDownload)
 	mux.HandleFunc("/api/ssh/ls", handleLs)
+	mux.HandleFunc("/api/ssh/cwd", handleCwd)
 	mux.HandleFunc("/api/ssh/complete", handleComplete)
 	mux.HandleFunc("/api/ssh/global-cred", handleGlobalCred)
 	mux.HandleFunc("/ws/ssh", handleTerminal)

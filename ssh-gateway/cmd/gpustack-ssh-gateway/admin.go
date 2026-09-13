@@ -413,6 +413,45 @@ type lsItem struct {
 	ModTime string `json:"mod_time,omitempty"`
 }
 
+// handleCwd — ?worker_id= 返回终端交互 shell 的当前目录。
+// 找该登录用户最新的 pts shell 进程, readlink /proc/<pid>/cwd — 这是
+// shell 的真实工作目录, cd/脚本内部切换都能跟上 (比前端解析 cd 命令可靠)。
+// 找不到 shell (会话未建立/已退出) 时 404, 前端保持面板不动。
+func handleCwd(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	wid, ok := queryUint(r, "worker_id")
+	if !ok {
+		http.Error(w, "worker_id required", http.StatusBadRequest)
+		return
+	}
+	sess, err := pooledSession(wid)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer sess.Close()
+	// 该用户最新的 pts shell: ps 列出 pts 终端进程取 pid 最大者 (最后
+	// 启动的就是本次终端会话的 shell), 再 readlink 其 cwd。
+	// readlink 失败 (进程退出竞态) 输出空, 前端忽略。
+	script := "for p in $(ps -eo pid,tty,user,comm --no-headers 2>/dev/null | " +
+		"awk -v u=\"$(id -un)\" '$2 ~ /^pts\\// && $3==u {print $1}' | sort -rn); do " +
+		"if [ -r /proc/$p/cwd ]; then readlink /proc/$p/cwd && exit 0; fi; done"
+	out, err := sess.Output(script)
+	if err != nil && len(out) == 0 {
+		http.Error(w, "cwd lookup failed", http.StatusBadGateway)
+		return
+	}
+	cwd := strings.TrimSpace(string(out))
+	if cwd == "" {
+		http.Error(w, "no shell session", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"cwd": cwd})
+}
+
 // handleLs — ?worker_id=&path= 列目录 (含隐藏文件, ReadDir 默认返回全部)。
 func handleLs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -467,6 +506,38 @@ func handleLs(w http.ResponseWriter, r *http.Request) {
 
 // ---------- Tab 补全 (独立 exec 会话, 不干扰交互 PTY) ----------
 
+// compCache — 补全结果短缓存: 敲键/退格会反复查同一个前缀, 命令位的
+// PTY + bash -lic 一次要几百毫秒 (起 login shell), 缓存后幽灵提示几乎
+// 瞬时。3 秒过期 (新装命令/别名要及时可见), 条数封顶防膨胀。
+var compCache = struct {
+	sync.Mutex
+	m map[string]compCacheEntry
+}{m: map[string]compCacheEntry{}}
+
+type compCacheEntry struct {
+	at    time.Time
+	comps []string
+}
+
+func compCacheGet(key string) ([]string, bool) {
+	compCache.Lock()
+	defer compCache.Unlock()
+	e, ok := compCache.m[key]
+	if !ok || time.Since(e.at) > 3*time.Second {
+		return nil, false
+	}
+	return e.comps, true
+}
+
+func compCachePut(key string, comps []string) {
+	compCache.Lock()
+	defer compCache.Unlock()
+	if len(compCache.m) > 512 {
+		compCache.m = map[string]compCacheEntry{}
+	}
+	compCache.m[key] = compCacheEntry{at: time.Now(), comps: comps}
+}
+
 // handleComplete — ?worker_id=&line=&cursor= 返回补全候选。
 // 用 compgen 在节点上求值; 无凭据/失败时返回空列表
 // (前端静默降级, 不报错弹窗)。
@@ -490,18 +561,12 @@ func handleComplete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	c := getCred(req.WorkerID)
-	if c == nil {
-		writeJSON(w, map[string]interface{}{"completions": []string{}})
+	cacheKey := fmt.Sprintf("%d|%d|%s", req.WorkerID, req.Cursor, req.Line)
+	if cached, ok := compCacheGet(cacheKey); ok {
+		writeJSON(w, map[string]interface{}{"completions": cached})
 		return
 	}
-	cli, err := sshDial(c)
-	if err != nil {
-		writeJSON(w, map[string]interface{}{"completions": []string{}})
-		return
-	}
-	defer cli.Close()
-	sess, err := cli.NewSession()
+	sess, err := pooledSession(req.WorkerID)
 	if err != nil {
 		writeJSON(w, map[string]interface{}{"completions": []string{}})
 		return
@@ -608,6 +673,7 @@ func handleComplete(w http.ResponseWriter, r *http.Request) {
 	if len(comps) > 200 {
 		comps = comps[:200]
 	}
+	compCachePut(cacheKey, comps)
 	writeJSON(w, map[string]interface{}{"completions": comps})
 }
 

@@ -23,14 +23,26 @@
   .main { display: flex; height: calc(100% - 42px); }
   #term { flex: 1; min-width: 0; }
 
-  /* ---------- 文件浏览器侧栏 (可折叠) ---------- */
+  /* ---------- 文件浏览器侧栏 (默认展开, 右缘箭头折叠) ---------- */
   #files {
-    width: 0; overflow: hidden; transition: width .18s ease;
+    width: 300px; overflow: hidden; transition: width .18s ease;
     background: #212121; border-right: 1px solid #333;
-    display: flex; flex-direction: column;
+    display: flex; flex-direction: column; position: relative; flex-shrink: 0;
     font: 12px/1.5 -apple-system, "Segoe UI", "PingFang SC", sans-serif;
   }
-  #files.open { width: 300px; }
+  #files.closed { width: 0; border-right: none; }
+  /* 折叠/展开箭头: 挂在 .main 下, 贴面板右缘 (收起时贴屏幕左缘) 垂直居中 */
+  .main { position: relative; }
+  #files-toggle-btn {
+    position: absolute; left: 301px; top: 50%; transform: translateY(-50%);
+    width: 14px; height: 52px; z-index: 40; cursor: pointer;
+    background: #2a2d2e; border: 1px solid #333; border-left: none;
+    border-radius: 0 6px 6px 0; color: #9aa0a6; font-size: 10px;
+    display: flex; align-items: center; justify-content: center;
+    user-select: none; transition: left .18s ease;
+  }
+  #files-toggle-btn:hover { background: #37393b; color: #4f8cff; }
+  #files-toggle-btn.collapsed { left: 0; border-radius: 0 6px 6px 0; }
   .fbar {
     display: flex; align-items: center; gap: 8px; padding: 8px 10px;
     border-bottom: 1px solid #333; flex-shrink: 0;
@@ -86,22 +98,20 @@
   <span class="dot wait" id="dot"></span>
   <span class="name" id="wname">SSH</span>
   <span class="meta" id="wmeta">连接中…</span>
-  <a class="hint" id="files-toggle" onclick="toggleFiles()">📁 文件</a>
-  <a class="hint" onclick="pickUpload()">⬆ 上传</a>
-  <a class="hint" onclick="promptDownload()">⬇ 下载</a>
   <a class="hint" onclick="location.reload()">重新连接</a>
   <input type="file" id="up-file" style="display:none" onchange="doUpload(this)">
 </div>
 <div id="xfer"><div class="bar2"></div></div>
 <div class="main">
+  <div id="files-toggle-btn" onclick="toggleFiles()" title="收起/展开文件面板">◀</div>
   <div id="files">
     <div class="fbar">
       <a onclick="filesUp()" title="上一级">↑</a>
+      <a onclick="filesUploadHere()" title="上传到当前目录">⬆</a>
       <span class="cur" id="files-path">/</span>
       <a onclick="filesRefresh()" title="刷新">⟳</a>
-      <a onclick="filesUploadHere()" title="上传到当前目录">⬆</a>
     </div>
-    <div class="flist" id="files-list"><div class="floading">点击「📁 文件」打开浏览器</div></div>
+    <div class="flist" id="files-list"><div class="floading">连接后自动读取…</div></div>
   </div>
   <div id="term"></div>
 </div>
@@ -324,7 +334,7 @@
     ghostTimer = setTimeout(function () {
       ghostTimer = null;
       requestGhost();
-    }, 220);
+    }, 80);
   }
   function cancelGhost() {
     if (ghostTimer) { clearTimeout(ghostTimer); ghostTimer = null; }
@@ -347,58 +357,43 @@
     }).catch(function () {});
   }
 
-  // ---------- Tab 列表 (HTML 浮层, 不碰 xterm buffer) ----------
-  // 画进 buffer 的候选块有三宗罪: 空白行残留 (擦除后行还在)、与命令
-  // 输出混排 (过期响应画在滚动输出上)、光标错位 (shell 不知道这些行)。
-  // HTML 浮层完全不进 buffer — 终端区域上方绝对定位, shell 输出/滚动/
-  // 回车互不干扰, 关闭即消失无残留。样式浅灰, 与幽灵文本同一视觉语言。
-  var hintBox = null;        // 浮层 DOM (创建于首次 Tab)
-  var hintShown = false;
+  // ---------- Tab 补全 (Windows 式循环: 按一下补全, 再按切下一个) ----------
+  // 对齐 Windows CMD/PowerShell 的 Tab 循环: 第一次 Tab 把首候选写进
+  // 输入行 (发送差量, shell 回显黑字), 再按 Tab 依次切换下一个候选,
+  // 循环回到开头。写入是真实输入 (会执行), 但每次都是用户按 Tab 主动
+  // 触发的 — 不是抢输入。回车前的任何手动编辑都会退出循环态。
+  var tabList = [];        // 当前循环候选
+  var tabIdx = -1;        // 已写入的候选下标 (-1 = 未开始)
+  var tabTyped = '';      // 循环开始时用户实敲的词 (切候选的替换基准)
 
-  function hideHintBox() {
-    if (hintBox) { hintBox.style.display = 'none'; }
-    hintShown = false;
+  function resetTabCycle() {
+    tabList = []; tabIdx = -1; tabTyped = '';
   }
-  function showHintBox(list) {
-    if (!hintBox) {
-      hintBox = document.createElement('div');
-      hintBox.style.cssText =
-        'position:absolute;z-index:50;display:none;pointer-events:none;' +
-        'background:rgba(30,30,30,.97);border:1px solid #3c3c3c;border-radius:6px;' +
-        'padding:6px 10px;color:rgb(138,138,138);' +
-        'font:12px/1.7 Menlo,Consolas,monospace;max-width:92%;' +
-        'box-shadow:0 6px 24px rgba(0,0,0,.5);white-space:pre-wrap;word-break:break-all';
-      document.querySelector('.main').appendChild(hintBox);
-    }
-    // 浮层内容: 候选空格分隔, 浅灰; 超过 60 项截断提示
-    var shown = Math.min(list.length, 60);
-    var text = list.slice(0, shown).join('  ');
-    if (list.length > shown) text += '  …还有 ' + (list.length - shown) + ' 项 (继续输入缩小范围)';
-    hintBox.textContent = text;
-    hintBox.style.display = 'block';
-    // 定位: 终端区域内左下角 (输入行总在视口底部附近)
-    var mainEl = document.querySelector('.main');
-    var mainRect = mainEl.getBoundingClientRect();
-    var boxRect = hintBox.getBoundingClientRect();
-    var top = mainRect.height - boxRect.height - 10;
-    if (top < 10) top = 10;
-    hintBox.style.left = '10px';
-    hintBox.style.top = top + 'px';
-    hintShown = true;
+  // 把输入行末词替换为 word: 发送退格+差量, 同步 lineBuf
+  function replaceLastWord(word) {
+    var lw = lastWord();
+    var bs = '';
+    for (var i = 0; i < lw.length; i++) bs += '\u007f';
+    wsSend({ type: 'input', data: bs + word });
+    lineBuf = lineBuf.slice(0, lineBuf.length - lw.length) + word;
   }
-  function renderCompletions(list) {
-    eraseGhostNow();
-    showHintBox(list);
+  function applyTabCandidate() {
+    if (tabIdx < 0 || tabIdx >= tabList.length) return;
+    replaceLastWord(tabList[tabIdx]);
   }
   function requestCompletion() {
     if (!connected) return;
     var lw = lastWord();
     if (!lw && !lineBuf.trim()) return;
+    // 循环态: Tab 切下一个候选 (本地切换, 无请求)
+    if (tabIdx >= 0 && tabList.length > 0) {
+      tabIdx = (tabIdx + 1) % tabList.length;
+      applyTabCandidate();
+      return;
+    }
     if (completing) return;
     completing = true;
-    // 失效保护: 记录发起时的行; Tab 的 PTY 补全请求要走一次 SSH 登录
-    // (几百毫秒), 期间用户可能已回车 — 响应回来时行已清空/变了就丢弃,
-    // 否则候选列表会画在正在滚动的命令输出上 (与输出混排)。
+    // 失效保护: 响应回来时行已变就丢弃
     var line = lineBuf;
     fetch('/v2/ssh-gw/complete', {
       method: 'POST', credentials: 'include',
@@ -410,29 +405,75 @@
       if (!list.length) return;
       if (lineBuf !== line) return;               // 行已变 (回车/继续敲字), 响应过期
       var lw2 = lastWord();
-      if (list.length === 1 && list[0] === lw2) return; // 词已完整
-      renderCompletions(list);
+      if (!lw2) return;
+      // 进入循环态: 首候选写入, 记录实敲词
+      tabList = list;
+      tabTyped = lw2;
+      tabIdx = 0;
+      applyTabCandidate();
     }).catch(function () { completing = false; });
   }
 
-  // ================= 文件浏览器 =================
-  var filesOpen = false, filesPath = '/';
+  // ================= 文件浏览器 (默认展开, 跟随终端 cd) =================
+  var filesOpen = true, filesPath = '/';
+  var cwdTimer = null;         // cwd 轮询
+  var userBrowsing = false;    // 用户手动浏览中 (点目录/上一级) — 暂停跟随
+  var userBrowsingUntil = 0;   // 手动浏览保持到该时刻 (10s 后恢复跟随)
+  var lastCwd = '';
+
   window.toggleFiles = function () {
     filesOpen = !filesOpen;
-    $('#files').className = filesOpen ? 'open' : '';
-    if (filesOpen) { if (hasCred) filesLs(filesPath); else filesLs('/'); }
+    var el = $('#files');
+    el.className = filesOpen ? '' : 'closed';
+    var btn = $('#files-toggle-btn');
+    btn.textContent = filesOpen ? '◀' : '▶';
+    btn.className = filesOpen ? '' : 'collapsed';
+    if (filesOpen && hasCred) filesLs(filesPath);
+    // 面板收起后再展开: fit 会重算尺寸
+    setTimeout(function () { if (fit) fit.fit(); }, 220);
   };
-  window.filesRefresh = function () { if (filesOpen) filesLs(filesPath); };
+  window.filesRefresh = function () {
+    userBrowsing = true; userBrowsingUntil = Date.now() + 10000;
+    if (filesOpen) filesLs(filesPath);
+  };
   window.filesUp = function () {
     if (filesPath === '/') return;
+    userBrowsing = true; userBrowsingUntil = Date.now() + 10000;
     var up = filesPath.replace(/\/+$/, '').split('/');
     up.pop();
     filesLs(up.join('/') || '/');
   };
   window.filesUploadHere = function () {
+    if (!filesOpen) return;
     $('#up-file').dataset.dest = filesPath;
     $('#up-file').click();
   };
+  // 目录点击: 浏览模式 10s (期间 cwd 轮询不抢占), 方便层层翻目录
+  window.filesCd = function (p) {
+    userBrowsing = true; userBrowsingUntil = Date.now() + 10000;
+    filesLs(p);
+  };
+  // 跟随终端 shell 的当前目录: 敲回车后 1s 查一次 + 3s 周期兜底。
+  // 查询走网关 /cwd (readlink 最新 pts shell 的 /proc/<pid>/cwd),
+  // cd / 脚本内部 cd 都能跟上; 404 (无 shell) 忽略。
+  function syncCwd() {
+    if (!connected || !workerId) return;
+    fetch('/v2/ssh-gw/cwd?worker_id=' + workerId, { credentials: 'include' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (!j || !j.cwd) return;
+        if (j.cwd === lastCwd || j.cwd === filesPath) { lastCwd = j.cwd; return; }
+        lastCwd = j.cwd;
+        // 用户手动浏览窗口内不抢占; 但目录相同时无妨
+        if (userBrowsing && Date.now() < userBrowsingUntil) return;
+        userBrowsing = false;
+        if (filesOpen) filesLs(j.cwd);
+      }).catch(function () {});
+  }
+  function startCwdSync() {
+    if (cwdTimer) clearInterval(cwdTimer);
+    cwdTimer = setInterval(syncCwd, 1500);
+  }
   function filesLs(p) {
     filesPath = p;
     $('#files-path').textContent = p;
@@ -462,7 +503,7 @@
         return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
       });
       if (it.is_dir) {
-        return '<div class="item dir" onclick="filesLs(\'' + jsq(full) + '\')">'
+        return '<div class="item dir" onclick="filesCd(\'' + jsq(full) + '\')">'
           + '<span class="ico">📁</span><span class="name">' + esc + '</span>'
           + '<span class="meta">' + it.mod_time + '</span></div>';
       }
@@ -508,11 +549,6 @@
     box.style.display = 'block';
     box.querySelector('.bar2').style.width = Math.min(100, pct) + '%';
   }
-  window.pickUpload = function () {
-    if (!workerId) return;
-    delete $('#up-file').dataset.dest;
-    $('#up-file').click();
-  };
   window.doUpload = function (inp) {
     var f = inp.files && inp.files[0];
     var dest = inp.dataset.dest;
@@ -558,12 +594,7 @@
     xhr.send(fd);
   };
 
-  window.promptDownload = function () {
-    if (!workerId) return;
-    var p = prompt('要下载的远程文件绝对路径:', '');
-    if (!p) return;
-    window.dlFile(p);
-  };
+
 
   // ================= 终端 =================
   term = new Terminal({
@@ -615,6 +646,7 @@
         connected = true;
         hasCred = true;
         if (filesOpen) filesLs(filesPath);
+        startCwdSync();
         ping = setInterval(function () { wsSend({ type: 'ping' }); }, 15000);
       };
       ws.onmessage = function (ev) {
@@ -638,10 +670,10 @@
         } else {
           term.write(frame);
         }
-        if (hintShown) hideHintBox();
       };
       ws.onclose = function () {
         if (ping) clearInterval(ping);
+        if (cwdTimer) { clearInterval(cwdTimer); cwdTimer = null; }
         connected = false;
         hasCred = false;
         if ($('#cred-mask').classList.contains('show')) return;
@@ -654,14 +686,16 @@
         if (ws.readyState !== 1) return;
         // 行缓冲维护 (补全用): 可打印字符追加; 回车/ctrl-c 清空; 退格回退
         if (data === '\r') {
-          // 回车执行: 撤幽灵/列表, shell 输出从干净行开始
+          // 回车执行: 撤幽灵, 退出 Tab 循环态
           cancelGhost();
+          resetTabCycle();
           term.write('', function () { eraseGhostNow(); });
-          if (hintShown) hideHintBox();
           lineBuf = '';
+          setTimeout(syncCwd, 400);
         }
         else if (data === '\u007f') {
           lineBuf = lineBuf.slice(0, -1);
+          resetTabCycle();   // 手动退格: 退出 Tab 循环
           // 退格: 先擦幽灵 (擦完正好把回显的 ^H 后残留盖掉), 再排新幽灵
           term.write('', function () {
             eraseGhostNow();
@@ -671,13 +705,14 @@
         }
         else if (data === '\u0003') { lineBuf = ''; cancelGhost(); }
         else if (data === '\t') {
-          // Tab: 纯提示 — 浅色列出候选, 输入行不动, 永不自动补全
+          // Tab: Windows 式循环补全 — 首按写入首候选, 再按切下一个
           cancelGhost();
           requestCompletion();
           return;
         }
         else if (data >= ' ') {
           lineBuf += data;
+          resetTabCycle();  // 手动输入: 退出 Tab 循环 (Tab 写入的字符已在 lineBuf)
           lastInputAt = Date.now();
           scheduleGhost();   // 敲完即排幽灵 (等回显落地后画)
         }
