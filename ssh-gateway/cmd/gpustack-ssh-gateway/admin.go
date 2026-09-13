@@ -524,9 +524,11 @@ func handleComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	isFirst := len(words) <= 1
 	var out []byte
+	aliasSet := map[string]bool{} // 命令位: 别名集合 (排序时别名组优先)
 	if isFirst {
 		// 命令位: PTY + 交互 login shell (别名在这里才存在)。
 		// ECHO=0 + ICANON 保留: 无回显、行缓冲可用, 输出即 compgen 结果。
+		// 双通道输出间插哨兵, 别名通道可单独识别。
 		modes := ssh.TerminalModes{
 			ssh.ECHO:          0,
 			ssh.TTY_OP_ISPEED: 14400,
@@ -537,8 +539,11 @@ func handleComplete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		esc := strings.ReplaceAll(lastWord, "'", "'\\''")
-		script := "compgen -A command -- '" + esc + "' 2>/dev/null; " +
-			"compgen -A alias -- '" + esc + "' 2>/dev/null; echo __X9__"
+		// 别名通道在前: 交互 shell 里 compgen -A command 本身就包含别名
+		// (bash command 补全覆盖 alias/function/builtin/command), 若命令
+		// 通道在前, 同名别名会被去重挡住、aliasSet 登记不上。
+		script := "compgen -A alias -- '" + esc + "' 2>/dev/null; echo __C9__; " +
+			"compgen -A command -- '" + esc + "' 2>/dev/null; echo __X9__"
 		out, err = sess.Output("bash -lic " + shQuote(script))
 	} else {
 		// 文件位: 普通 exec (别名无关), 目录尾部加 '/'
@@ -555,14 +560,50 @@ func handleComplete(w http.ResponseWriter, r *http.Request) {
 	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
 	comps := make([]string, 0, len(lines))
 	seen := map[string]bool{}
+	// 别名通道在前 (见上方 script 拼接), __C9__ 之前是别名、之后是命令
+	inAliasCh := true
 	for _, l := range lines {
 		// 注意: 不能 TrimRight("/") — 文件位目录的 '/' 尾巴是目录标记,
 		// 前端原样显示; 命令位候选本来就不带 '/'
+		if l == "__C9__" {
+			inAliasCh = false
+			continue
+		}
 		if l == "" || l == "__X9__" || seen[l] {
 			continue
 		}
 		seen[l] = true
+		if inAliasCh {
+			aliasSet[l] = true
+		}
 		comps = append(comps, l)
+	}
+	// 命令位排序: 别名优先 (用户自定义快捷方式, 如 ll — 最高频意图),
+	// 别名组内常规词形优先于生僻词形 (l. 之类), 组内最短优先再字典序。
+	// bash 的 alias 输出是 hash 顺序不可依赖, 全部重排, 顺序可复现。
+	if isFirst {
+		wordLike := func(s string) bool {
+			for _, r := range s {
+				if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
+					return false
+				}
+			}
+			return len(s) > 0
+		}
+		sort.SliceStable(comps, func(i, j int) bool {
+			ai, aj := aliasSet[comps[i]], aliasSet[comps[j]]
+			if ai != aj {
+				return ai
+			}
+			wi, wj := wordLike(comps[i]), wordLike(comps[j])
+			if wi != wj {
+				return wi
+			}
+			if wi && len(comps[i]) != len(comps[j]) {
+				return len(comps[i]) < len(comps[j])
+			}
+			return comps[i] < comps[j]
+		})
 	}
 	if len(comps) > 200 {
 		comps = comps[:200]

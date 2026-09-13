@@ -225,21 +225,29 @@
     if (e.key === 'Enter') submitCredentials();
   });
 
-  // ================= Tab 补全 (纯提示, 永不自动写入) =================
-  // 行为: Tab 只做一件事 — 以浅色在终端里列出候选, 输入行原样不动。
-  // 不选区、不循环、不回填: 用户看提示后自己敲 (或再敲字符缩小范围后
-  // 再按 Tab 刷新候选)。对齐 bash 的「列表补全」但去掉一切自动写入,
-  // 避免抢用户输入。
-  //
-  // 光标还原: 提示块写进终端后 xterm 光标停在提示块尾, 而 shell 侧的
-  // 输入行还停在原处 — 之后 shell 回显/方向键编辑都会错位。写提示前
-  // 记下光标绝对位置, 写完后用 CUU/CUF 把它还原回原输入行, 让 shell
-  // 的回显接着原行写 (与 bash 列完候选后重绘输入行同效)。
+  // ================= 输入提示 (纯提示, 永不自动写入) =================
+  // 两层提示, 都不写入输入行:
+  //   1. 幽灵文本 (ghost text): 敲字符后自动把首个候选的剩余部分以
+  //      亮灰显示在光标处 (敲 l → 后面跟灰色的 l, 合成 ll 预览),
+  //      光标仍停在已敲内容末尾 — 回车只执行用户实际敲的字符。
+  //      无需按 Tab, 敲完即出。
+  //   2. Tab 列表: 按 Tab 在输入行下方浅色列出全部候选。
+  // 关键机制:
+  //   - xterm 的 write 异步解析 — 一切坐标读取都在 term.write('', cb)
+  //     同步点里做 (回调触发时先前写入已全部解析)。
+  //   - shell 回显帧到达时, 先在同步点里擦掉旧幽灵再写帧 (write 队列
+  //     FIFO 保序), 回显永远不会与幽灵残影叠字。
+  //   - 幽灵等回显落地 (lastInputAt <= lastOutputAt) 才画, 否则回显会
+  //     盖掉幽灵开头留残影; 等不到 (2s) 放弃。
+  //   - registerMarker 标记幽灵所在行, buffer 滚动/裁剪后行号依然正确;
+  //     marker.isDisposed 是布尔属性 (xterm 5), 不是方法。
   var lineBuf = '';
-  var completing = false;
-  var hintShown = false;     // 当前输入行下方有提示块
-  var hintRows = 0;          // 提示块占的行数 (多清一行空白行无害, 宁多勿少)
-  var hintMarker = null;     // 输入行 marker (随 buffer 滚动/裁剪自动跟踪行号)
+  var completing = false;      // Tab 列表请求中
+  var ghost = null;            // {col, w} 已画的幽灵
+  var ghostMarker = null;      // 幽灵所在行 marker
+  var ghostTimer = null;       // 敲键后补全请求防抖
+  var lastInputAt = 0;         // 最近转发按键时间 (等回显)
+  var lastOutputAt = 0;        // 最近收到 shell 输出时间
 
   function lastWord() {
     var m = lineBuf.match(/(\S*)$/);
@@ -257,6 +265,93 @@
     }
     return w;
   }
+  // 擦掉已画的幽灵 (须在 write 同步点里调用, 或接受坐标过期): 用空格
+  // 覆盖幽灵区域, 光标还原到调用时的位置。行已滚出 scrollback 时跳过
+  // (幽灵早已不可见)。
+  function eraseGhostNow() {
+    if (!ghost) { return; }
+    var g = ghost; ghost = null;
+    var row = -1;
+    if (ghostMarker) {
+      row = ghostMarker.isDisposed ? -1 : ghostMarker.line;
+      ghostMarker.dispose(); ghostMarker = null;
+    }
+    if (row < 0) return;
+    var b = term.buffer.active;
+    var curRow = b.cursorY + b.baseY, curCol = b.cursorX;
+    var s = '';
+    var up = curRow - row;
+    if (up > 0) s += '\x1b[' + up + 'A';
+    else if (up < 0) s += '\x1b[' + (-up) + 'B';
+    s += '\r';
+    if (g.col > 0) s += '\x1b[' + g.col + 'C';
+    for (var i = 0; i < g.w; i++) s += ' ';
+    s += '\r';
+    if (curCol > 0) s += '\x1b[' + curCol + 'C';
+    if (up > 0) s += '\x1b[' + up + 'B';
+    else if (up < 0) s += '\x1b[' + (-up) + 'A';
+    term.write(s);
+  }
+  // 画幽灵: 等回显落地 → 同步点里擦旧幽灵 → 光标处写灰字 → 光标拉回
+  // 已敲内容末尾。forLine 是发起时的行快照, 行变了 (继续敲字) 就作废。
+  function paintGhost(text, forLine) {
+    var tries = 0;
+    (function wait() {
+      if (!connected || lineBuf !== forLine) return;
+      if (lastInputAt > lastOutputAt) {
+        if (++tries > 50) return;   // ~2s 回显未到, 放弃
+        setTimeout(wait, 40);
+        return;
+      }
+      term.write('', function () {
+        if (!connected || lineBuf !== forLine) return;
+        var b = term.buffer.active;
+        var col = b.cursorX;
+        var w = termWidth(text);
+        if (w === 0) return;
+        if (col + w >= term.cols) { eraseGhostNow(); return; }  // 会折行, 不画
+        eraseGhostNow();
+        if (ghostMarker) { ghostMarker.dispose(); ghostMarker = null; }
+        ghostMarker = term.registerMarker(0);
+        term.write('\x1b[90m' + text + '\x1b[0m\x1b[' + w + 'D');
+        ghost = { col: col, w: w };
+      });
+    })();
+  }
+  // 敲键后防抖请求补全, 首个候选的剩余部分做幽灵
+  function scheduleGhost() {
+    if (ghostTimer) clearTimeout(ghostTimer);
+    ghostTimer = setTimeout(function () {
+      ghostTimer = null;
+      requestGhost();
+    }, 220);
+  }
+  function cancelGhost() {
+    if (ghostTimer) { clearTimeout(ghostTimer); ghostTimer = null; }
+  }
+  function requestGhost() {
+    if (!connected) return;
+    var line = lineBuf, lw = lastWord();
+    if (!lw) return;
+    fetch('/v2/ssh-gw/complete', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ worker_id: workerId, line: line, cursor: line.length })
+    }).then(function (r) { return r.json(); }).then(function (j) {
+      if (lineBuf !== line) return;              // 行已变, 响应过期
+      var list = j.completions || [];
+      if (!list.length) return;
+      var cand = list[0];
+      if (cand === lw || cand.indexOf(lw) !== 0) return;
+      paintGhost(cand.slice(lw.length), line);
+    }).catch(function () {});
+  }
+
+  // ---------- Tab 列表 (按 Tab 列出全部候选, 依旧不写入) ----------
+  var hintShown = false;     // 当前输入行下方有提示块
+  var hintRows = 0;          // 提示块占的行数 (多清一行空白行无害, 宁多勿少)
+  var hintMarker = null;     // 输入行 marker (随 buffer 滚动/裁剪自动跟踪行号)
+
   // 光标从当前位置移动到 (absRow, col) (buffer 绝对坐标)
   function moveCursor(absRow, col) {
     var b = term.buffer.active;
@@ -269,11 +364,10 @@
     else if (right < 0) s += '\x1b[' + (-right) + 'D';
     term.write(s);
   }
-  // 清除提示块: 用 marker 定位输入行 (滚动/裁剪后行号依然正确),
+  // 清除 Tab 列表提示块: 用 marker 定位输入行 (滚动/裁剪后行号依然正确),
   // 光标移到块首逐行清空, 再还原到调用时的光标位置。
   // marker 被裁剪 (输入行已滚出 scrollback) 时放弃清除 — 此时提示
   // 早已不可见, 清了也没意义。
-  // NOTE: isDisposed 是 boolean 属性 (非方法), xterm 5 如此。
   function clearHintBlock() {
     if (!hintShown) return;
     hintShown = false;
@@ -290,14 +384,13 @@
     term.write(s);
     moveCursor(curRow, curCol);
   }
-  // 渲染候选提示: 亮灰 (bright black) 流式排列, 像原生 bash 的候选列表;
-  // 超出 60 项截断并给出缩小范围提示。写完把光标还原回原输入行。
+  // 渲染 Tab 候选列表: 亮灰流式排列, 超出 60 项截断提示缩小范围。
+  // 写完把光标还原回原输入行。
   function renderCompletions(list) {
-    if (hintShown) { clearHintBlock(); }
-    // xterm 的 write 是异步解析的 — 回显/清块序列可能还没落地。
-    // 用空 write 的回调做同步点: 回调触发时先前写入全部解析完,
-    // 此时读 cursorX / 注册 marker 才准确。
+    // 同步点: 先等此前写入 (回显/幽灵擦除) 解析完, 坐标才准
     term.write('', function () {
+      if (hintShown) { clearHintBlock(); }
+      eraseGhostNow();
       var b = term.buffer.active;
       var saveCol = b.cursorX;
       if (hintMarker) { hintMarker.dispose(); hintMarker = null; }
@@ -312,8 +405,6 @@
       // 提示块行数 = 起始换行 1 + 候选文本按宽度折行数 (宁多清一行)
       hintRows = 1 + Math.max(1, Math.ceil(termWidth(body) / Math.max(1, term.cols)));
       hintShown = true;
-      // \r\n 起始: 提示块从新行开始; 文本按终端宽度自动折行。
-      // 写完在回调里用 marker 还原光标 (滚动后 marker.line 依然正确)。
       term.write('\r\n' + body + '\r\n', function () {
         if (hintMarker && !hintMarker.isDisposed) {
           moveCursor(hintMarker.line, saveCol);
@@ -552,10 +643,19 @@
           } catch (e) {}
           return;
         }
-        term.write(new Uint8Array(ev.data));
-        // shell 的新输出 (命令结果) 到达: 提示块已无意义且会与输出混排,
-        // 清掉。clearHintBlock 自己会判断有没有提示块。
-        clearHintBlock();
+        var frame = new Uint8Array(ev.data);
+        lastOutputAt = Date.now();
+        // shell 输出帧到达: 先擦旧幽灵再写帧 — write 队列 FIFO 保序,
+        // 帧永远不会画在幽灵残影上。Tab 列表块同样清掉。
+        if (ghost || hintShown) {
+          term.write('', function () {
+            eraseGhostNow();
+            clearHintBlock();
+            term.write(frame);
+          });
+        } else {
+          term.write(frame);
+        }
       };
       ws.onclose = function () {
         if (ping) clearInterval(ping);
@@ -571,18 +671,39 @@
         if (ws.readyState !== 1) return;
         // 行缓冲维护 (补全用): 可打印字符追加; 回车/ctrl-c 清空; 退格回退
         if (data === '\r') {
-          // 回车执行: 先清提示块, 让 shell 输出从干净行开始
-          clearHintBlock();
+          // 回车执行: 撤幽灵/列表, shell 输出从干净行开始
+          cancelGhost();
+          term.write('', function () { eraseGhostNow(); clearHintBlock(); });
           lineBuf = '';
         }
-        else if (data === '\u007f') { lineBuf = lineBuf.slice(0, -1); }
-        else if (data === '\u0003') { lineBuf = ''; }
+        else if (data === '\u007f') {
+          lineBuf = lineBuf.slice(0, -1);
+          // 退格: 先擦幽灵 (擦完正好把回显的 ^H 后残留盖掉), 再排新幽灵
+          term.write('', function () {
+            eraseGhostNow();
+            scheduleGhost();
+          });
+          lastInputAt = Date.now();
+        }
+        else if (data === '\u0003') { lineBuf = ''; cancelGhost(); }
         else if (data === '\t') {
           // Tab: 纯提示 — 浅色列出候选, 输入行不动, 永不自动补全
+          cancelGhost();
           requestCompletion();
           return;
         }
-        else if (data >= ' ') { lineBuf += data; }
+        else if (data >= ' ') {
+          lineBuf += data;
+          lastInputAt = Date.now();
+          scheduleGhost();   // 敲完即排幽灵 (等回显落地后画)
+        }
+        else {
+          // 其它控制序列 (方向键/Ctrl-U/Ctrl-W/ESC…): 行内容失真,
+          // 重置行缓冲并撤幽灵, 下次纯字符输入再恢复
+          lineBuf = '';
+          cancelGhost();
+          term.write('', function () { eraseGhostNow(); });
+        }
         wsSend({ type: 'input', data: data });
       });
       term.onResize(function (cols, rows) {
