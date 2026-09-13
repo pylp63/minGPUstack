@@ -99,6 +99,16 @@ RUN cd / && PKG_UI="$(/opt/venv/bin/python -c 'import gpustack,os;print(os.path.
 RUN VIRTUAL_ENV=/opt/venv GPUSTACK_TOOLS_DOWNLOAD_BASE_URL="https://gpustack-1303613262.cos.ap-guangzhou.myqcloud.com" \
     /opt/venv/bin/gpustack download-tools || true
 
+# ---- 构建阶段: Go SSH 网关 (xterm 交互终端 + 定期随机密码轮换) ----
+# 静态编译 (CGO=0), 单二进制; GOPROXY 国内源; xterm 静态资源已随
+# gpustack/gpustack/ui_console/ 进包 (页面走 /console/*), 这里只需二进制。
+FROM ${BASE_REGISTRY}/golang:1.26 AS gobuilder
+ENV GOPROXY=https://goproxy.cn,direct CGO_ENABLED=0
+WORKDIR /src
+COPY ssh-gateway/go.mod ssh-gateway/go.sum ./
+COPY ssh-gateway/cmd ./cmd
+RUN go build -trimpath -ldflags="-s -w" -o /out/gpustack-ssh-gateway ./cmd/gpustack-ssh-gateway
+
 # ---- 运行阶段 ----
 FROM base AS runtime
 
@@ -113,6 +123,8 @@ ENV PATH="/opt/venv/bin:$PATH" \
 
 # 从构建阶段带走 venv 与 gpustack 包 (含修补后的 UI 和工具)
 COPY --from=builder /opt/venv /opt/venv
+# Go SSH 网关 (节点页「SSH」交互终端)
+COPY --from=gobuilder /out/gpustack-ssh-gateway /usr/local/bin/gpustack-ssh-gateway
 
 # 启动脚本: 初始化并拉起内置 PostgreSQL, 再启动 gpustack
 COPY deploy/entrypoint-slim.sh /usr/local/bin/entrypoint-slim.sh

@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>SSH - GPUStack</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #1e1e1e; }
+  #term { width: 100%; height: 100%; }
+  #status {
+    position: fixed; top: 10px; right: 12px; z-index: 10;
+    font: 12px/1.6 -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+    color: #9aa0a6; background: rgba(30,30,30,.85); border: 1px solid #333;
+    border-radius: 6px; padding: 4px 10px; display: none;
+  }
+  #status.err { color: #ff7875; border-color: #5b2526; }
+</style>
+</head>
+<body>
+<div id="status"></div>
+<div id="term"></div>
+<script src="/console/xterm.js"></script>
+<script src="/console/xterm-addon-fit.js"></script>
+<link rel="stylesheet" href="/console/xterm.css">
+<script>
+(function () {
+  var qs = new URLSearchParams(location.search);
+  var workerId = qs.get('id');
+  var statusEl = document.getElementById('status');
+  function setStatus(msg, isErr) {
+    statusEl.style.display = 'block';
+    statusEl.textContent = msg;
+    statusEl.className = isErr ? 'err' : '';
+  }
+
+  var term = new Terminal({
+    cursorBlink: true,
+    fontSize: 13,
+    fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+    theme: { background: '#1e1e1e' },
+    scrollback: 5000
+  });
+  var fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('term'));
+  fit.fit();
+  term.write('\x1b[32m正在连接节点 ' + workerId + ' ...\x1b[0m\r\n');
+
+  // 1) 取一次性 ticket
+  fetch('/api/ssh/ticket', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ worker_id: parseInt(workerId, 10) })
+  }).then(function (r) {
+    if (!r.ok) throw new Error('ticket ' + r.status);
+    return r.json();
+  }).then(function (d) {
+    // 2) WebSocket (同源, cookie/ticket 双保险)
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var ws = new WebSocket(proto + '//' + location.host + '/ws/ssh?ticket=' + encodeURIComponent(d.ticket));
+    var pingTimer = null;
+
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = function () {
+      term.reset();
+      pingTimer = setInterval(function () {
+        if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping' }));
+      }, 15000);
+    };
+    ws.onmessage = function (ev) {
+      if (typeof ev.data === 'string') {
+        try {
+          var m = JSON.parse(ev.data);
+          if (m.type === 'pong') return;
+        } catch (e) { /* 非 JSON 忽略 */ }
+        return;
+      }
+      term.write(new Uint8Array(ev.data));
+    };
+    ws.onclose = function () {
+      if (pingTimer) clearInterval(pingTimer);
+      setStatus('连接已断开', true);
+      term.write('\r\n\x1b[31m[连接已断开]\x1b[0m\r\n');
+    };
+    ws.onerror = function () { setStatus('连接错误', true); };
+
+    term.onData(function (data) {
+      if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'input', data: data }));
+    });
+    term.onResize(function (cols, rows) {
+      if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', cols: cols, rows: rows }));
+    });
+
+    window.addEventListener('resize', function () { fit.fit(); });
+  }).catch(function (e) {
+    setStatus('无法建立连接: ' + e.message, true);
+    term.write('\r\n\x1b[31m[无法建立连接: ' + e.message + ']\x1b[0m\r\n');
+  });
+})();
+</script>
+</body>
+</html>

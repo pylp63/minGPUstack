@@ -53,6 +53,9 @@ orig = t
 
 # ============================================================
 # 1. SSH 终端: 操作下拉项注入 (插在 view_ssh 项之前)
+# label 必须是静态字符串 — antd Menu item 的 label 若传函数,
+# 菜单直接把函数 toString 渲染出来 (显示成乱码文本, 实测)。
+# key 用 __ssh_term__:<id> 编码行 id, 由外层 Dropdown onClick 拦截。
 DROPDOWN_ANCHOR = '{label:"resources.worker.ssh.view",key:"view_ssh"'
 idx = t.find(DROPDOWN_ANCHOR)
 if idx == -1:
@@ -60,64 +63,30 @@ if idx == -1:
     sys.exit(1)
 
 SSH_ITEM = (
-    '{label:"SSH 终端",key:"ssh_terminal",'
-    'icon:(0,ae.jsx)(Y.Z,{type:"icon-ssh-outlined"}),'
-    'onClick:function(){'
-    'window.open("/console/ssh_terminal.html?id="+this.row.id,"_blank")}'
-    '},'
-)
-# this.row 不可用 (items 数组无 row 上下文) — dropdown onClick 用 record 参数。
-# 检查 J.Z (dropdown) items 渲染是否传 record... antd Dropdown onClick(item) 只有 key。
-# 改用闭包: 在 filter 处捕获 record n -> 需要在 items 构造处。保守方案:
-# 点击后从 key 解析 id (key 编码为 ssh_terminal:<id>)。
-SSH_ITEM = (
-    '{label:function(r){return "SSH 终端"},key:"__ssh_term__",'
+    '{label:"SSH",key:"__ssh_term__",'
     'icon:(0,ae.jsx)(Y.Z,{type:"icon-ssh-outlined"})}'
     ','
 )
-# 上面的 function label 需要 intl… 简化: 直接静态 label (中文界面)。
-# key 用 __ssh_term__ 前缀 + id, 在 dropdown 的 onClick (J.Z 外层有 onClick?) 处理。
-# 查看外层: J.Z({items:...,onClick:?}) — 需要确认。若外层 onClick 存在则拦截 key。
+# label 静态 "SSH" (label 函数会被 antd toString 渲染成乱码文本 — 实测)。
 t = t[:idx] + SSH_ITEM + t[idx:]
 print("SSH dropdown item injected")
 
 # ============================================================
-# 2. 拦截 key 执行打开终端: 找 J.Z({items:...( 处的 onClick。
-# 若没有 onClick, 注入一个。dropdown 组件形如 (0,ae.jsx)(J.Z,{items:(...),onClick:fn})
-# 先探测:
-if 'key:"__ssh_term__"' in t:
-    # 找 items 数组的闭合后的 onClick — 直接在 J.Z,{items: 后面查找 "onClick"
-    jz = t.find('(0,ae.jsx)(J.Z,{items:')
-    seg = t[jz:jz + 400]
-    if 'onClick' not in seg.split('})')[0]:
-        # 没有 onClick: 在 J.Z,{items: 后面插 onClick 处理 (拦截 __ssh_term__ key)
-        ONCLICK = (
-            'onClick:function(info){'
-            'if(String(info.key||"").indexOf("__ssh_term__")===0){'
-            'var wid=String(info.key).split(":")[1];'
-            'window.open("/console/ssh_terminal.html?id="+wid,"_blank")}},'
-        )
-        # items: 前插 onClick? antd Dropdown props 顺序无关。插在 J.Z,{ 后:
-        t = t[:jz + len('(0,ae.jsx)(J.Z,{')] + ONCLICK + t[jz + len('(0,ae.jsx)(J.Z,{'):]
-        print("dropdown onClick handler injected")
-    else:
-        print("(dropdown already has onClick — 检查 key 格式兼容)")
-
-# key 里编码 id: SSH_ITEM 的 key 改为动态。但 items 是静态数组 (无 record)…
-# 检查 items 构造上下文: filter(function(e){...t=n...}) — n 是 record (闭包)!
-# 所以可以在 SSH_ITEM 里用闭包变量。上面探测到的 filter: (t=n,oe.filter(...))
-# t 就是当前行 record! 在 SSH_ITEM 内引用不了 (数组在外面)。
-# 正解: label 用静态文案, key 固定 "__ssh_term__", onClick 从 label 拿不到 id;
-# 但 dropdown onClick 的 info 里有 item.props… 复杂。
-# 最稳: 利用已有闭包 — 把 SSH_ITEM 的 key 写成运行时拼接: key:"__ssh_term__:"+t.id
-# (t 是 filter 闭包里的 record, 同一作用域!)
-
-# 替换静态 key 为闭包 key:
-t = t.replace(
-    'key:"__ssh_term__"',
-    'key:"__ssh_term__:"+(t?t.id:"")',
+# 2. SSH 菜单点击 -> 新标签页终端。SplitButton (81034) 的菜单点击走
+#    onSelect(key, item); workers 页 onSelect 闭包捕获 render 的 record n,
+#    handleSelect (xe) 的 (e,n) — e=key, n=record (与 view_ssh 分支同构)。
+#    在 xe 的 key 分支链里注入 __ssh_term__ 分支, n.id 即行 id。
+XE_ANCHOR = '"stop_maintenance"===e&&N(n)'
+xi = t.find(XE_ANCHOR)
+if xi == -1:
+    print("!! handleSelect anchor not found")
+    sys.exit(1)
+# 在 xe 函数体的分支链里加: __ssh_term__ -> window.open
+XE_PATCH = (
+    ',"__ssh_term__"===e&&window.open("/console/ssh_terminal.html?id="+(n?n.id:""),"_blank")'
 )
-print("SSH item key bound to row id")
+t = t[:xi + len(XE_ANCHOR)] + XE_PATCH + t[xi + len(XE_ANCHOR):]
+print("SSH open-terminal branch injected into handleSelect")
 
 # ============================================================
 # 3. CPU/GPU 区分: 名称列 render 的 name-text span 后加类型徽标

@@ -65,5 +65,18 @@ gosu postgres psql -h 127.0.0.1 -p "$PG_PORT" -tc "SELECT 1 FROM pg_database WHE
 # gpustack 连接串指向内置 PG (仅当外部连接串未配置时)
 export GPUSTACK_DATABASE_URL="${GPUSTACK_DATABASE_URL:-postgresql://postgres@127.0.0.1:$PG_PORT/$PG_DB?sslmode=disable}"
 
+# 二开: SSH 网关 (节点页「SSH」交互终端; Go 静态二进制, 监听 127.0.0.1:10170)
+# 环境变量 (可选):
+#   SSHGW_ROTATE_PASSWORDS=true   开启定期随机密码轮换 (默认关)
+#   SSHGW_ROTATE_EVERY=24h        轮换周期
+#   SSHGW_BOOTSTRAP_PASSWORD=x    首次接入节点的引导密码 (轮换后作废)
+#   SSHGW_SSH_USER / SSHGW_SSH_PORT / SSHGW_SSH_HOST_KEY
+if [ -x /usr/local/bin/gpustack-ssh-gateway ]; then
+    mkdir -p "$DATA_DIR"
+    SSHGW_STATE_FILE="${SSHGW_STATE_FILE:-$DATA_DIR/ssh-gateway-state.json}" \
+      nohup /usr/local/bin/gpustack-ssh-gateway >> "$DATA_DIR/ssh-gateway.log" 2>&1 &
+    echo "[entrypoint] ssh-gateway started (pid $!)"
+fi
+
 echo "[entrypoint] postgres ready, starting: $*"
 exec "$@"

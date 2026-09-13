@@ -36,6 +36,7 @@ from gpustack.routes import (
     openai,
     workers,
     usage,
+    usage_resources,
     cloud_credentials,
     worker_pools,
     clusters,
@@ -72,6 +73,7 @@ from gpustack.api.auth import (
 from gpustack.api.tenant import require_org_role
 from gpustack.schemas.principals import OrgRole
 from gpustack.websocket_proxy.message_server import router as message_server_router
+from gpustack.routes.ssh_gateway import router as ssh_gateway_router
 from gpustack.routes.gateway_metrics import router as gateway_metrics_router
 
 from gpustack_higress_plugins.server import router as higress_plugins_router
@@ -116,6 +118,11 @@ v1_base_router.include_router(users.me_router, prefix="/users", tags=["Users"])
 v1_base_router.include_router(users.directory_router, tags=["Users"])
 v1_base_router.include_router(api_keys.router, prefix="/api-keys", tags=["API Keys"])
 v1_base_router.include_router(usage.router, prefix="/usage", tags=["Usage"])
+# 二开补充: 官方新版 UI 使用量页的资源计量端点 (summary/resource-*/storage),
+# 消除前端 404。详见 usage_resources.py 模块头注释。
+v1_base_router.include_router(
+    usage_resources.router, prefix="/usage", tags=["Usage"]
+)
 v1_base_router.include_router(
     me_orgs.router,
     prefix="/users/me",
@@ -522,4 +529,13 @@ api_router.include_router(
     message_server_router,
     tags=["WebSocket Proxy"],
     include_in_schema=True,
+)
+# SSH 网关反代 (二开): /v2/ssh-gw/ticket/{id} + /v2/ssh-gw/ws
+# 挂 api_router (v2 前缀) 但不带 get_current_user 依赖 —
+# ticket 路由自带 SessionDep/TenantContextDep 校验, WS 走一次性 ticket。
+api_router.include_router(
+    ssh_gateway_router,
+    prefix=f"{versioned_prefix}/ssh-gw",
+    tags=["SSH Gateway"],
+    include_in_schema=False,
 )

@@ -3,125 +3,120 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SSH 终端</title>
+<title>SSH - GPUStack</title>
+<link rel="stylesheet" href="/console/xterm.css">
 <style>
-  :root {
-    --fg: #e6e6e6; --muted: #9aa0a6; --accent: #4f8cff; --border: #333;
-    --bg: #1e1e1e; --card: #252526;
+  html, body { margin: 0; padding: 0; height: 100%; background: #1e1e1e; }
+  #term { width: 100%; height: calc(100% - 42px); }
+  .bar {
+    height: 42px; display: flex; align-items: center; gap: 10px;
+    padding: 0 14px; background: #252526; border-bottom: 1px solid #333;
+    font: 12px/1.4 -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+    color: #9aa0a6; box-sizing: border-box;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: "SF Mono", Consolas, "Courier New", monospace; background: var(--bg); color: var(--fg); font-size: 13px; }
-  .header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: var(--card); border-bottom: 1px solid var(--border); }
-  .header .dot { width: 10px; height: 10px; border-radius: 50%; background: #4caf50; }
-  .header .dot.err { background: #f44336; }
-  .header h1 { font-size: 14px; font-weight: 500; }
-  .header .meta { color: var(--muted); font-size: 12px; }
-  #screen { padding: 12px 16px; height: calc(100vh - 108px); overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
-  #screen .cmd { color: var(--accent); }
-  #screen .err { color: #ff6b6b; }
-  #screen .sys { color: var(--muted); }
-  .input-row { display: flex; gap: 8px; padding: 10px 16px; background: var(--card); border-top: 1px solid var(--border); }
-  .input-row .prompt { color: #4caf50; user-select: none; }
-  #cmd { flex: 1; background: transparent; border: none; outline: none; color: var(--fg); font: inherit; caret-color: var(--accent); }
-  #run { background: var(--accent); color: #fff; border: none; border-radius: 4px; padding: 4px 14px; cursor: pointer; font: inherit; }
-  #run:disabled { opacity: .5; cursor: not-allowed; }
+  .bar .name { color: #e6e6e6; font-weight: 500; font-size: 13px; }
+  .bar .meta { flex: 1; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #4caf50; }
+  .dot.err { background: #f44336; }
+  .dot.wait { background: #ff9800; }
+  a.hint { color: #4f8cff; text-decoration: none; }
 </style>
 </head>
 <body>
-  <div class="header">
-    <span class="dot" id="status-dot"></span>
-    <h1>SSH 终端 — <span id="wname">…</span></h1>
-    <span class="meta" id="wmeta"></span>
-  </div>
-  <div id="screen"><span class="sys">连接中…</span></div>
-  <div class="input-row">
-    <span class="prompt">$</span>
-    <input id="cmd" placeholder="输入命令后回车 (如 nvidia-smi / ls / df -h)" autocomplete="off" spellcheck="false">
-    <button id="run">执行</button>
-  </div>
+<div class="bar">
+  <span class="dot wait" id="dot"></span>
+  <span class="name" id="wname">SSH</span>
+  <span class="meta" id="wmeta">连接中…</span>
+  <a class="hint" id="reconnect" href="javascript:location.reload()">重新连接</a>
+</div>
+<div id="term"></div>
+<script src="/console/xterm.js"></script>
+<script src="/console/xterm-addon-fit.js"></script>
 <script>
-const qs = new URLSearchParams(location.search);
-const WID = qs.get('id');
-const $ = (s) => document.querySelector(s);
-const screen = $('#screen');
-const esc = (s) => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+(function () {
+  var qs = new URLSearchParams(location.search);
+  var workerId = parseInt(qs.get('id'), 10);
+  var dot = document.getElementById('dot');
+  var $ = function (s) { return document.querySelector(s); };
 
-function print(text, cls) {
-  const span = document.createElement('span');
-  if (cls) span.className = cls;
-  span.textContent = text;
-  screen.appendChild(span);
-  screen.appendChild(document.createTextNode('\n'));
-  screen.scrollTop = screen.scrollHeight;
-}
+  var term = new Terminal({
+    cursorBlink: true,
+    fontSize: 13,
+    fontFamily: 'Menlo, Consolas, "Courier New", monospace',
+    theme: { background: '#1e1e1e' },
+    scrollback: 10000
+  });
+  var fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open($('#term'));
+  fit.fit();
 
-async function api(path, opts) {
-  const r = await fetch('/v2' + path, Object.assign({credentials: 'include'}, opts));
-  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).message || ('HTTP ' + r.status));
-  return r.json();
-}
+  function setDot(cls, msg) { dot.className = 'dot ' + cls; $('#wmeta').textContent = msg; }
 
-async function runCmd() {
-  const input = $('#cmd');
-  const command = input.value.trim();
-  if (!command || $('#run').disabled) return;
-  input.value = '';
-  print('$ ' + command, 'cmd');
-  $('#run').disabled = true;
-  try {
-    const r = await api(`/workers/${WID}/ssh-exec`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({command}),
+  if (!workerId) {
+    setDot('err', '缺少 ?id= 参数');
+    term.write('\r\n\x1b[31m[缺少 ?id= 参数]\x1b[0m\r\n');
+    return;
+  }
+
+  // 节点信息 (顺带验证登录态)
+  fetch('/v2/workers?perPage=200', { credentials: 'include' })
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function (d) {
+      var w = (d.items || []).find(function (x) { return String(x.id) === String(workerId); });
+      if (!w) throw new Error('节点不存在');
+      var gpus = ((w.status || {}).gpu_devices || []).length;
+      $('#wname').textContent = 'SSH — ' + w.name;
+      $('#wmeta').textContent = w.ip + ' · ' + (gpus ? 'GPU 服务器 (' + gpus + ' 卡)' : 'CPU 服务器');
+    })
+    .catch(function (e) { setDot('err', '节点信息获取失败: ' + e.message); });
+
+  // 1) 一次性 ticket (GPUStack 登录态 + worker 可见性在服务端校验)
+  fetch('/v2/ssh-gw/ticket/' + workerId, {
+    method: 'POST', credentials: 'include'
+  }).then(function (r) {
+    if (!r.ok) return r.json().then(function (j) { throw new Error(j.message || ('HTTP ' + r.status)); });
+    return r.json();
+  }).then(function (d) {
+    // 2) WebSocket 交互终端 (Go 网关 PTY)
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var ws = new WebSocket(proto + '//' + location.host + '/v2/ssh-gw/ws?ticket=' + encodeURIComponent(d.ticket));
+    ws.binaryType = 'arraybuffer';
+    var ping = null;
+
+    ws.onopen = function () {
+      setDot('', '已连接');
+      term.focus();
+      ping = setInterval(function () {
+        if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping' }));
+      }, 15000);
+    };
+    ws.onmessage = function (ev) {
+      if (typeof ev.data === 'string') {
+        try { var m = JSON.parse(ev.data); if (m.type === 'pong') return; } catch (e) {}
+        return;
+      }
+      term.write(new Uint8Array(ev.data));
+    };
+    ws.onclose = function () {
+      if (ping) clearInterval(ping);
+      setDot('err', '连接已断开');
+      term.write('\r\n\x1b[31m[连接已断开 — 可点「重新连接」]\x1b[0m\r\n');
+    };
+    ws.onerror = function () { setDot('err', '连接错误'); };
+
+    term.onData(function (data) {
+      if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'input', data: data }));
     });
-    if (r.output) print(r.output);
-    if (r.returncode !== 0 && !r.output) print(`[退出码 ${r.returncode}]`, 'sys');
-  } catch (e) {
-    print('错误: ' + e.message, 'err');
-  }
-  $('#run').disabled = false;
-  input.focus();
-}
+    term.onResize(function (cols, rows) {
+      if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', cols: cols, rows: rows }));
+    });
+  }).catch(function (e) {
+    setDot('err', '无法建立连接: ' + e.message);
+    term.write('\r\n\x1b[31m[无法建立连接: ' + e.message + ']\x1b[0m\r\n');
+  });
 
-$('#run').onclick = runCmd;
-$('#cmd').addEventListener('keydown', (e) => { if (e.key === 'Enter') runCmd(); });
-
-// 历史记录 (上下键)
-let history = [], hidx = -1;
-$('#cmd').addEventListener('keydown', (e) => {
-  if (e.key === 'ArrowUp' && history.length) {
-    hidx = Math.min(hidx + 1, history.length - 1);
-    e.target.value = history[history.length - 1 - hidx] || '';
-    e.preventDefault();
-  } else if (e.key === 'ArrowDown') {
-    hidx = Math.max(hidx - 1, -1);
-    e.target.value = hidx === -1 ? '' : history[history.length - 1 - hidx];
-    e.preventDefault();
-  } else if (e.key === 'Enter') {
-    const v = e.target.value.trim();
-    if (v) { history.push(v); hidx = -1; }
-  }
-});
-
-(async function init() {
-  if (!WID) { print('缺少 ?id= 参数', 'err'); return; }
-  try {
-    const data = await api('/workers?perPage=200');
-    const w = (data.items || []).find(x => String(x.id) === String(WID));
-    if (!w) throw new Error('节点不存在');
-    const gpus = ((w.status || {}).gpu_devices || []).length;
-    $('#wname').textContent = w.name;
-    $('#wmeta').textContent = `${w.ip} · ${gpus > 0 ? 'GPU 服务器 (' + gpus + ' 卡)' : 'CPU 服务器'}`;
-    screen.innerHTML = '';
-    print(`已连接 ${w.name} (${w.ip}) — 浏览器端命令通道, 非交互式 shell`, 'sys');
-    print('提示: 每条命令独立执行, 无状态; 交互式程序 (vim/top) 不适用', 'sys');
-    print('', 'sys');
-  } catch (e) {
-    $('#status-dot').className = 'dot err';
-    screen.innerHTML = '';
-    print('初始化失败: ' + e.message, 'err');
-  }
-  $('#cmd').focus();
+  window.addEventListener('resize', function () { fit.fit(); });
 })();
 </script>
 </body>
