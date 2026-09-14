@@ -17,7 +17,7 @@ FROM ${BASE_REGISTRY}/python:3.11-slim AS base
 # patch 链的字面锚点就漂移 (构建不可复现). 钉到当前验证过的版本;
 # 升级 UI 时先本地验证 patch 链再更新此 SHA256.
 ARG UI_TARBALL_URL="https://gpustack-ui-1303613262.cos.accelerate.myqcloud.com/releases/latest.tar.gz"
-ARG UI_TARBALL_SHA256="df12eeccf16e1cbc859e4343e4e80cd16e8c9eefa293af3f468f3480ed1884da"
+ARG UI_TARBALL_SHA256="1d96b483d91f4743eb22ff035752270e6036e781ce14aca1e493449ffb88d9bc"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \

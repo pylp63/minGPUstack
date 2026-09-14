@@ -154,13 +154,13 @@ ADV_GROUP = (
     'if(v==="pd_disaggregated"){'
     # 二开: PD 分离默认预填引擎互连参数 (SGLang 官方 PD 语法), 用户可在
     # 后端参数框里直接改; 切走拓扑时清空 (上面 setFieldValue([]))。
-    # --disaggregation-mode 由后端按角色展开 (P=prefill/D=decode), 前端
-    # 预填其余通用互连参数: KV bootstrap 端口 + 传输后端 + router 端口。
+    # 注意 --disaggregation-mode 不预填 — 它按角色变化 (P=prefill /
+    # D=decode), 由后端展开时自动生成, 前端写死任一值都会误导;
+    # 框里只放通用互连项: KV bootstrap 地址 + 传输后端 + 服务端口。
     'var bk=(n.getFieldValue("backend")||"").toLowerCase();'
     'var pre=[];'
     'if(bk==="sglang"){'
-    'pre=["--disaggregation-mode=prefill",'
-    '"--disaggregation-bootstrap-server=localhost:8555",'
+    'pre=["--disaggregation-bootstrap-server=localhost:8555",'
     '"--disaggregation-transfer-backend=mooncake",'
     '"--port=30000"]}'
     'if(pre.length){n.setFieldValue("backend_parameters",pre)}'

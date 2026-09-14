@@ -995,8 +995,11 @@ async def create_model_route(
             backend=model_in.backend,
             backend_parameters=model_in.backend_parameters,
             env=model_in.env,
-            kv_transfer="sglang" == (model_in.backend or "").lower() and bool(
-                find_parameter(model_in.backend_parameters or [], "--disaggregation-mode")
+            # SGLang PD 分离 = 引擎级互连 (mode/端口参数由 deploy_presets
+            # 按角色展开自动生成, 不依赖用户参数框里是否带 disaggregation 参数)
+            kv_transfer=(
+                "sglang" == (model_in.backend or "").lower()
+                and arch == "pd_disaggregated"
             ),
             cluster_id=model_in.cluster_id,
             prefill_gpu_count=int(topology.get("prefill_gpu_count") or 1),
