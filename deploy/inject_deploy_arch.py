@@ -152,6 +152,18 @@ ADV_GROUP = (
     'n.setFieldValue("backend_parameters",[]);'
     'n.setFieldValue("distributed_inference_across_workers",v==="pipeline_parallel");'
     'if(v==="pd_disaggregated"){'
+    # 二开: PD 分离默认预填引擎互连参数 (SGLang 官方 PD 语法), 用户可在
+    # 后端参数框里直接改; 切走拓扑时清空 (上面 setFieldValue([]))。
+    # --disaggregation-mode 由后端按角色展开 (P=prefill/D=decode), 前端
+    # 预填其余通用互连参数: KV bootstrap 端口 + 传输后端 + router 端口。
+    'var bk=(n.getFieldValue("backend")||"").toLowerCase();'
+    'var pre=[];'
+    'if(bk==="sglang"){'
+    'pre=["--disaggregation-mode=prefill",'
+    '"--disaggregation-bootstrap-server=localhost:8555",'
+    '"--disaggregation-transfer-backend=mooncake",'
+    '"--port=30000"]}'
+    'if(pre.length){n.setFieldValue("backend_parameters",pre)}'
     'if(n.getFieldValue("prefill_groups")===undefined){n.setFieldValue("prefill_groups",1)}'
     'if(n.getFieldValue("decode_groups")===undefined){n.setFieldValue("decode_groups",1)}'
     'if(n.getFieldValue("prefill_gpu_count")===undefined){n.setFieldValue("prefill_gpu_count",1)}'

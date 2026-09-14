@@ -995,6 +995,9 @@ async def create_model_route(
             backend=model_in.backend,
             backend_parameters=model_in.backend_parameters,
             env=model_in.env,
+            kv_transfer="sglang" == (model_in.backend or "").lower() and bool(
+                find_parameter(model_in.backend_parameters or [], "--disaggregation-mode")
+            ),
             cluster_id=model_in.cluster_id,
             prefill_gpu_count=int(topology.get("prefill_gpu_count") or 1),
             decode_gpu_count=int(topology.get("decode_gpu_count") or 1),

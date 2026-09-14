@@ -202,6 +202,22 @@ def _base_payload(req: PresetDeployRequest, **overrides) -> Dict[str, Any]:
     return payload
 
 
+def _strip_role_params(payload: Dict[str, Any], names: List[str]) -> None:
+    """从 payload 的用户预填参数里剔除该角色不该带的 flag."""
+    if not names:
+        return
+    from gpustack.utils.command import find_parameter
+
+    params = list(payload.get("backend_parameters") or [])
+    kept = []
+    for prm in params:
+        bare = prm.split("=")[0].split(" ")[0].lstrip("-")
+        if bare in names:
+            continue
+        kept.append(prm)
+    payload["backend_parameters"] = kept
+
+
 def _kv_flags(req: PresetDeployRequest, role: str) -> List[str]:
     """KV 传输参数 — 按角色对称生成 (二开修复: 原版 decode 侧缺失).
 
@@ -220,9 +236,14 @@ def _kv_flags(req: PresetDeployRequest, role: str) -> List[str]:
 
 
 def _engine_role_parameters(
-    backend: Optional[str], role: str, kv_transfer: bool
-) -> List[str]:
-    """按引擎生成 P/D 角色互连参数 (二开修复: 原版 --api-server-type
+    backend: Optional[str], role: str, kv_transfer: bool,
+    user_params: Optional[List[str]] = None,
+) -> tuple:
+    """返回 (flags, strip_names): flags = 该角色的互连参数;
+    strip_names = 用户预填参数里该角色必须剔除的 flag 名 (如 decode 侧
+    不该带 --disaggregation-bootstrap-server — 它是 P 侧起的 bootstrap
+    server, decode 是连接方, 地址由 router/discovery 下发).
+    按引擎生成 P/D 角色互连参数 (二开修复: 原版 --api-server-type
     在 vLLM/SGLang 都不存在, 引擎启动直接失败).
 
     kv_transfer=False 时返回空 — PD 两组作为普通独立实例部署, 由
@@ -230,14 +251,36 @@ def _engine_role_parameters(
     producer/consumer 成对组网, 单独出现引擎起不来).
 
     - vLLM (默认): --kv-transfer-config (kv_producer / kv_consumer)
-    - SGLang:      --disaggregation-mode prefill|decode (官方 launch_server 语法)
+    - SGLang (官方 PD 语法, 二开补全):
+        P: --disaggregation-mode=prefill --disaggregation-bootstrap-server
+        D: --disaggregation-mode=decode
+      KV bootstrap 端口 (默认 8555) 与传输后端 (默认 mooncake) 尊重
+      用户在后端参数框里的预填值 — 前端 PD 预填的通用参数在框里,
+      这里只补角色差异项, 同名 flag 不覆盖用户值.
     """
     if not kv_transfer:
         return []
     b = (backend or "vllm").lower()
     if b == "sglang":
+        from gpustack.utils.command import find_parameter
+
+        user_params = user_params or []
         mode = "prefill" if role == "prefill" else "decode"
-        return [f"--disaggregation-mode={mode}"]
+        flags = [f"--disaggregation-mode={mode}"]
+        strip = []
+        if role == "prefill":
+            # P 侧起 KV bootstrap server (D/router 连它); 用户改过端口则用用户的
+            has_boot = find_parameter(user_params, ["disaggregation-bootstrap-server"])
+            if has_boot is None:
+                flags.append("--disaggregation-bootstrap-server=localhost:8555")
+        else:
+            # decode 侧: 剔除用户预填里的 bootstrap-server (那是 P 的)
+            strip.append("disaggregation-bootstrap-server")
+        # 传输后端: 用户预填的保留, 没有则默认 mooncake (PD 必需)
+        has_tb = find_parameter(user_params, ["disaggregation-transfer-backend"])
+        if has_tb is None:
+            flags.append("--disaggregation-transfer-backend=mooncake")
+        return flags, strip
     # vLLM 形式
     kv_role = "kv_producer" if role == "prefill" else "kv_consumer"
     kv_rank = 0 if role == "prefill" else 1
@@ -245,7 +288,7 @@ def _engine_role_parameters(
         "--kv-transfer-config",
         '{"kv_connector":"PyNcclConnector","kv_role":"%s","kv_rank":%d,'
         '"kv_parallel_size":2}' % (kv_role, kv_rank),
-    ]
+    ], []
 
 
 def _role_plan(
@@ -324,16 +367,12 @@ def build_preset_payloads(req: PresetDeployRequest) -> PresetDeployPlan:
 
     # ---------------- PD 分离 (组数>1 = 多 P 多 D) ----------------
     if arch == DeploymentArchitectureEnum.PD_DISAGGREGATED:
-        p_flags = (
-            [f"--tensor-parallel-size={req.prefill_gpu_count}"]
-            + _engine_role_parameters(req.backend, "prefill",
-                                      req.kv_transfer)
-        )
-        d_flags = (
-            [f"--tensor-parallel-size={req.decode_gpu_count}"]
-            + _engine_role_parameters(req.backend, "decode",
-                                      req.kv_transfer)
-        )
+        _pf, _p_strip = _engine_role_parameters(
+            req.backend, "prefill", req.kv_transfer, req.backend_parameters)
+        _df, _d_strip = _engine_role_parameters(
+            req.backend, "decode", req.kv_transfer, req.backend_parameters)
+        p_flags = [f"--tensor-parallel-size={req.prefill_gpu_count}"] + _pf
+        d_flags = [f"--tensor-parallel-size={req.decode_gpu_count}"] + _df
         # ---- 节点级 rank 分配 (pd_node_assign): 每角色每 rank 指定节点列表.
         # 有分配时每 rank 一个独立 Model (固定节点, 不靠调度器漂移);
         # 无分配时保持原行为 (P/D 两个 Model, 组数=replicas 由调度器摆放).
@@ -407,6 +446,7 @@ def build_preset_payloads(req: PresetDeployRequest) -> PresetDeployPlan:
                             if not f.startswith("--pipeline-parallel-size")
                             and not f.startswith("--tensor-parallel-size")
                         ]
+                    _strip_role_params(p, _p_strip if role == "prefill" else _d_strip)
                     _merge_backend_parameters(p, r_flags)
                     payloads.append(p)
                     roles.append(_role_plan(
@@ -426,11 +466,13 @@ def build_preset_payloads(req: PresetDeployRequest) -> PresetDeployPlan:
             req, name=f"{req.model_name}-prefill",
             replicas=req.prefill_groups,
         )
+        _strip_role_params(p_payload, _p_strip)
         _merge_backend_parameters(p_payload, p_flags)
         d_payload = _base_payload(
             req, name=f"{req.model_name}-decode",
             replicas=req.decode_groups,
         )
+        _strip_role_params(d_payload, _d_strip)
         _merge_backend_parameters(d_payload, d_flags)
         roles = [
             _role_plan("prefill", f"{req.model_name}-prefill",

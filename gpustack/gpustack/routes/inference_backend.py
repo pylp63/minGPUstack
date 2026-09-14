@@ -430,6 +430,13 @@ def merge_list_runners(  # noqa: C901
 
                 query_conditions.add((gpu.type, variant))
 
+    # 二开修复: 集群内没有 GPU 设备 (纯 CPU worker 或状态未上报) 时,
+    # query_conditions 为空集, 版本列表/默认版本全空 — 部署表单的
+    # 「后端版本」下拉就没有任何选项。回退到 cuda 目录 (打包清单的
+    # 基准框架), 让内置后端的版本照样可选; 有 GPU 时行为不变。
+    if not query_conditions:
+        query_conditions.add(("cuda", None))
+
     merged_runner_versions: Dict[str, List[ServiceVersionedRunner]] = {}
     merged_version_configs = VersionConfigDict()
     merged_default_version = None
