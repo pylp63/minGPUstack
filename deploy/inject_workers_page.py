@@ -109,6 +109,51 @@ else:
     t = t[:na] + BADGE + t[na + len(NAME_ANCHOR):]
     print("CPU/GPU badge injected into name column")
 
+# ============================================================
+# 4. CPU/GPU 服务器分类列: 插在 IP 列之前 (名称/标签/集群之后)。
+#    列内容与名称列徽标同一视觉语言: GPU 服务器·N 卡 (蓝) / CPU 服务器 (灰)。
+#    幂等: 先移除旧注入 (以 __type_col__ 标记识别), 再插入。
+TYPE_COL_MARK = '__type_col__'
+tc = t.find(TYPE_COL_MARK)
+if tc != -1:
+    # 移除上一次注入的整列 (从列数组元素开头到该元素结尾)
+    # 注入形态: {title:"类型",...,dataIndex:"__type_col__",...}] 括号自平衡
+    start = t.rfind('{title:"类型"', 0, tc)
+    if start != -1:
+        depth = 0
+        i = start
+        while i < len(t):
+            if t[i] == '{':
+                depth += 1
+            elif t[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        t = t[:start] + t[i + 1:]
+        # 清理元素已删但其前导逗号可能残留 (,,) — 吃掉一个
+        if start > 0 and t[start - 1] == ',' and start < len(t) and t[start] == ',':
+            t = t[:start - 1] + t[start:]
+        print("old type column removed (idempotent cleanup)")
+
+IP_ANCHOR = '{title:"IP",dataIndex:"ip"'
+if t.count(IP_ANCHOR) != 1:
+    print("!! IP anchor not unique:", t.count(IP_ANCHOR))
+    sys.exit(1)
+ip = t.find(IP_ANCHOR)
+TYPE_COL = (
+    '{title:"类型",dataIndex:"__type_col__",minWidth:110,'
+    'render:function(e,n){var g=((n&&n.status)||{}).gpu_devices||[];'
+    'return (0,ae.jsx)("span",{style:{display:"inline-flex",alignItems:"center",'
+    'padding:"1px 8px",borderRadius:4,fontSize:12,'
+    'color:g.length?"#4f8cff":"#9aa0a6",'
+    'background:g.length?"rgba(79,140,255,.12)":"rgba(154,160,166,.12)",'
+    'whiteSpace:"nowrap"},'
+    'children:g.length?("GPU 服务器 · "+g.length+" 卡"):"CPU 服务器"})}},'
+)
+t = t[:ip] + TYPE_COL + t[ip:]
+print("CPU/GPU type column injected before IP column")
+
 if t == orig:
     print("!! no-op")
     sys.exit(1)

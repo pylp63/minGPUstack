@@ -46,3 +46,18 @@ try {
   console.error('!! 镜像行片段语法错误: ' + e.message);
   process.exit(1);
 }
+
+/* inject_workers_page.py 的 CPU/GPU 类型列片段语法自检 */
+try {
+  const wt = fs.readFileSync('/mnt/gpustack/deploy/inject_workers_page.py', 'utf8');
+  const m = wt.match(/TYPE_COL = \(\n([\s\S]*?)\n\)/);
+  if (!m) { console.error('!! TYPE_COL not found in inject_workers_page.py'); process.exit(1); }
+  const parts = [...m[1].matchAll(/'((?:[^'\\]|\\.)*)'/g)].map(x => x[1]);
+  const typeCol = parts.join('');
+  // 列数组元素上下文: [..., TYPE_COL, {IP列}] — 两边都要有数组邻居
+  new Function('ae', 'return [' + typeCol + '{title:"IP"}]');
+  console.log('inject 预检: workers 类型列片段语法 OK');
+} catch (e) {
+  console.error('!! workers 类型列片段语法错误: ' + e.message);
+  process.exit(1);
+}
