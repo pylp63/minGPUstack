@@ -1,6 +1,7 @@
 import secrets
 import datetime
 import base64
+import ipaddress
 import json
 import uuid
 import logging
@@ -82,7 +83,12 @@ from gpustack.utils.grafana import resolve_grafana_base_url
 
 router = APIRouter()
 system_name_prefix = "system/worker"
+
 logger = logging.getLogger(__name__)
+
+# 二开: IP 手动覆盖标签 — 编辑框「IP 地址」输入框写入的值存在 labels 里,
+# 同时作为心跳/重注册时的覆写保护标记 (探测值不冲掉手改值)。
+IP_OVERRIDE_LABEL = "gpustack.io/ip-override"
 
 
 # Semaphore for creating workers to prevent db contention
@@ -413,6 +419,13 @@ def update_worker_data(
                 "state": WorkerStateEnum.READY,
             }
         )
+        # 二开: IP 覆写保护 — 重注册的 incoming_data 带新探测的
+        # ip/advertise_address/ifname, 会冲掉管理员手动指定的值。
+        # existing 的 labels 里有覆写标签时, 保留手改值 (与编辑框语义一致)。
+        if (existing.labels or {}).get(IP_OVERRIDE_LABEL):
+            to_create_worker.ip = existing.ip
+            to_create_worker.advertise_address = existing.advertise_address
+            to_create_worker.ifname = existing.ifname
     else:
         # new worker should ignore the reported worker_uuid
         to_create_worker = Worker.model_validate(
@@ -802,6 +815,31 @@ async def update_worker(
     assert_org_owned_writable(ctx, worker, resource_label="worker")
 
     patch = worker_in.model_dump()
+
+    # 二开: IP 手动覆盖 — 编辑框的「IP 地址」输入框把值放进
+    # labels["gpustack.io/ip-override"]。这里拦截:
+    #   - 有值: 校验 IPv4/IPv6 格式, 同步覆盖 worker.ip / advertise_address
+    #     (ifname 置空 — 手动指定 IP 后网卡名不再有意义), 标签保留作为
+    #     心跳/重注册时的覆写保护标记 (探测值不再冲掉手改值)。
+    #   - 清空: 解除覆盖, 下一次心跳的探测值恢复写回。
+    labels = dict(patch.get("labels") or {})
+    override = (labels.get(IP_OVERRIDE_LABEL) or "").strip()
+    if override:
+        try:
+            ipaddress.ip_address(override)
+        except ValueError:
+            raise InvalidException(
+                message=f"IP 地址格式无效: {override} (需 IPv4/IPv6)"
+            )
+        worker.ip = override
+        worker.advertise_address = override
+        worker.ifname = ""
+    elif IP_OVERRIDE_LABEL in labels:
+        # 显式清空 -> 解除覆盖
+        labels.pop(IP_OVERRIDE_LABEL, None)
+        patch["labels"] = labels
+        worker.ifname = worker.ifname or ""
+
     if worker_in.maintenance is not None:
         worker.maintenance = worker_in.maintenance
         worker.compute_state()
@@ -851,6 +889,14 @@ async def create_worker_status(user: CurrentUserDep, input: WorkerStatusStored):
     # watch events / the API response (issue #5751).
     input_dict = {key: getattr(input, key) for key in input.model_fields_set}
     input_dict["heartbeat_time"] = heartbeat_time
+
+    # 二开: IP 覆写保护 — worker 自动探测的 IP 在多网卡/代理网卡环境会
+    # 选错 (如 fake-IP DNS 代理的 Meta 网卡)。管理员在编辑框手动指定后
+    # (labels[gpustack.io/ip-override]), 心跳上报的探测值不再覆盖手改值。
+    existing_labels = user.worker.labels or {}
+    if existing_labels.get("gpustack.io/ip-override"):
+        for k in ("ip", "advertise_address", "ifname"):
+            input_dict.pop(k, None)
 
     # Add worker status to buffer for batch update
     async with worker_status_flush_buffer_lock:

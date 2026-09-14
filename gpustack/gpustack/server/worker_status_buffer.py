@@ -80,6 +80,23 @@ async def flush_worker_status():
                     setattr(worker, key, value)
                 worker.compute_state()
 
+            # 二开: 老节点补打部署形态标签 — 旧版镜像注册的 worker 没有
+            # gpustack.io/node-kind 标签 (新 agent 注册时自动打)。心跳状态里
+            # 带着文件系统信息: mount_from=overlay 即容器 (GPUDocker/compose
+            # 部署特征); 非 overlay 视为 BMS 裸金属 (agent 直接跑在 OS 上,
+            # K8S Pod 场景由新 agent 打标, 不在此推断)。只补缺失, 不覆盖。
+            for worker in workers:
+                labels = dict(worker.labels or {})
+                if labels.get("gpustack.io/node-kind"):
+                    continue
+                fs = getattr(
+                    getattr(worker, "status", None), "filesystem", None
+                ) or []
+                mount_from = (fs[0] or {}).get("mount_from", "") if fs else ""
+                inferred = "container" if mount_from == "overlay" else "bms"
+                labels["gpustack.io/node-kind"] = inferred
+                worker.labels = labels
+
             await WorkerService(session).batch_update(workers)
     except Exception as e:
         logger.error(f"Error flushing worker status to DB: {e}")

@@ -270,6 +270,83 @@ def test_pipeline_parallel_single_distributed_payload():
     assert len(plan.roles) == 4  # N 个 stage 角色
 
 
+def test_pipeline_parallel_manual_gpu_selection():
+    """PP 手动选卡: gpus_per_replica = 跨节点总卡数 (PP×TP) —
+    调度器按总预算跨节点分配, 引擎侧按每节点卡数=TP 拆分."""
+    plan = _preset_plan(
+        DeploymentArchitectureEnum.PIPELINE_PARALLEL,
+        pipeline_parallel_size=2,
+        tensor_parallel_size=8,
+        gpu_ids=[
+            "n1:cuda:0", "n1:cuda:1", "n1:cuda:2", "n1:cuda:3",
+            "n1:cuda:4", "n1:cuda:5", "n1:cuda:6", "n1:cuda:7",
+            "n2:cuda:0", "n2:cuda:1", "n2:cuda:2", "n2:cuda:3",
+            "n2:cuda:4", "n2:cuda:5", "n2:cuda:6", "n2:cuda:7",
+        ],
+    )
+    payload = plan.payloads[0]
+    assert payload["gpu_selector"]["gpus_per_replica"] == 16  # 总量, 非 8
+    assert len(payload["gpu_selector"]["gpu_ids"]) == 16
+    assert "--pipeline-parallel-size=2" in _flat_params(payload)
+    assert "--tensor-parallel-size=8" in _flat_params(payload)
+
+
+def test_pipeline_parallel_manual_gpu_mismatch_rejected():
+    """选卡数/节点数与 PP×TP 不匹配 -> 显式报错, 而不是静默产出
+    world_size 校验必炸的 payload."""
+    # 卡数不够 PP×TP
+    with pytest.raises(ValueError, match="不匹配"):
+        _preset_plan(
+            DeploymentArchitectureEnum.PIPELINE_PARALLEL,
+            pipeline_parallel_size=2,
+            tensor_parallel_size=8,
+            gpu_ids=["n1:cuda:0"] * 8 + ["n2:cuda:0"] * 4,
+        )
+    # 节点数不等于 PP
+    with pytest.raises(ValueError, match="流水线并行度"):
+        _preset_plan(
+            DeploymentArchitectureEnum.PIPELINE_PARALLEL,
+            pipeline_parallel_size=2,
+            tensor_parallel_size=4,
+            gpu_ids=[
+                "n1:cuda:0", "n1:cuda:1", "n1:cuda:2", "n1:cuda:3",
+                "n1:cuda:4", "n1:cuda:5", "n1:cuda:6", "n1:cuda:7",
+            ],
+        )
+    # 每节点卡数不等 (TP 拆不均) — 总量正确 (8=2×4) 但 n1/n2 分配 3/5
+    with pytest.raises(ValueError, match="选卡数不等"):
+        _preset_plan(
+            DeploymentArchitectureEnum.PIPELINE_PARALLEL,
+            pipeline_parallel_size=2,
+            tensor_parallel_size=4,
+            gpu_ids=[
+                "n1:cuda:0", "n1:cuda:1", "n1:cuda:2",
+                "n2:cuda:0", "n2:cuda:1", "n2:cuda:2", "n2:cuda:3",
+                "n2:cuda:4",
+            ],
+        )
+
+
+def test_pd_node_assign_multinode_gpus_per_replica_includes_pp():
+    """PD 跨节点 (pd_pipeline_size>1): gpus_per_replica 必须是总卡数
+    (gpu_count×pp), 写单节点数会让调度器 world_size 校验失败."""
+    plan = _preset_plan(
+        DeploymentArchitectureEnum.PD_DISAGGREGATED,
+        prefill_gpu_count=4, decode_gpu_count=4,
+        pd_pipeline_size=2,
+        pd_node_assign={
+            "prefill": [["n1", "n2"]],
+            "decode": [["n3", "n4"]],
+        },
+    )
+    by_name = {p["name"]: p for p in plan.payloads}
+    p = by_name["testmodel-prefill-0"]
+    assert p["gpu_selector"]["gpus_per_replica"] == 8  # 4/节点 × 2 节点
+    assert len(p["gpu_selector"]["gpu_ids"]) == 8
+    assert "--tensor-parallel-size=4" in _flat_params(p)  # TP=每节点数
+    assert "--pipeline-parallel-size=2" in _flat_params(p)
+
+
 def test_standalone_tp_flag_only_when_needed():
     plan = _preset_plan(
         DeploymentArchitectureEnum.STANDALONE,

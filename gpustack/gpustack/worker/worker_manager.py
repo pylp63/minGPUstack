@@ -137,11 +137,63 @@ class WorkerManager:
     def _register_shutdown_hooks(self):
         pass
 
+    @staticmethod
+    def _is_in_container() -> bool:
+        """检测 agent 是否跑在容器内 (非 K8S 场景)。
+
+        依据 (任一命中即容器):
+        - /.dockerenv 存在 (docker/containerd 标准)
+        - cgroup v1: /proc/self/cgroup 含 docker/containerd/kubepods 路径
+          (kubepods 在 is_inside_kubernetes 已先行判断, 这里兜底)
+        - cgroup v2: /proc/self/mountinfo 里 root 指向非 / 的 overlay
+        """
+        if os.path.exists("/.dockerenv"):
+            return True
+        try:
+            with open("/proc/self/cgroup", encoding="utf-8") as f:
+                cg = f.read()
+            for marker in ("docker", "containerd", "kubepods"):
+                if marker in cg:
+                    return True
+        except OSError:
+            pass
+        try:
+            with open("/proc/self/mountinfo", encoding="utf-8") as f:
+                for line in f:
+                    # 格式: ID parent major:minor root mount-point ...
+                    # 容器内 root 通常是 overlay 且不为 /, 宿主机为 /
+                    parts = line.split()
+                    if len(parts) > 4 and parts[4] == "/" and "overlay" in line:
+                        continue
+                    if (
+                        len(parts) > 3
+                        and parts[0] != "0"
+                        and parts[3] not in ("/",)
+                        and "overlay" in line
+                        and parts[4] == "/"
+                    ):
+                        return True
+        except OSError:
+            pass
+        return False
+
     def _ensure_builtin_labels(self) -> dict:
         labels = {
             "os": platform.system(),
             "arch": platform.arch(),
         }
+        # 二开: 部署形态标签 — 节点以何种方式承载 agent:
+        #   k8s-pod: K8S 集群内 Pod (有 serviceaccount + KUBERNETES_SERVICE_HOST)
+        #   container: 宿主容器 (docker/containerd 内, 无 K8S 环境)
+        #   bms: 裸金属 (agent 直接跑物理机/虚机 OS 上)
+        # 判定顺序: K8S (环境变量+SA 文件) -> 容器 (.dockerenv / cgroup v1/v2
+        # 容器标记) -> 裸金属。仅 worker 侧打标, server 端原样存储/透传。
+        if platform.is_inside_kubernetes():
+            labels["gpustack.io/node-kind"] = "k8s-pod"
+        elif self._is_in_container():
+            labels["gpustack.io/node-kind"] = "container"
+        else:
+            labels["gpustack.io/node-kind"] = "bms"
         # worker name label will be set during registration
         name = self._cfg.worker_name or get_worker_name(self._cfg.data_dir)
         if name:

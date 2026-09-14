@@ -166,8 +166,12 @@ ADV_GROUP = (
     'if(pre.length){n.setFieldValue("backend_parameters",pre)}'
     'if(n.getFieldValue("prefill_groups")===undefined){n.setFieldValue("prefill_groups",1)}'
     'if(n.getFieldValue("decode_groups")===undefined){n.setFieldValue("decode_groups",1)}'
-    'if(n.getFieldValue("prefill_gpu_count")===undefined){n.setFieldValue("prefill_gpu_count",1)}'
-    'if(n.getFieldValue("decode_gpu_count")===undefined){n.setFieldValue("decode_gpu_count",1)}'
+    # 二开: PD 默认 GPU 数跟随集群 — min(8, 单节点最大卡数), 无节点数据时
+    # fallback 8。盲填 8 在 4 卡机上必然调度失败 (TP 不能超过单节点卡数)。
+    'var mg=0;if(window.__topoWorkersRaw){for(var mi=0;mi<window.__topoWorkersRaw.length;mi++){var mgi=(((window.__topoWorkersRaw[mi]||{}).status||{}).gpu_devices||[]).length;if(mgi>mg){mg=mgi}}}'
+    'var ddef=mg?Math.min(8,mg):8;'
+    'if(n.getFieldValue("prefill_gpu_count")===undefined){n.setFieldValue("prefill_gpu_count",ddef)}'
+    'if(n.getFieldValue("decode_gpu_count")===undefined){n.setFieldValue("decode_gpu_count",ddef)}'
     'if(n.getFieldValue("pd_pipeline_size")===undefined){n.setFieldValue("pd_pipeline_size",1)}'
     'if(n.getFieldValue("pd_node_assign")===undefined){n.setFieldValue("pd_node_assign",{prefill:[],decode:[]})}}'
     'if(v==="pipeline_parallel"){'
@@ -184,6 +188,9 @@ ADV_GROUP = (
     'var out=[];'
     'if(pd){out.push('
     '(0,D.jsx)(k.Z.Item,{name:"pd_node_assign",hidden:!0,children:(0,D.jsx)("input",{style:{display:"none"}})}),'
+    # 二开: PD 的 P/D GPU 数 = 每节点 TP (跨节点时 gpu_count 仍是每节点卡数,
+    # --tensor-parallel-size 由后端按 gpu_count 注入), max 收紧到
+    # 集群单节点最大卡数 (TP 不可能超过它)。
     '(0,D.jsx)(k.Z.Item,{name:"prefill_groups",'
     'children:(0,D.jsx)(Y.Z.Input,{type:"number",min:1,max:64,'
     'label:e.formatMessage({id:"models.form.servingTopology.pgroups"})})}'
@@ -193,11 +200,13 @@ ADV_GROUP = (
     'label:e.formatMessage({id:"models.form.servingTopology.dgroups"})})}'
     '),'
     '(0,D.jsx)(k.Z.Item,{name:"prefill_gpu_count",'
-    'children:(0,D.jsx)(Y.Z.Input,{type:"number",min:1,max:64,'
+    'children:(0,D.jsx)(Y.Z.Input,{type:"number",min:1,'
+    'max:(function(){var m1=0;if(window.__topoWorkersRaw){for(var i1=0;i1<window.__topoWorkersRaw.length;i1++){var g1=(((window.__topoWorkersRaw[i1]||{}).status||{}).gpu_devices||[]).length;if(g1>m1){m1=g1}}}return m1?m1:64})(),'
     'label:e.formatMessage({id:"models.form.servingTopology.prefill"})})}'
     '),'
     '(0,D.jsx)(k.Z.Item,{name:"decode_gpu_count",'
-    'children:(0,D.jsx)(Y.Z.Input,{type:"number",min:1,max:64,'
+    'children:(0,D.jsx)(Y.Z.Input,{type:"number",min:1,'
+    'max:(function(){var m2=0;if(window.__topoWorkersRaw){for(var i2=0;i2<window.__topoWorkersRaw.length;i2++){var g2=(((window.__topoWorkersRaw[i2]||{}).status||{}).gpu_devices||[]).length;if(g2>m2){m2=g2}}}return m2?m2:64})(),'
     'label:e.formatMessage({id:"models.form.servingTopology.decode"})})}'
     '),'
     '(0,D.jsx)(k.Z.Item,{name:"pd_pipeline_size",'
@@ -234,7 +243,8 @@ WORKER_FETCH = (
     '(function(){if(window.__topoWorkersFetched){return}'
     'window.__topoWorkersFetched=!0;'
     'fetch("/v2/workers",{credentials:"include"}).then(function(r){return r.json()})'
-    '.then(function(d){window.__topoWorkers=(d.items||[]).map(function(w){return w.name})})'
+    '.then(function(d){window.__topoWorkersRaw=d.items||[];'
+    'window.__topoWorkers=(d.items||[]).map(function(w){return w.name})})'
     '.catch(function(){})})(),'
 )
 ci2 = t.find(categ_anchor_key)
@@ -286,6 +296,61 @@ if t[frag_close:frag_close + 4] != "]}),":
     print("!! unexpected structure after gpu fragment:", repr(t[frag_close:frag_close + 20]))
     sys.exit(1)
 gpu_items_src = t[gpu_ids_start:arr_end]  # 两个 item (不含数组括号与 Fragment 闭合)
+
+# ---- 二开: 「每副本 GPU 数量」语义按拓扑标注 (源码核实) ----
+#   单机部署: = SGLang 的 TP — worker/backends/sglang.py 无显式 tp 参数时
+#             自动注入 --tp-size <卡数>, 选项上限 = 集群单节点最大卡数
+#   PP 流水线: = 跨节点总卡数 (不是每节点 TP!) — 调度器
+#             base_candidate_selector._set_gpu_count 把 gpus_per_replica
+#             当作主+从 worker 的总预算跨节点分配; 引擎侧
+#             cal_distributed_parallelism_arguments 再按 每节点卡数=TP、
+#             节点数=PP 拆分。所以 pp=2 × 每节点 8 卡 → 这里选 16。
+#             选项上限 = PP × 单节点最大卡数, 且须被 PP 整除 (每节点 TP
+#             = 总数/PP 必须是整数, 不整除时引擎退化为 tp=1 的退化拓扑)。
+#   PD 分离:  该字段被 rank 选点框替换 (gpu_count 单独控制), 不经过这里。
+# d = Cn 组件作用域的 form instance (label 函数运行时读取当前拓扑)。
+PR_LABEL_OLD = 'label:n.formatMessage({id:"models.form.gpusperreplica"}),allowNull:!0,'
+PR_LABEL_NEW = (
+    'label:(function(){var tp=d.getFieldValue("serving_topology")||"standalone";'
+    'if(tp==="pipeline_parallel"){return "每副本 GPU 数量 (总卡数 = PP×每节点TP)"}'
+    'return "每副本 GPU 数量 (TP)"})(),allowNull:!0,'
+)
+PR_OPTS_OLD = (
+    'options:[{label:n.formatMessage({id:"common.options.auto"}),value:null},{label:"1",value:1},'
+    '{label:"2",value:2},{label:"4",value:4},{label:"8",value:8},{label:"16",value:16}],'
+)
+PR_OPTS_NEW = (
+    # 按拓扑 + 集群单节点最大 GPU 数过滤选项 (无数据时全量 — 兼容 fetch 失败)
+    'options:(function(){var mg=0;'
+    'if(window.__topoWorkersRaw){for(var i=0;i<window.__topoWorkersRaw.length;i++){'
+    'var g=(((window.__topoWorkersRaw[i]||{}).status||{}).gpu_devices||[]).length;'
+    'if(g>mg){mg=g}}}'
+    'var isPP=(d.getFieldValue("serving_topology")==="pipeline_parallel");'
+    'var pp=d.getFieldValue("pipeline_parallel_size")||2;'
+    'var all=[{label:n.formatMessage({id:"common.options.auto"}),value:null},{label:"1",value:1},'
+    '{label:"2",value:2},{label:"4",value:4},{label:"8",value:8},{label:"16",value:16}]'
+    '.concat(isPP?[{label:"32",value:32},{label:"64",value:64}]:[]);'
+    'if(!mg){return all}'
+    'var lim=isPP?mg*pp:mg;'
+    'return all.filter(function(o){'
+    'if(o.value===null){return !0}'
+    'if(o.value>lim){return !1}'
+    'if(isPP&&o.value%pp!==0){return !1}'
+    'return !0})'
+    # PP 模式选项标注分解 (如 "16 (2节点×每节点8卡)") — 消除总量/每节点歧义
+    '.map(function(o){if(!isPP||pp<2||o.value===null){return o}'
+    'return {label:o.label+" ("+pp+"节点×每节点"+(o.value/pp)+"卡)",value:o.value}})})(),'
+)
+if PR_LABEL_OLD in gpu_items_src and PR_OPTS_OLD in gpu_items_src:
+    gpu_items_src = gpu_items_src.replace(PR_LABEL_OLD, PR_LABEL_NEW)
+    gpu_items_src = gpu_items_src.replace(PR_OPTS_OLD, PR_OPTS_NEW)
+    print("per-replica GPU field: TP label + node-max filtered options")
+else:
+    if "每副本 GPU 数量 (TP)" in gpu_items_src:
+        print("per-replica GPU field: already rewritten (idempotent)")
+    else:
+        print("!! per-replica field pattern not found in gpu_items_src")
+        sys.exit(1)
 
 # rank 选点框生成器 (children 函数内联, 挂在 __pdRankSlot 标记的组件里):
 # 用一个 noStyle Form.Item(shouldUpdate) 感知 topology/backend/groups 变化,
@@ -408,7 +473,8 @@ RANK_BOXES = (
 PD_SWITCH = (
     '(0,D.jsx)(k.Z.Item,{noStyle:!0,__pdRankSwitch:!0,'
     'shouldUpdate:function(ab,bb){'
-    'return ab.serving_topology!==bb.serving_topology||ab.backend!==bb.backend},'
+    'return ab.serving_topology!==bb.serving_topology||ab.backend!==bb.backend'
+    '||ab.pipeline_parallel_size!==bb.pipeline_parallel_size},'
     'children:function(fw){'
     'var isPD=(fw.getFieldValue("backend")==="SGLang"'
     '&&fw.getFieldValue("serving_topology")==="pd_disaggregated");'
@@ -488,9 +554,9 @@ for lf in [f] + glob.glob(os.path.join(JS, "*.chunk.js")) + umis:
         ("models.form.servingTopology.standalone", "单机部署"),
         ("models.form.servingTopology.pd", "PD 分离"),
         ("models.form.servingTopology.pipeline", "流水线并行"),
-        ("models.form.servingTopology.prefill", "Prefill GPU 数"),
-        ("models.form.servingTopology.decode", "Decode GPU 数"),
-        ("models.form.servingTopology.ppSize", "流水线并行度PP"),
+        ("models.form.servingTopology.prefill", "Prefill GPU 数 (每节点TP)"),
+        ("models.form.servingTopology.decode", "Decode GPU 数 (每节点TP)"),
+        ("models.form.servingTopology.ppSize", "流水线并行度PP (节点数)"),
         ("models.form.servingTopology.pgroups", "Prefill节点数量"),
         ("models.form.servingTopology.dgroups", "Decode节点数量"),
     ]

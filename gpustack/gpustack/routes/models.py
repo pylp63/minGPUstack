@@ -982,6 +982,22 @@ async def create_model_route(
         from gpustack.routes.deploy_presets import deploy_preset
         from gpustack.schemas.deploy_presets import PresetDeployRequest
 
+        # PP 手动选卡: 「每副本 GPU 数量」语义 = 跨节点总卡数 (调度器
+        # base_candidate_selector._set_gpu_count 把 gpus_per_replica
+        # 当作主+从 worker 的总预算; 引擎侧 TP=每节点卡数、PP=节点数)。
+        # 所以 TP = 总卡数 // PP, 不能直接拿总卡数当 TP (否则
+        # world_size = TP×PP ≠ 选卡数, 调度直接报不匹配)。
+        # 总卡数优先取表单「每副本 GPU 数量」(用户显式选的),
+        # 未选 (自动) 时取手选 GPU 数。
+        _sel = model_in.gpu_selector
+        _pp_size = max(int(topology.get("pipeline_parallel_size") or 2), 1)
+        _total = 0
+        if _sel and _sel.gpu_ids:
+            _total = int(
+                getattr(_sel, "gpus_per_replica", None) or len(_sel.gpu_ids)
+            )
+        _tp = max(1, _total // _pp_size) if _total else 1
+
         req = PresetDeployRequest(
             architecture=arch,
             model_name=model_in.name,
@@ -1011,12 +1027,10 @@ async def create_model_route(
             pipeline_parallel_size=int(
                 topology.get("pipeline_parallel_size") or 2
             ),
-            tensor_parallel_size=max(
-                1,
-                len(model_in.gpu_selector.gpu_ids or [])
-                if model_in.gpu_selector
-                else 1,
+            gpu_ids=(
+                list(_sel.gpu_ids) if _sel and _sel.gpu_ids else None
             ),
+            tensor_parallel_size=_tp,
         )
         plan = await deploy_preset(session=session, ctx=ctx, req=req)
         created = getattr(plan, "created_models", None) or []

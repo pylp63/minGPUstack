@@ -1,8 +1,9 @@
 """构建期 patch: 节点页面 (workers chunk) 增强注入 (二开).
 
 1. SSH 终端: 操作下拉加「SSH 终端」项 -> 新窗口打开 /console/ssh_terminal.html?id=<wid>
-2. CPU/GPU 服务器区分: 名称列 render 里按 status.gpu_devices 数量加徽标
-   (GPU 服务器 N 卡 / CPU 服务器)
+2. 部署形态徽标: 名称列 + 独立「部署形态」列, 按 worker 注册时打的
+   gpustack.io/node-kind 标签显示 K8s Pod / 容器 / BMS 裸金属 (三色区分),
+   并保留 GPU/CPU 服务器信息 (GPU 服务器 N 卡 / CPU 服务器)
 
 用法: UI_DIR=<pkg>/ui python3 inject_workers_page.py
 """
@@ -95,19 +96,27 @@ print("SSH open-terminal branch injected into handleSelect")
 NAME_ANCHOR = 'children:(0,ae.jsx)("span",{className:"name-text",children:e})}),h(n)]})}'
 na = t.find(NAME_ANCHOR)
 if na == -1:
-    print("!! name render anchor not found (GPU/CPU badge skip)")
+    print("!! name render anchor not found (node-kind badge skip)")
 else:
+    # 名称列徽标 (v2): 部署形态 (k8s-pod/container/bms) + GPU/CPU 卡数。
+    # 与「部署形态」列同一标签来源; 老节点无标签时不显示形态徽标
+    # (只显示 GPU/CPU), 避免误标。
     BADGE = (
         'children:(0,ae.jsx)("span",{className:"name-text",children:e})}),h(n),'
         '(function(){var g=((n&&n.status)||{}).gpu_devices||[];'
+        'var kind=((n||{}).labels||{})["gpustack.io/node-kind"];'
+        'var kc={'
+        '"k8s-pod":["K8s Pod","#722ed1","rgba(114,46,209,.10)"],'
+        '"container":["容器","#08979c","rgba(8,151,156,.10)"],'
+        '"bms":["BMS","#d46b08","rgba(212,107,8,.10)"]}[kind];'
         'return (0,ae.jsx)("span",{style:{marginLeft:8,fontSize:11,'
-        'padding:"1px 6px",borderRadius:4,'
-        'color:g.length?"#4f8cff":"#9aa0a6",'
-        'background:g.length?"rgba(79,140,255,.12)":"rgba(154,160,166,.12)"},'
-        'children:g.length?("GPU 服务器 · "+g.length+" 卡"):"CPU 服务器"})})()]})}'
+        'padding:"1px 6px",borderRadius:4,whiteSpace:"nowrap",'
+        'color:kc?kc[1]:(g.length?"#4f8cff":"#9aa0a6"),'
+        'background:kc?kc[2]:(g.length?"rgba(79,140,255,.12)":"rgba(154,160,166,.12)")},'
+        'children:kc?kc[0]:(g.length?("GPU 服务器 · "+g.length+" 卡"):"CPU 服务器")})})()]})}'
     )
     t = t[:na] + BADGE + t[na + len(NAME_ANCHOR):]
-    print("CPU/GPU badge injected into name column")
+    print("node-kind badge injected into name column")
 
 # ============================================================
 # 4. CPU/GPU 服务器分类列: 插在 IP 列之前 (名称/标签/集群之后)。
@@ -141,18 +150,109 @@ if t.count(IP_ANCHOR) != 1:
     print("!! IP anchor not unique:", t.count(IP_ANCHOR))
     sys.exit(1)
 ip = t.find(IP_ANCHOR)
+# 二开: 部署形态列 — agent 承载方式 (worker 注册时自动打
+# gpustack.io/node-kind 标签: k8s-pod / container / bms):
+#   k8s-pod  K8S Pod        (紫)  — agent 跑在 K8S 集群 Pod 里
+#   container 宿主容器      (青)  — docker/compose 起的容器
+#   bms      BMS 裸金属     (橙)  — agent 直接跑物理机/虚机 OS
+# 老节点 (无标签) fallback 到 container 判定 (GPUDocker 部署的存量节点),
+# 再 fallback 未知 — 不误标 BMS。
+# 徽标第二行保留 GPU/CPU 信息 (GPU 服务器·N 卡 / CPU 服务器)。
 TYPE_COL = (
-    '{title:"类型",dataIndex:"__type_col__",minWidth:110,'
-    'render:function(e,n){var g=((n&&n.status)||{}).gpu_devices||[];'
-    'return (0,ae.jsx)("span",{style:{display:"inline-flex",alignItems:"center",'
-    'padding:"1px 8px",borderRadius:4,fontSize:12,'
-    'color:g.length?"#4f8cff":"#9aa0a6",'
-    'background:g.length?"rgba(79,140,255,.12)":"rgba(154,160,166,.12)",'
+    '{title:"部署形态",dataIndex:"__type_col__",minWidth:150,'
+    'render:function(e,n){'
+    'var g=((n&&n.status)||{}).gpu_devices||[];'
+    'var lb=(n&&n.labels)||{};'
+    'var kind=lb["gpustack.io/node-kind"];'
+    'if(!kind){'
+    # 容器证据 (与 worker 侧判定同源, 老节点兜底): .dockerenv 在 UI 里
+    # 不可探 — 用 filesystem.mount_from=overlay 推断 (GPUDocker 部署特征)
+    'var fs=((n&&n.status)||{}).filesystem||[];'
+    'var mnt=(fs[0]||{}).mount_from||"";'
+    'kind=mnt==="overlay"?"container":"unknown";}'
+    'var cfg={'
+    '"k8s-pod":{t:"K8s Pod",c:"#722ed1",bg:"rgba(114,46,209,.10)"},'
+    '"container":{t:"容器",c:"#08979c",bg:"rgba(8,151,156,.10)"},'
+    '"bms":{t:"BMS 裸金属",c:"#d46b08",bg:"rgba(212,107,8,.10)"}}[kind]'
+    '||{t:"未知",c:"#9aa0a6",bg:"rgba(154,160,166,.12)"};'
+    'return (0,ae.jsx)("div",{style:{display:"flex",flexDirection:"column",gap:2},children:['
+    '(0,ae.jsx)("span",{style:{display:"inline-flex",alignItems:"center",'
+    'padding:"1px 8px",borderRadius:4,fontSize:12,whiteSpace:"nowrap",'
+    'width:"fit-content",'
+    'color:cfg.c,background:cfg.bg,'
+    'children:cfg.t}}),'
+    '(0,ae.jsx)("span",{style:{fontSize:11,color:g.length?"#4f8cff":"#9aa0a6",'
     'whiteSpace:"nowrap"},'
-    'children:g.length?("GPU 服务器 · "+g.length+" 卡"):"CPU 服务器"})}},'
+    'children:g.length?("GPU 服务器 · "+g.length+" 卡"):"CPU 服务器"})]})}},'
 )
 t = t[:ip] + TYPE_COL + t[ip:]
-print("CPU/GPU type column injected before IP column")
+print("node-kind column injected before IP column")
+
+# ============================================================
+# 5. IP 手动覆盖: 编辑弹窗加「IP 地址」输入框。
+#    背景: worker 自动探测 IP 在多网卡/代理网卡环境会选错 (如 fake-IP
+#    DNS 代理的 Meta 网卡 198.18.x.x)。管理员手动指定后写入
+#    labels["gpustack.io/ip-override"], 后端 update_worker 拦截:
+#    覆盖 ip/advertise_address 且心跳/重注册不再冲掉 (三处保护)。
+#    四个锚点 (构建期 fail-fast):
+#      a. 编辑弹窗 initialValues 加 ip (回显现有 IP)
+#      b. labels 字段后插 IP 输入框
+#      c. ve (onOk) 提交时把 ip 值塞进 labels 覆写键
+#      d. Ae 的 data prop 加 ip
+# ============================================================
+INIT_VALUES_OLD = 'initialValues:{name:a.name,labels:a.labels},children:['
+INIT_VALUES_NEW = (
+    'initialValues:{name:a.name,labels:a.labels,'
+    # 回显: 优先覆写标签值 (手动指定过的), 否则当前探测 ip
+    'ip:((a.labels||{})["gpustack.io/ip-override"])||a.ip},children:['
+)
+LABELS_ITEM_END_OLD = (
+    'children:(0,ae.jsx)(be.Z,{label:i.formatMessage({id:"resources.table.labels"}),'
+    'btnText:i.formatMessage({id:"common.button.addLabel"})})})]})})}),'
+)
+IP_FIELD = (
+    # 原 labels item 的 children 段原样保留 (被替换原文的开头),
+    # 其后插入 IP 输入框 item; allowClear 清空 = 解除覆盖 (心跳探测值恢复写回)
+    'children:(0,ae.jsx)(be.Z,{label:i.formatMessage({id:"resources.table.labels"}),'
+    'btnText:i.formatMessage({id:"common.button.addLabel"})})}),'
+    '(0,ae.jsx)(ye.Z.Item,{name:"ip",children:(0,ae.jsx)(xe.Z.Input,{'
+    'label:"IP 地址",placeholder:"自动探测 (留空恢复)",allowClear:!0,'
+    'description:"手动指定后以该 IP 为准, 心跳不再用探测值覆盖; 清空恢复自动探测"})})'
+    ']})})}),'
+)
+VE_SUBMIT_OLD = (
+    'e.next=3,(0,S.Vq)(W.data.id,i()(i()({},W.data),{},{labels:n.labels}));'
+)
+VE_SUBMIT_NEW = (
+    # 表单 ip 值 -> labels 覆写键 (后端 update_worker 拦截生效);
+    # 清空时移除键 (解除覆盖)。其余字段原样透传。
+    'e.next=3,(function(){var lv=i()(i()({},n.labels||{}),{},'
+    '{name:W.data.name});'
+    'var ipov=(n.ip||"").trim();'
+    'if(ipov){lv["gpustack.io/ip-override"]=ipov}'
+    'else{delete lv["gpustack.io/ip-override"]}'
+    'return (0,S.Vq)(W.data.id,i()(i()({},W.data),{},{labels:lv}))})();'
+)
+AE_DATA_OLD = 'data:{name:W.data.name,labels:W.data.labels}})'
+AE_DATA_NEW = (
+    'data:{name:W.data.name,labels:W.data.labels,'
+    'ip:((W.data.labels||{})["gpustack.io/ip-override"])||W.data.ip}})'
+)
+_ok = True
+for _n, _old, _new in (
+    ("edit initialValues", INIT_VALUES_OLD, INIT_VALUES_NEW),
+    ("edit ip field", LABELS_ITEM_END_OLD, IP_FIELD),
+    ("ve submit", VE_SUBMIT_OLD, VE_SUBMIT_NEW),
+    ("Ae data prop", AE_DATA_OLD, AE_DATA_NEW),
+):
+    if _old not in t:
+        print("!! anchor missing: " + _n)
+        _ok = False
+    else:
+        t = t.replace(_old, _new, 1)
+        print("edit-modal " + _n + " patched")
+if not _ok:
+    sys.exit(1)
 
 if t == orig:
     print("!! no-op")

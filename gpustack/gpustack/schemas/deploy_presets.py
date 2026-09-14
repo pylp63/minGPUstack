@@ -90,6 +90,9 @@ class PresetDeployRequest(BaseModel):
     # 流水线并行: N 节点 N stage, 每 stage TP
     pipeline_parallel_size: int = Field(default=1, ge=1, le=64)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
+    # PP 手动选卡 (来自表单 GPU 选择器): 跨节点 GPU id 列表, 长度 = PP×TP。
+    # 留空 = 自动调度 (调度器跨节点聚合 N*tp 张卡)。
+    gpu_ids: Optional[List[str]] = None
     backend_parameters: Optional[List[str]] = None
     env: Optional[Dict[str, str]] = None
     cluster_id: Optional[int] = None
@@ -259,7 +262,7 @@ def _engine_role_parameters(
       这里只补角色差异项, 同名 flag 不覆盖用户值.
     """
     if not kv_transfer:
-        return []
+        return [], []
     b = (backend or "vllm").lower()
     if b == "sglang":
         from gpustack.utils.command import find_parameter
@@ -419,7 +422,11 @@ def build_preset_payloads(req: PresetDeployRequest) -> PresetDeployPlan:
                             f"{role} rank{i} 需要 {pp_size} 个节点, "
                             f"实际 {len(nodes)}: {nodes}"
                         )
-                    # gpu_ids: 每节点取 gpu_count 张卡 (worker_name:cuda:idx)
+                    # gpu_ids: 每节点取 gpu_count 张卡 (worker_name:cuda:idx);
+                    # gpus_per_replica 必须是跨节点总卡数 = gpu_count×pp —
+                    # 调度器按它做总预算分配 (base_candidate_selector
+                    # ._set_gpu_count), 写单节点数会让 world_size 校验
+                    # (TP×PP vs 选卡数) 失败。
                     gpu_ids = []
                     for w in nodes:
                         gpu_ids += [
@@ -432,7 +439,7 @@ def build_preset_payloads(req: PresetDeployRequest) -> PresetDeployPlan:
                     )
                     p["gpu_selector"] = {
                         "gpu_ids": gpu_ids,
-                        "gpus_per_replica": gpu_count,
+                        "gpus_per_replica": gpu_count * pp_size,
                     }
                     r_flags = list(flags)
                     if pp_size > 1:
@@ -510,6 +517,36 @@ def build_preset_payloads(req: PresetDeployRequest) -> PresetDeployPlan:
             req, replicas=1,
             distributed_inference_across_workers=True,
         )
+        # 手动选卡: 表单 GPU 选择器的跨节点 GPU 列表 + 每副本 GPU 数量
+        # (gpus_per_replica 语义 = 跨节点总卡数, 见 base_candidate_selector
+        # ._set_gpu_count — 主+从 worker 按该预算分配; 引擎侧
+        # cal_distributed_parallelism_arguments 按 每节点卡数=TP、节点数=PP 拆)。
+        # 校验: 总卡数必须 = PP×TP 且恰好分布在 n 个不同节点上。
+        if req.gpu_ids:
+            if len(req.gpu_ids) != n * tp:
+                raise ValueError(
+                    f"选卡数 ({len(req.gpu_ids)}) 与 PP×TP ({n}×{tp}={n*tp}) "
+                    f"不匹配, 请调整「每副本 GPU 数量 (总卡数)」为 {n*tp}"
+                )
+            by_worker = {}
+            for gid in req.gpu_ids:
+                w = gid.split(":")[0]
+                by_worker.setdefault(w, []).append(gid)
+            if len(by_worker) != n:
+                raise ValueError(
+                    f"选卡跨越 {len(by_worker)} 个节点, 与流水线并行度 "
+                    f"PP={n} 不匹配 (PP 模式每个 stage 恰好一个节点)"
+                )
+            if any(len(v) != tp for v in by_worker.values()):
+                raise ValueError(
+                    f"各节点选卡数不等 (TP={tp} 要求每节点恰好 {tp} 张); "
+                    f"实际: "
+                    + ", ".join(f"{w}={len(v)}" for w, v in by_worker.items())
+                )
+            payload["gpu_selector"] = {
+                "gpu_ids": list(req.gpu_ids),
+                "gpus_per_replica": n * tp,
+            }
         flags = [f"--pipeline-parallel-size={n}"]
         if tp > 1:
             flags.append(f"--tensor-parallel-size={tp}")

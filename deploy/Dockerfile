@@ -17,7 +17,7 @@ FROM ${BASE_REGISTRY}/python:3.11-slim AS base
 # patch 链的字面锚点就漂移 (构建不可复现). 钉到当前验证过的版本;
 # 升级 UI 时先本地验证 patch 链再更新此 SHA256.
 ARG UI_TARBALL_URL="https://gpustack-ui-1303613262.cos.accelerate.myqcloud.com/releases/latest.tar.gz"
-ARG UI_TARBALL_SHA256="1d96b483d91f4743eb22ff035752270e6036e781ce14aca1e493449ffb88d9bc"
+ARG UI_TARBALL_SHA256="7cdbfd66a2c5548d6f8786a05228acb14242afcca150a3b68741beec2e99665c"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -86,13 +86,14 @@ RUN cd / && PKG_UI="$(/opt/venv/bin/python -c 'import gpustack,os;print(os.path.
 
 # 二开: 修补编译后的 UI — 删除计费菜单/页面/计量 tab (含 .gz 重生成),
 # 组织页替换为控制台跳转, 全部固化进镜像
-COPY deploy/patch_ui_dist.py deploy/purge_billing_locale.py deploy/inject_deploy_arch.py deploy/inject_workers_page.py deploy/inject_backends_images.py deploy/rehash_umi_entry.py /tmp/
+COPY deploy/patch_ui_dist.py deploy/purge_billing_locale.py deploy/inject_deploy_arch.py deploy/inject_workers_page.py deploy/inject_backends_images.py deploy/rebrand_mingpustack.py deploy/rehash_umi_entry.py /tmp/
 RUN cd / && PKG_UI="$(/opt/venv/bin/python -c 'import gpustack,os;print(os.path.join(os.path.dirname(gpustack.__file__),"ui"))')" \
     && UI_DIR="$PKG_UI" python3 /tmp/patch_ui_dist.py \
     && UI_DIR="$PKG_UI" python3 /tmp/purge_billing_locale.py \
     && UI_DIR="$PKG_UI" python3 /tmp/inject_deploy_arch.py \
     && UI_DIR="$PKG_UI" python3 /tmp/inject_workers_page.py \
     && UI_DIR="$PKG_UI" python3 /tmp/inject_backends_images.py \
+    && UI_DIR="$PKG_UI" python3 /tmp/rebrand_mingpustack.py \
     && UI_DIR="$PKG_UI" python3 /tmp/rehash_umi_entry.py
 
 # 下载后端工具 (gguf-parser / fastfetch). 官方源走 GitHub, 国内网络
