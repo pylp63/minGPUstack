@@ -152,16 +152,15 @@ ADV_GROUP = (
     'n.setFieldValue("backend_parameters",[]);'
     'n.setFieldValue("distributed_inference_across_workers",v==="pipeline_parallel");'
     'if(v==="pd_disaggregated"){'
-    # 二开: PD 分离默认预填引擎互连参数 (SGLang 官方 PD 语法), 用户可在
-    # 后端参数框里直接改; 切走拓扑时清空 (上面 setFieldValue([]))。
-    # 注意 --disaggregation-mode 不预填 — 它按角色变化 (P=prefill /
-    # D=decode), 由后端展开时自动生成, 前端写死任一值都会误导;
-    # 框里只放通用互连项: KV bootstrap 地址 + 传输后端 + 服务端口。
-    'var bk=(n.getFieldValue("backend")||"").toLowerCase();'
-    'var pre=[];'
-    'if(bk==="sglang"){'
-    'pre=["--disaggregation-bootstrap-server=localhost:8555",'
-    '"--disaggregation-transfer-backend=mooncake",'
+        # 二开: PD 分离默认预填引擎互连参数, 用户可在后端参数框里直接改。
+        # 注意 --disaggregation-mode 与 --disaggregation-bootstrap-server 不预填:
+        # 前者按角色变化 (P=prefill / D=decode), 后者是内部互连地址 (P 侧自己起
+        # bootstrap server, 由后端 _engine_role_parameters 自动补 localhost8555,
+        # 不暴露给用户)。框里只放真正需要用户感知的: 传输后端 + 服务端口。
+        'var bk=(n.getFieldValue("backend")||"").toLowerCase();'
+        'var pre=[];'
+        'if(bk==="sglang"){'
+    'pre=["--disaggregation-transfer-backend=mooncake",'
     '"--port=30000"]}'
     'if(pre.length){n.setFieldValue("backend_parameters",pre)}'
     'if(n.getFieldValue("prefill_groups")===undefined){n.setFieldValue("prefill_groups",1)}'
