@@ -2,7 +2,9 @@
 /* 构建前预检: 提取 inject_deploy_arch.py 的全部注入片段 (ADV_GROUP /
    RANK_BOXES / PD_SWITCH / WORKER_FETCH), 包进官方上下文做语法检查。 */
 const fs = require('fs');
-const t = fs.readFileSync('/mnt/gpustack/deploy/inject_deploy_arch.py', 'utf8');
+const path = require('path');
+const DEPLOY_DIR = path.dirname(__filename);
+const t = fs.readFileSync(path.join(DEPLOY_DIR, 'inject_deploy_arch.py'), 'utf8');
 
 function extract(name) {
   const m = t.match(new RegExp(name + ' = \\(\\n([\\s\\S]*?)\\n\\)\\n'));
@@ -49,7 +51,7 @@ try {
 
 /* inject_workers_page.py 的 CPU/GPU 类型列片段语法自检 */
 try {
-  const wt = fs.readFileSync('/mnt/gpustack/deploy/inject_workers_page.py', 'utf8');
+  const wt = fs.readFileSync(path.join(DEPLOY_DIR, 'inject_workers_page.py'), 'utf8');
   const m = wt.match(/TYPE_COL = \(\n([\s\S]*?)\n\)/);
   if (!m) { console.error('!! TYPE_COL not found in inject_workers_page.py'); process.exit(1); }
   const parts = [...m[1].matchAll(/'((?:[^'\\]|\\.)*)'/g)].map(x => x[1]);
