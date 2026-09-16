@@ -509,6 +509,69 @@ balance_check(ADV_GROUP, "ADV_GROUP")
 balance_check(WORKER_FETCH.rstrip(","), "WORKER_FETCH")
 balance_check(RANK_BOXES, "RANK_BOXES")
 balance_check(PD_SWITCH, "PD_SWITCH")
+
+# ============================================================
+# 4. YAML 预览 tab: 在「高级」tab 之后新增第 5 个「YAML」tab。
+#    切到该 tab 时, 用当前表单字段构造 PresetDeployRequest, 调
+#    /v2/deploy-presets/plan (dry-run, 无副作用) 拿 plan_yaml,
+#    直接写入 DOM 容器显示 (不依赖 React 重渲染, 避免 hooks 注入复杂)。
+#    缓存: window.__yamlCache 按 body 序列化 key 去重, 避免重复请求。
+# ============================================================
+YAML_TAB_ANCH = (
+    '{key:jt,label:de.formatMessage({id:"resources.form.advanced"}),'
+    'forceRender:!0,children:(0,D.jsx)(ne,{})}'
+)
+yi = t.find(YAML_TAB_ANCH)
+if yi == -1:
+    print("!! YAML tab anchor not found")
+    sys.exit(1)
+YAML_TAB = (
+    ',{key:"__yaml__",label:"YAML",forceRender:!0,children:'
+    '(0,D.jsx)(k.Z.Item,{noStyle:!0,shouldUpdate:function(){return !0},'
+    'children:function(fv){'
+    'var vals=fv.getFieldsValue(true)||{};'
+    'var topo=vals.serving_topology||"standalone";'
+    # standalone 无拓扑计划 — 显示提示
+    'if(!topo||topo==="standalone"){'
+    'return (0,D.jsx)("div",{id:"__yaml_out__",style:{padding:"16px 0",color:"var(--ant-color-text-secondary)",fontSize:12},'
+    'children:"单机部署不生成拓扑计划。选择「PD 分离」或「流水线并行」后, 此 Tab 显示展开的完整部署计划 (角色/副本/GPU/环境变量/启动参数)。"})}'
+    # 有拓扑: 构造 body
+    'var gs=vals.gpu_selector||{};'
+    'var body={architecture:topo,'
+    '"model_name":vals.name||"",'
+    '"model_source":vals.huggingface_repo_id||vals.model_scope_model_id||vals.local_path||vals.name||"",'
+    '"model_source_kind":vals.source||undefined,'
+    '"backend":vals.backend||undefined,'
+    '"backend_parameters":vals.backend_parameters||undefined,'
+    '"env":vals.env||undefined,'
+    '"prefill_gpu_count":vals.prefill_gpu_count||1,'
+    '"decode_gpu_count":vals.decode_gpu_count||1,'
+    '"prefill_groups":vals.prefill_groups||1,'
+    '"decode_groups":vals.decode_groups||1,'
+    '"pd_pipeline_size":vals.pd_pipeline_size||1,'
+    '"pd_node_assign":vals.pd_node_assign||undefined,'
+    '"pipeline_parallel_size":vals.pipeline_parallel_size||2,'
+    '"gpu_ids":gs.gpu_ids||undefined,'
+    '"tensor_parallel_size":gs.gpus_per_replica||(gs.gpu_ids?gs.gpu_ids.length:1)};'
+    # 缓存 + fetch (完成后直接写 DOM, 不依赖 React 重渲染)
+    'var key=JSON.stringify(body);'
+    '(function(b,k,out){'
+    'if(window.__yamlCache&&window.__yamlCache.k===k){'
+    'var o=document.getElementById(out);if(o){o.style.whiteSpace="pre-wrap";o.style.fontFamily="monospace";o.style.fontSize="12px";o.textContent=window.__yamlCache.yaml}'
+    'return}'
+    'fetch("/v2/deploy-presets/plan",{method:"POST",credentials:"include",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})'
+    '.then(function(r){return r.json()})'
+    '.then(function(d){var y=d.plan_yaml||"(后端未返回 plan_yaml)\";'
+    'window.__yamlCache={key:k,yaml:y};'
+    'var o=document.getElementById(out);if(o){o.textContent=y;o.style.whiteSpace="pre-wrap";o.style.fontFamily="monospace";o.style.fontSize="12px";o.style.lineHeight="18px"}})'
+    '.catch(function(){var o=document.getElementById(out);if(o){o.textContent="生成失败, 请检查后端服务或表单字段"}})}'
+    ')(body,key,"__yaml_out__");'
+    'return (0,D.jsx)("div",{id:"__yaml_out__",style:{padding:"16px 0",fontSize:12,lineHeight:"18px",fontFamily:"monospace",whiteSpace:"pre-wrap",maxHeight:600,overflow:"auto"},'
+    'children:"正在生成部署计划..."})'
+    '}})}'
+)
+t = t[:yi + len(YAML_TAB_ANCH)] + YAML_TAB + t[yi + len(YAML_TAB_ANCH):]
+print("YAML preview tab injected")
 try:
     import subprocess
     import tempfile
