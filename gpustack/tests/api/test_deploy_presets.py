@@ -171,6 +171,34 @@ def test_pd_node_assign_multi_rank_multi_node_pp():
     assert d1["gpu_selector"]["gpu_ids"] == ["n7:cuda:0", "n8:cuda:0"]
 
 
+def test_pd_bootstrap_server_only_on_prefill_rank0():
+    """SGLang PD: KV bootstrap server 只由 prefill rank0 起 (地址=P0 节点),
+    其余 prefill rank 与所有 decode rank 都不带 --disaggregation-bootstrap-server。"""
+    plan = _preset_plan(
+        DeploymentArchitectureEnum.PD_DISAGGREGATED,
+        backend="sglang", kv_transfer=True,
+        prefill_groups=3, decode_groups=2,
+        prefill_gpu_count=1, decode_gpu_count=1,
+        pd_node_assign={
+            "prefill": [["p0-node"], ["p1-node"], ["p2-node"]],
+            "decode": [["d0-node"], ["d1-node"]],
+        },
+    )
+    by_name = {p["name"]: p for p in plan.payloads}
+    # prefill rank0: 有 bootstrap, 地址是 P0 节点名
+    p0 = by_name["testmodel-prefill-0"]
+    assert "--disaggregation-bootstrap-server=p0-node:8555" in _flat_params(p0)
+    # prefill rank1/rank2: 不带 bootstrap
+    for nm in ("testmodel-prefill-1", "testmodel-prefill-2"):
+        assert "--disaggregation-bootstrap-server" not in _flat_params(by_name[nm])
+    # decode 全都不带
+    for nm in ("testmodel-decode-0", "testmodel-decode-1"):
+        assert "--disaggregation-bootstrap-server" not in _flat_params(by_name[nm])
+    # mode 仍各自正确
+    assert "--disaggregation-mode=prefill" in _flat_params(p0)
+    assert "--disaggregation-mode=decode" in _flat_params(by_name["testmodel-decode-0"])
+
+
 def test_pd_node_assign_rejects_incomplete():
     """防浪费: rank 节点数 != PP 或缺节点 -> 直接 ValueError (UI 同步红字)."""
     with pytest.raises(ValueError, match="未指定节点"):

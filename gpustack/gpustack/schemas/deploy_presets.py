@@ -241,6 +241,8 @@ def _kv_flags(req: PresetDeployRequest, role: str) -> List[str]:
 def _engine_role_parameters(
     backend: Optional[str], role: str, kv_transfer: bool,
     user_params: Optional[List[str]] = None,
+    prefill_rank: int = 0,
+    bootstrap_host: Optional[str] = None,
 ) -> tuple:
     """返回 (flags, strip_names): flags = 该角色的互连参数;
     strip_names = 用户预填参数里该角色必须剔除的 flag 名 (如 decode 侧
@@ -255,11 +257,12 @@ def _engine_role_parameters(
 
     - vLLM (默认): --kv-transfer-config (kv_producer / kv_consumer)
     - SGLang (官方 PD 语法, 二开补全):
-        P: --disaggregation-mode=prefill --disaggregation-bootstrap-server
+        P: --disaggregation-mode=prefill
+           (仅 rank0) --disaggregation-bootstrap-server=<P0地址>:8555
         D: --disaggregation-mode=decode
-      KV bootstrap 端口 (默认 8555) 与传输后端 (默认 mooncake) 尊重
-      用户在后端参数框里的预填值 — 前端 PD 预填的通用参数在框里,
-      这里只补角色差异项, 同名 flag 不覆盖用户值.
+      KV bootstrap server 由 prefill rank0 起 (全拓扑唯一), 其余 P rank
+      与所有 D rank 都不带 bootstrap-server — 多 P 多 D 时只有 rank0 是
+      bootstrap 源, 其它实例自动发现它.
     """
     if not kv_transfer:
         return [], []
@@ -271,15 +274,21 @@ def _engine_role_parameters(
         mode = "prefill" if role == "prefill" else "decode"
         flags = [f"--disaggregation-mode={mode}"]
         strip = []
-        if role == "prefill":
-            # P 侧起 KV bootstrap server (D/router 连它); 用户改过端口则用用户的
+        if role == "prefill" and prefill_rank == 0:
+            # 只 prefill rank0 起 KV bootstrap server (其它 rank/D 连它).
+            # 地址: 优先 bootstrap_host (有节点分配时=P0 实际节点), 否则
+            # 用户预填, 再否则单机 fallback localhost:8555.
             has_boot = find_parameter(user_params, ["disaggregation-bootstrap-server"])
             if has_boot is None:
-                flags.append("--disaggregation-bootstrap-server=localhost:8555")
-        else:
-            # decode 侧: 剔除用户预填里的 bootstrap-server (那是 P 的)
+                host = bootstrap_host or "localhost"
+                flags.append(f"--disaggregation-bootstrap-server={host}:8555")
+        elif role == "prefill":
+            # 非 rank0 prefill: 不起 bootstrap, 也剔除任何误填
             strip.append("disaggregation-bootstrap-server")
-        # 传输后端: 用户预填的保留, 没有则默认 mooncake (PD 必需)
+        else:
+            # decode 侧: 剔除 (bootstrap 是 P 的)
+            strip.append("disaggregation-bootstrap-server")
+        # 传输后端: 用户预填保留, 没有则默认 mooncake (PD 必需)
         has_tb = find_parameter(user_params, ["disaggregation-transfer-backend"])
         if has_tb is None:
             flags.append("--disaggregation-transfer-backend=mooncake")
@@ -370,8 +379,12 @@ def build_preset_payloads(req: PresetDeployRequest) -> PresetDeployPlan:
 
     # ---------------- PD 分离 (组数>1 = 多 P 多 D) ----------------
     if arch == DeploymentArchitectureEnum.PD_DISAGGREGATED:
+        # 框架参数: mode + transfer-backend (bootstrap 不在此算 — 它按
+        # prefill rank0 单独生成, 见下面两条路径; 这里传 prefill_rank=1
+        # 让函数不再对"整组 prefill"注入 bootstrap, 避免非 rank0 误带)
         _pf, _p_strip = _engine_role_parameters(
-            req.backend, "prefill", req.kv_transfer, req.backend_parameters)
+            req.backend, "prefill", req.kv_transfer, req.backend_parameters,
+            prefill_rank=1)
         _df, _d_strip = _engine_role_parameters(
             req.backend, "decode", req.kv_transfer, req.backend_parameters)
         p_flags = [f"--tensor-parallel-size={req.prefill_gpu_count}"] + _pf
@@ -442,6 +455,14 @@ def build_preset_payloads(req: PresetDeployRequest) -> PresetDeployPlan:
                         "gpus_per_replica": gpu_count * pp_size,
                     }
                     r_flags = list(flags)
+                    # 二开: SGLang PD 的 KV bootstrap server 只由 prefill
+                    # rank0 起 (全拓扑唯一), 其余 P rank 与所有 D rank 都不带
+                    # --disaggregation-bootstrap-server (它们自动发现 rank0)。
+                    # 地址用 rank0 首个节点名 (集群内可解析); 单机时即本节点。
+                    if role == "prefill" and i == 0 and req.kv_transfer:
+                        r_flags.append(
+                            f"--disaggregation-bootstrap-server={nodes[0]}:8555"
+                        )
                     if pp_size > 1:
                         # 跨节点 PP: 分布式推理 + PP 参数
                         p["distributed_inference_across_workers"] = True
@@ -468,13 +489,19 @@ def build_preset_payloads(req: PresetDeployRequest) -> PresetDeployPlan:
                     ))
             return _finalize(arch.value, roles, payloads)
         # ---- 无节点分配: 原自动调度路径 ----
-        # 组数即副本数: prefill_groups/decode_groups (合并进来的多 P 多 D)
+        # 组数即副本数: prefill_groups/decode_groups (合并进来的多 P 多 D)。
+        # 二开: 自动调度下副本无 rank 顺序, P 组以单副本互连为底 —
+        # prefill 补 localhost bootstrap (单 PD 成立; 多 P 各副本独立起
+        # 自己那份, 依赖 model-route 聚合, 与历史行为一致)。
+        _auto_p_flags = list(p_flags)
+        if req.kv_transfer and (req.backend or "").lower() == "sglang":
+            _auto_p_flags.append("--disaggregation-bootstrap-server=localhost:8555")
         p_payload = _base_payload(
             req, name=f"{req.model_name}-prefill",
             replicas=req.prefill_groups,
         )
         _strip_role_params(p_payload, _p_strip)
-        _merge_backend_parameters(p_payload, p_flags)
+        _merge_backend_parameters(p_payload, _auto_p_flags)
         d_payload = _base_payload(
             req, name=f"{req.model_name}-decode",
             replicas=req.decode_groups,
