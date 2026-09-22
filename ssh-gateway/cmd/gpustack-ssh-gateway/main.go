@@ -13,10 +13,10 @@
 //     密码改为高强度随机密码。
 //
 // 安全设计:
-//  - ticket 一次性 + 短时效, 防重放
-//  - 凭据仅存内存 + 0600 状态文件 (容器卷内, 重启恢复); 密码经 stdin 传给
-//    chpasswd / 只用于 crypto/ssh 认证, 不进命令行参数与日志
-//  - 网关只监听 127.0.0.1, 必须经 GPUStack 主服务 (登录态) 才能触达
+//   - ticket 一次性 + 短时效, 防重放
+//   - 凭据仅存内存 + 0600 状态文件 (容器卷内, 重启恢复); 密码经 stdin 传给
+//     chpasswd / 只用于 crypto/ssh 认证, 不进命令行参数与日志
+//   - 网关只监听 127.0.0.1, 必须经 GPUStack 主服务 (登录态) 才能触达
 package main
 
 import (
@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -94,6 +95,7 @@ var loadCfg = loadConfig()
 type Ticket struct {
 	WorkerID uint
 	IP       string
+	User     string // 多凭据时前端选择的用户名 (空 = 默认第一套)
 	Expires  time.Time
 }
 
@@ -106,19 +108,20 @@ func NewTicketStore() *TicketStore {
 	return &TicketStore{byToken: map[string]*Ticket{}}
 }
 
-func (s *TicketStore) Issue(workerID uint, ip string) string {
+func (s *TicketStore) Issue(workerID uint, ip string, user string) string {
 	b := make([]byte, 32)
 	_, _ = rand.Read(b)
 	tok := fmt.Sprintf("%x", b)
 	s.mu.Lock()
-	s.byToken[tok] = &Ticket{WorkerID: workerID, IP: ip, Expires: time.Now().Add(loadCfg.TicketTTL)}
+	s.byToken[tok] = &Ticket{WorkerID: workerID, IP: ip, User: user,
+		Expires: time.Now().Add(loadCfg.TicketTTL)}
 	s.mu.Unlock()
 	go s.sweep()
 	return tok
 }
 
 // Consume 消费 ticket — 一次性 (成功即删)。
-func (s *TicketStore) Consume(tok string) (uint, string, bool) {
+func (s *TicketStore) Consume(tok string) (uint, string, string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.byToken[tok]
@@ -126,10 +129,10 @@ func (s *TicketStore) Consume(tok string) (uint, string, bool) {
 		if ok {
 			delete(s.byToken, tok)
 		}
-		return 0, "", false
+		return 0, "", "", false
 	}
 	delete(s.byToken, tok)
-	return t.WorkerID, t.IP, true
+	return t.WorkerID, t.IP, t.User, true
 }
 
 func (s *TicketStore) sweep() {
@@ -149,11 +152,14 @@ var tickets = NewTicketStore()
 
 // nodeCred — 每节点 SSH 凭据 (弹窗录入 / 轮换写入)。
 // 旧状态文件 (只有 ip/pw) 可兼容反序列化: User/Port 为零值时回落默认。
+// HostKey: 首次连接时记录的服务器指纹 (base64)。重装系统后指纹变化,
+// 连接时报 host_key_changed, 前端提示用户确认 (删除旧记录重新验证)。
 type nodeCred struct {
 	IP        string `json:"ip"`
 	User      string `json:"user"`
 	Pw        string `json:"pw"`
 	Port      int    `json:"port"`
+	HostKey   string `json:"host_key,omitempty"`
 	RotatedAt string `json:"rotated_at,omitempty"`
 }
 
@@ -172,27 +178,70 @@ func (c *nodeCred) port() int {
 }
 
 type CredState struct {
-	mu   sync.RWMutex
-	creds map[uint]nodeCred
+	mu    sync.RWMutex
+	creds map[uint][]nodeCred // 每节点可存多套凭据 (第一套 = 默认/上次用的)
 }
 
-var credState = &CredState{creds: map[uint]nodeCred{}}
+var credState = &CredState{creds: map[uint][]nodeCred{}}
 
 func getCred(workerID uint) *nodeCred {
+	l := listCreds(workerID)
+	if len(l) == 0 {
+		return nil
+	}
+	return &l[0]
+}
+
+// listCreds — 该节点全部凭据 (默认在首位)。前端选择窗口用。
+func listCreds(workerID uint) []nodeCred {
 	credState.mu.RLock()
 	defer credState.mu.RUnlock()
-	c, ok := credState.creds[workerID]
+	l, ok := credState.creds[workerID]
 	if !ok {
 		return nil
 	}
+	out := make([]nodeCred, len(l))
+	copy(out, l)
+	return out
+}
+
+// pickCred — 按用户名选凭据 (选择窗口场景)。找不到回退默认第一套。
+func pickCred(workerID uint, user string) *nodeCred {
+	l := listCreds(workerID)
+	if len(l) == 0 {
+		return nil
+	}
+	for i := range l {
+		if user != "" && l[i].User == user {
+			c := l[i]
+			return &c
+		}
+	}
+	c := l[0]
 	return &c
 }
 
+// saveCred — 保存凭据: 同 IP+用户名覆盖, 否则追加; 把目标移到首位 (设为默认)。
 func saveCred(workerID uint, c nodeCred) {
 	credState.mu.Lock()
-	credState.creds[workerID] = c
+	l := credState.creds[workerID]
+	for i := range l {
+		if l[i].User == c.User && l[i].IP == c.IP {
+			// 覆盖已有同用户凭据, 移到首位 (设为默认)
+			c.RotatedAt = l[i].RotatedAt // 保留轮换时间戳
+			rest := append([]nodeCred{c}, l[:i]...)
+			rest = append(rest, l[i+1:]...)
+			credState.creds[workerID] = rest
+			credState.mu.Unlock()
+			poolBumpGen()
+			saveState()
+			return
+		}
+	}
+	// 新用户: 追加到首位
+	credState.creds[workerID] = append([]nodeCred{c}, l...)
 	credState.mu.Unlock()
-	poolBumpGen() // 凭据变了: 池内旧连接全部作废
+	poolBumpGen()
 	saveState()
 }
 
@@ -213,15 +262,35 @@ func genPassword() (string, error) {
 	return string(out), nil
 }
 
+// errHostKeyChanged — 服务器指纹变化 (重装系统等), 前端据此提示确认。
+var errHostKeyChanged = errors.New("host key changed")
+
 // sshDial — 用凭据建立 SSH 连接。
-func sshDial(c *nodeCred) (*ssh.Client, error) {
+// 指纹校验在 KEX 阶段 (HostKeyCallback, 认证之前) 做: 服务器重装后
+// 即使密码也对, 也必须先报 host_key_changed, 而不是连上再比。
+// 首次连接 (c.HostKey 为空): 接受并记录指纹, 随连接返回。
+func sshDial(c *nodeCred) (*ssh.Client, string, error) {
+	var gotKey string
 	cfg := &ssh.ClientConfig{
-		User:            c.user(),
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // 内网节点, 首版不做 known_hosts
-		Auth:            []ssh.AuthMethod{ssh.Password(c.Pw)},
-		Timeout:         10 * time.Second,
+		User: c.user(),
+		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			gotKey = ssh.FingerprintSHA256(key)
+			if c.HostKey != "" && gotKey != c.HostKey {
+				return errHostKeyChanged
+			}
+			return nil
+		},
+		Auth:    []ssh.AuthMethod{ssh.Password(c.Pw)},
+		Timeout: 10 * time.Second,
 	}
-	return ssh.Dial("tcp", net.JoinHostPort(c.IP, fmt.Sprint(c.port())), cfg)
+	cli, err := ssh.Dial("tcp", net.JoinHostPort(c.IP, fmt.Sprint(c.port())), cfg)
+	if err != nil {
+		if errors.Is(err, errHostKeyChanged) {
+			return nil, gotKey, errHostKeyChanged
+		}
+		return nil, "", err
+	}
+	return cli, gotKey, nil
 }
 
 // classifyErr — 连接失败分类: 端口不通 / 认证失败 / 其它。
@@ -230,6 +299,9 @@ func sshDial(c *nodeCred) (*ssh.Client, error) {
 func classifyErr(err error) (code, message string) {
 	if err == nil {
 		return "", ""
+	}
+	if errors.Is(err, errHostKeyChanged) {
+		return "host_key_changed", "服务器指纹已变化 (可能重装系统)"
 	}
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
@@ -248,7 +320,7 @@ func classifyErr(err error) (code, message string) {
 
 // rotateRemotePassword — 用旧密码登录, chpasswd 改新密码 (密码走 stdin, 不进 ps)。
 func rotateRemotePassword(c *nodeCred, newPw string) error {
-	cli, err := sshDial(c)
+	cli, _, err := sshDial(c)
 	if err != nil {
 		return err
 	}
@@ -273,12 +345,38 @@ func rotateLoop(ctx context.Context) {
 		writeRotate(RotateConfig{Enabled: true, Days: rc.Days})
 	}
 }
+
 // saveState / loadState — 0600 状态文件, 重启恢复。
+// 文件是多种 key 的混合体: 数字 workerID key (凭据) + "_global_cred"。
+// saveState 只序列化 creds 会抹掉 _global_cred — 必须先读旧文件、保留
+// 非 workerID key, 再合并写入。
 func saveState() {
 	credState.mu.RLock()
-	data, _ := json.Marshal(credState.creds)
+	credsData, _ := json.Marshal(credState.creds)
 	credState.mu.RUnlock()
-	_ = os.WriteFile(loadCfg.StateFile, data, 0600)
+
+	// 保留旧文件里的非凭据 key (_global_cred 等)
+	preserved := map[string]json.RawMessage{}
+	if old, err := os.ReadFile(loadCfg.StateFile); err == nil {
+		var raw map[string]json.RawMessage
+		if json.Unmarshal(old, &raw) == nil {
+			for k, v := range raw {
+				if k == "_global_cred" {
+					preserved[k] = v
+				}
+			}
+		}
+	}
+	var merged map[string]json.RawMessage
+	if json.Unmarshal(credsData, &merged) == nil {
+		for k, v := range preserved {
+			merged[k] = v
+		}
+		out, _ := json.Marshal(merged)
+		_ = os.WriteFile(loadCfg.StateFile, out, 0600)
+	} else {
+		_ = os.WriteFile(loadCfg.StateFile, credsData, 0600)
+	}
 }
 
 func loadState() {
@@ -286,29 +384,51 @@ func loadState() {
 	if err != nil {
 		return
 	}
-	m := map[uint]nodeCred{}
-	if json.Unmarshal(data, &m) == nil {
-		credState.mu.Lock()
-		credState.creds = m
-		credState.mu.Unlock()
+	// 文件里可能混有 "_global_cred" 等 string key (uint 解析会整体失败),
+	// 先按 string key 拆开, 只把数字 key 的值解析为凭据。
+	raw := map[string]json.RawMessage{}
+	if json.Unmarshal(data, &raw) != nil {
+		return
 	}
+	// 兼容两种凭据值格式:
+	//   旧: {"<wid>": {ip/user/pw/...}}        (单值)
+	//   新: {"<wid>": [{...}, {...}]}          (多凭据 slice)
+	creds := map[uint][]nodeCred{}
+	for k, v := range raw {
+		wid, err := strconv.ParseUint(k, 10, 64)
+		if err != nil {
+			continue // "_global_cred" 等非数字 key
+		}
+		var multi []nodeCred
+		if json.Unmarshal(v, &multi) == nil && len(multi) > 0 {
+			creds[uint(wid)] = multi
+			continue
+		}
+		var single nodeCred
+		if json.Unmarshal(v, &single) == nil && single.Pw != "" {
+			creds[uint(wid)] = []nodeCred{single}
+		}
+	}
+	credState.mu.Lock()
+	credState.creds = creds
+	credState.mu.Unlock()
 }
 
 // ---------- WebSocket 终端 ----------
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin:     func(r *http.Request) bool { return true },
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
 }
 
 // wsMsg — xterm 前端协议 (input/resize/ping) + 网关下行 (pong/error)。
 type wsMsg struct {
-	Type  string `json:"type"`
-	Code  string `json:"code,omitempty"`
-	Data  string `json:"data,omitempty"`
-	Cols  int    `json:"cols,omitempty"`
-	Rows  int    `json:"rows,omitempty"`
+	Type string `json:"type"`
+	Code string `json:"code,omitempty"`
+	Data string `json:"data,omitempty"`
+	Cols int    `json:"cols,omitempty"`
+	Rows int    `json:"rows,omitempty"`
 }
 
 func sendErr(ws *websocket.Conn, code, msg string) {
@@ -319,7 +439,7 @@ func sendErr(ws *websocket.Conn, code, msg string) {
 
 func handleTerminal(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	workerID, host, ok := tickets.Consume(q.Get("ticket"))
+	workerID, host, wantUser, ok := tickets.Consume(q.Get("ticket"))
 	if !ok || host == "" {
 		http.Error(w, "invalid or expired ticket", http.StatusUnauthorized)
 		return
@@ -334,7 +454,9 @@ func handleTerminal(w http.ResponseWriter, r *http.Request) {
 	}
 	defer ws.Close()
 
-	creds := getCred(workerID)
+	// 多凭据: 前端选择窗口传来的用户名 → 从该节点凭据列表里选对应一套;
+	// 未指定 (单凭据/旧前端) 用默认第一套。
+	creds := pickCred(workerID, wantUser)
 	if creds == nil {
 		// 二开: 无节点级凭据时尝试「通用凭据」(一批服务器的统一账号) 自动派生
 		gc, gerr := applyGlobalCred(workerID, host)
@@ -347,11 +469,25 @@ func handleTerminal(w http.ResponseWriter, r *http.Request) {
 	}
 	creds.IP = host // ticket 携带的是 API 侧最新可达地址
 
-	cli, err := sshDial(creds)
+	cli, gotKey, err := sshDial(creds)
 	if err != nil {
+		// 服务器指纹变化 (重装系统等): 单独错误码, 前端弹窗让用户
+		// 确认是否信任新指纹 (信任则删除旧记录 + 用新 key 重新验证保存)。
+		if errors.Is(err, errHostKeyChanged) {
+			sendErr(ws, "host_key_changed",
+				fmt.Sprintf("服务器指纹已变化 (目标 %s:%d, 可能重装系统)。"+
+					"旧指纹: %s, 新指纹: %s", creds.IP, creds.port(),
+					creds.HostKey, gotKey))
+			return
+		}
 		code, msg := classifyErr(err)
 		sendErr(ws, code, fmt.Sprintf("%s (目标 %s:%d)", msg, creds.IP, creds.port()))
 		return
+	}
+	// 首次连接: 记录服务器指纹 (下次连接据此校验重装)
+	if creds.HostKey == "" {
+		creds.HostKey = gotKey
+		saveCred(workerID, *creds)
 	}
 	defer cli.Close()
 
@@ -461,12 +597,13 @@ func handleTicket(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		WorkerID uint   `json:"worker_id"`
 		IP       string `json:"ip"`
+		Username string `json:"username"` // 多凭据: 前端选择窗口指定的用户
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.WorkerID == 0 || req.IP == "" {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	tok := tickets.Issue(req.WorkerID, req.IP)
+	tok := tickets.Issue(req.WorkerID, req.IP, req.Username)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"ticket": tok})
 }
@@ -501,13 +638,25 @@ func handleCredentials(w http.ResponseWriter, r *http.Request) {
 		c.Port = loadCfg.SSHPort
 	}
 	w.Header().Set("Content-Type", "application/json")
-	cli, err := sshDial(&c)
+	cli, gotKey, err := sshDial(&c)
 	if err != nil {
+		// host key 变化: 验证阶段也提示 (重装后旧凭据已失效)
+		if errors.Is(err, errHostKeyChanged) {
+			_ = json.NewEncoder(w).Encode(credResp{
+				OK: false, Code: "host_key_changed",
+				Message: fmt.Sprintf("服务器指纹已变化 (可能重装系统)。旧指纹: %s, 新指纹: %s", c.HostKey, gotKey),
+			})
+			return
+		}
 		code, msg := classifyErr(err)
 		_ = json.NewEncoder(w).Encode(credResp{OK: false, Code: code, Message: msg})
 		return
 	}
 	cli.Close()
+	// 首次验证: 记录指纹 (下次据此检测重装)
+	if c.HostKey == "" {
+		c.HostKey = gotKey
+	}
 	saveCred(req.WorkerID, c)
 	log.Printf("[credentials] worker %d (%s@%s:%d) 凭据已验证并保存",
 		req.WorkerID, c.User, c.IP, c.Port)

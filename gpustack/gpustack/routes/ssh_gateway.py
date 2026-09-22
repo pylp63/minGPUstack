@@ -254,6 +254,7 @@ def _fallback_ip(ip: str) -> str:
 @router.post("/ticket/{worker_id}")
 async def ssh_gw_ticket(
     worker_id: int,
+    request: Request,
     session: SessionDep,
     ctx: TenantContextDep,
 ):
@@ -261,12 +262,23 @@ async def ssh_gw_ticket(
     worker, ip = await _worker_and_ip(worker_id, session, ctx)
     ip = _fallback_ip(ip)
 
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+
     connector = aiohttp.TCPConnector(limit=2, force_close=True)
     try:
         async with aiohttp.ClientSession(connector=connector) as sess:
             async with sess.post(
                 f"{SSHGW_BASE}/api/ssh/ticket",
-                json={"worker_id": worker_id, "ip": ip},
+                json={
+                    "worker_id": worker_id,
+                    "ip": ip,
+                    # 多凭据: 前端选择窗口指定的用户名 (空 = 默认第一套)
+                    "username": body.get("username") or "",
+                },
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 if resp.status != 200:

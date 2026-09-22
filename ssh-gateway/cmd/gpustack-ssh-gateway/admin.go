@@ -37,7 +37,6 @@ type RotateConfig struct {
 	LastApplied time.Time `json:"last_applied,omitempty"`
 }
 
-
 const kRotateKey = "_rotate"
 
 // 轮换配置存在状态文件独立的 "_rotate" key。
@@ -88,12 +87,16 @@ func handleCredList(w http.ResponseWriter, r *http.Request) {
 	}
 	credState.mu.RLock()
 	items := make([]credItem, 0, len(credState.creds))
-	for id, c := range credState.creds {
-		items = append(items, credItem{
-			WorkerID: id, IP: c.IP, Username: c.user(), Port: c.port(),
-			RotatedAt: c.RotatedAt,
-		})
+	cache := make([]credItem, 0, len(credState.creds))
+	for id, list := range credState.creds {
+		for _, c := range list {
+			cache = append(cache, credItem{
+				WorkerID: id, IP: c.IP, Username: c.user(), Port: c.port(),
+				RotatedAt: c.RotatedAt,
+			})
+		}
 	}
+	items = cache
 	credState.mu.RUnlock()
 	sort.Slice(items, func(i, j int) bool { return items[i].WorkerID < items[j].WorkerID })
 	rc := readRotate()
@@ -191,29 +194,29 @@ func rotateWorkerPasswords(id uint) (int, error) {
 	var firstErr error
 	for _, wid := range targets {
 		credState.mu.RLock()
-		c := credState.creds[wid]
+		list := credState.creds[wid]
 		credState.mu.RUnlock()
-		if c.IP == "" || c.Pw == "" {
-			continue
-		}
-		np, err := genPassword()
-		if err != nil {
-			continue
-		}
-		if err := rotateRemotePassword(&c, np); err != nil {
-			log.Printf("[rotate] worker %d (%s) 轮换失败: %v", wid, c.IP, err)
-			if firstErr == nil {
-				firstErr = err
+		for _, c := range list {
+			if c.IP == "" || c.Pw == "" {
+				continue
 			}
-			continue
+			np, err := genPassword()
+			if err != nil {
+				continue
+			}
+			if err := rotateRemotePassword(&c, np); err != nil {
+				log.Printf("[rotate] worker %d (%s) 轮换失败: %v", wid, c.IP, err)
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			c.Pw = np
+			c.RotatedAt = time.Now().UTC().Format(time.RFC3339)
+			saveCred(wid, c)
+			n++
+			log.Printf("[rotate] worker %d (%s) 密码已轮换", wid, c.IP)
 		}
-		c.Pw = np
-		c.RotatedAt = time.Now().UTC().Format(time.RFC3339)
-		credState.mu.Lock()
-		credState.creds[wid] = c
-		credState.mu.Unlock()
-		n++
-		log.Printf("[rotate] worker %d (%s) 密码已轮换", wid, c.IP)
 	}
 	saveState()
 	return n, firstErr
@@ -257,7 +260,7 @@ func sftpClient(workerID uint) (*sftp.Client, *ssh.Client, error) {
 	if c == nil {
 		return nil, nil, fmt.Errorf("该节点尚未配置 SSH 凭据")
 	}
-	cli, err := sshDial(c)
+	cli, _, err := sshDial(c)
 	if err != nil {
 		_, msg := classifyErr(err)
 		return nil, nil, fmt.Errorf("%s (%s:%d)", msg, c.IP, c.port())
@@ -403,7 +406,6 @@ func formUint(r *http.Request, key string) (uint, bool) {
 	return uint(n), true
 }
 
-
 // ---------- SFTP 目录浏览 ----------
 
 type lsItem struct {
@@ -502,7 +504,6 @@ func handleLs(w http.ResponseWriter, r *http.Request) {
 	})
 	writeJSON(w, map[string]interface{}{"path": p, "items": items})
 }
-
 
 // ---------- Tab 补全 (独立 exec 会话, 不干扰交互 PTY) ----------
 
@@ -760,7 +761,7 @@ func handleGlobalCred(w http.ResponseWriter, r *http.Request) {
 		if c.Port == 0 {
 			c.Port = loadCfg.SSHPort
 		}
-		cli, err := sshDial(&c)
+		cli, _, err := sshDial(&c)
 		if err != nil {
 			code, msg := classifyErr(err)
 			writeJSON(w, credResp{OK: false, Code: code, Message: msg})
@@ -784,7 +785,7 @@ func applyGlobalCred(workerID uint, host string) (*nodeCred, error) {
 		return nil, fmt.Errorf("no credentials")
 	}
 	c := nodeCred{IP: host, User: g.User, Pw: g.Pw, Port: g.Port}
-	cli, err := sshDial(&c)
+	cli, _, err := sshDial(&c)
 	if err != nil {
 		return nil, err
 	}

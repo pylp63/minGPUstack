@@ -91,6 +91,23 @@
 
   #xfer { display: none; margin: 4px 14px; height: 3px; background: #333; border-radius: 2px; overflow: hidden; flex-shrink: 0; }
   #xfer .bar2 { height: 100%; width: 0; background: #4f8cff; transition: width .15s; }
+
+  /* ---------- 已保存用户选择窗口 ---------- */
+  #user-pick-mask { position: fixed; inset: 0; z-index: 99; background: rgba(0,0,0,.55); display: none; align-items: center; justify-content: center; }
+  #user-pick-mask.show { display: flex; }
+  #user-pick-mask .dlg { width: 360px; }
+  .ulist { margin: 0; padding: 0; list-style: none; max-height: 240px; overflow-y: auto; }
+  .ulist li {
+    display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+    border: 1px solid #3c3c3c; border-radius: 8px; margin-bottom: 8px;
+    cursor: pointer; color: #e6e6e6; font-size: 13px;
+  }
+  .ulist li:hover { border-color: #4f8cff; background: #2a2d2e; }
+  .ulist li.sel { border-color: #4f8cff; background: rgba(79,140,255,.12); }
+  .ulist li .u { font-family: Menlo, Consolas, monospace; font-weight: 600; }
+  .ulist li .tag { font-size: 10px; color: #4f8cff; border: 1px solid rgba(79,140,255,.4); border-radius: 4px; padding: 1px 5px; }
+  .ulist li .m { margin-left: auto; color: #6a6f75; font-size: 11px; font-family: Menlo, Consolas, monospace; }
+  .ulist .empty { padding: 14px; color: #6a6f75; text-align: center; }
 </style>
 </head>
 <body>
@@ -138,6 +155,22 @@
   </div>
 </div>
 
+<!-- 已保存用户选择窗口 (多凭据时连接前选择登录身份) -->
+<div id="user-pick-mask">
+  <div class="dlg">
+    <h3>选择登录用户</h3>
+    <div class="body">
+      <p class="tip" id="user-pick-tip">该节点已保存以下 SSH 登录身份，请选择本次连接使用的用户。</p>
+      <ul class="ulist" id="user-pick-list"></ul>
+      <div class="err-msg" id="user-pick-err"></div>
+    </div>
+    <div class="foot">
+      <button onclick="userPickOther()">使用其它用户…</button>
+      <button class="primary" id="user-pick-ok" onclick="userPickConnect()">连接</button>
+    </div>
+  </div>
+</div>
+
 <script src="/console/xterm.js"></script>
 <script src="/console/xterm-addon-fit.js"></script>
 <script>
@@ -158,6 +191,11 @@
     $('#dlg-title').textContent = title || '连接到节点';
     if (tip) $('#dlg-tip').textContent = tip;
     $('#cred-err').className = 'err-msg';
+    // 重置按钮 (host_key_changed 曾改成「信任新指纹」; onclick property
+    // 一旦被覆盖, 置 null 不会恢复 HTML inline onclick — 必须显式赋回)
+    var okBtn = $('#cred-ok');
+    okBtn.disabled = false; okBtn.textContent = '验证并连接';
+    okBtn.onclick = submitCredentials;
     $('#cred-mask').classList.add('show');
     setTimeout(function () { $('#cred-pass').focus(); }, 50);
   }
@@ -179,14 +217,45 @@
     unreachable: { cls: 'unreachable', title: 'SSH 端口不通',
       tip: '无法建立 TCP 连接。请检查: 节点 sshd 是否运行、端口是否正确、防火墙/安全组是否放行。',
       text: 'SSH 端口不通或网络不可达', recred: true },
-    ssh_error: { cls: 'other', title: 'SSH 连接失败', text: '', recred: true }
+    ssh_error: { cls: 'other', title: 'SSH 连接失败', text: '', recred: true },
+    host_key_changed: { cls: 'other', title: '服务器指纹已变化',
+      tip: '该节点的 SSH 主机指纹与之前保存的不一致，通常意味着服务器已重装系统、或该 IP 已分配给另一台机器。',
+      text: '服务器指纹已变化', recred: false }
+  };
+
+  // 信任新指纹：删除该节点旧凭据 (含旧 host key)，转回正常凭据录入。
+  window.trustNewHostKey = function () {
+    var btn = $('#cred-ok');
+    btn.disabled = true; btn.textContent = '清理中…';
+    fetch('/v2/ssh-gw/credentials/' + workerId, {
+      method: 'DELETE', credentials: 'include'
+    }).then(function (r) { return r.json(); }).then(function () {
+    $('#cred-mask').classList.remove('show');
+    showCredDlg('连接到节点', '旧记录已清除。请重新输入 SSH 登录凭据，验证通过后用新的服务器指纹重新保存。');
+    }).catch(function (e) {
+      var err = $('#cred-err');
+      err.className = 'err-msg show other';
+      err.textContent = '清理失败: ' + e.message;
+      btn.disabled = false; btn.textContent = '信任新指纹并重新连接';
+    });
   };
 
   function handleGwError(code, message) {
-    var meta = ERR_META[code] || ERR_META.ssh_error;
-    setDot('err', meta.text);
-    term.write('\r\n\x1b[31m[' + (message || meta.text) + ']\x1b[0m\r\n');
-    if (meta.recred) {
+      var meta = ERR_META[code] || ERR_META.ssh_error;
+      setDot('err', meta.text);
+      term.write('\r\n\x1b[31m[' + (message || meta.text) + ']\x1b[0m\r\n');
+      if (code === 'host_key_changed') {
+        var err = $('#cred-err');
+        err.className = 'err-msg show ' + meta.cls;
+        err.textContent = (message || meta.text);
+        showCredDlg(meta.title, meta.tip);
+        var okBtn = $('#cred-ok');
+        okBtn.textContent = '信任新指纹并重新连接';
+        okBtn.onclick = window.trustNewHostKey;
+        setTimeout(function () { okBtn.focus(); }, 60);
+        return;
+      }
+      if (meta.recred) {
       var err = $('#cred-err');
       err.className = 'err-msg show ' + meta.cls;
       err.textContent = (message || meta.text);
@@ -213,10 +282,10 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: user, password: pass, port: port })
     }).then(function (r) { return r.json(); }).then(function (j) {
-      if (j.ok) {
-        $('#cred-mask').classList.remove('show');
-        connect();
-      } else {
+   if (j.ok) {
+     $('#cred-mask').classList.remove('show');
+     connect($('#cred-user').value.trim());  // 刚验证过的用户直连
+   } else {
         var meta = ERR_META[j.code] || ERR_META.ssh_error;
         var err = $('#cred-err');
         err.className = 'err-msg show ' + meta.cls;
@@ -627,10 +696,73 @@
   var ws = null;
   function wsSend(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 
-  function connect() {
+  // ================= 已保存用户选择窗口 =================
+  // 多凭据: 连接前拉取该节点已保存的凭据列表, 有则弹出选择窗口
+  // (默认选中第一套), 用户确认后带 username 拿 ticket 连接。
+  var pickUser = null;   // 当前选中用户名
+  var pickItems = [];    // 该节点全部凭据 {username, port, ip}
+
+  function showUserPick(items) {
+    pickItems = items;
+    pickUser = items.length ? items[0].username : null;
+    var ul = $('#user-pick-list');
+    ul.innerHTML = '';
+    items.forEach(function (it, i) {
+      var li = document.createElement('li');
+      if (i === 0) li.className = 'sel';
+      var u = document.createElement('span');
+      u.className = 'u'; u.textContent = it.username;
+      li.appendChild(u);
+      if (i === 0) {
+        var tag = document.createElement('span');
+        tag.className = 'tag'; tag.textContent = '默认';
+        li.appendChild(tag);
+      }
+      var m = document.createElement('span');
+      m.className = 'm'; m.textContent = (it.ip || '') + ':' + (it.port || 22);
+      li.appendChild(m);
+      li.onclick = function () {
+        pickUser = it.username;
+        Array.prototype.forEach.call(ul.children, function (x) { x.classList.remove('sel'); });
+        li.classList.add('sel');
+      };
+      li.ondblclick = function () { pickUser = it.username; userPickConnect(); };
+      ul.appendChild(li);
+    });
+    $('#user-pick-err').className = 'err-msg';
+    $('#user-pick-mask').classList.add('show');
+    setTimeout(function () { $('#user-pick-ok').focus(); }, 50);
+  }
+
+  window.userPickConnect = function () {
+    if (!pickUser) return;
+    $('#user-pick-mask').classList.remove('show');
+    connect(pickUser);
+  };
+  // 使用其它用户: 转到凭据录入弹窗 (预填选中的用户名, 便于改密码)
+  window.userPickOther = function () {
+    $('#user-pick-mask').classList.remove('show');
+    if (pickUser) $('#cred-user').value = pickUser;
+    showCredDlg('连接到节点', '输入新的 SSH 登录凭据。验证通过后会保存为该节点的另一个可选用户。');
+  };
+
+  // fetchMyCreds — 拉取本节点的已保存凭据 (密码不回传)
+  function fetchMyCreds() {
+    return fetch('/v2/ssh-gw/credentials', { credentials: 'include' })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (d) {
+        return (d.items || []).filter(function (it) {
+          return String(it.worker_id) === String(workerId);
+        });
+      });
+  }
+
+  function connect(username) {
     setDot('wait', '连接中…');
     fetch('/v2/ssh-gw/ticket/' + workerId, {
-      method: 'POST', credentials: 'include'
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: username || '' })
     }).then(function (r) {
       if (!r.ok) return r.json().then(function (j) { throw new Error(j.message || ('HTTP ' + r.status)); });
       return r.json();
@@ -735,7 +867,15 @@
   }
 
   window.addEventListener('resize', function () { fit.fit(); });
-  connect();
+
+  // 启动: 先拉本节点已保存凭据 — 有则弹选择窗口 (多凭据可选),
+  // 无则直接连接 (网关侧自动走通用凭据或报 no_credentials 弹录入)。
+  fetchMyCreds()
+    .then(function (items) {
+      if (items.length > 0) showUserPick(items);
+      else connect();
+    })
+    .catch(function () { connect(); });
 })();
 </script>
 </body>

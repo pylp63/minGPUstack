@@ -79,7 +79,7 @@ func pooledClient(wid uint) (*ssh.Client, error) {
 		_ = n.cli.Close()
 		n.cli = nil
 	}
-	cli, err := sshDial(c)
+	cli, _, err := sshDial(c)
 	if err != nil {
 		_, msg := classifyErr(err)
 		return nil, fmt.Errorf("%s (%s:%d)", msg, c.IP, c.port())
