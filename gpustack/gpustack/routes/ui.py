@@ -262,9 +262,13 @@ def register(app: FastAPI):
         None,
     )
     if _console_index:
+        # 二开修复: console 页面 (ssh_terminal/ssh_credentials 等) 走
+        # PrecompressedStaticFiles — 与主 UI 相同的 no-cache + gzip 策略。
+        # 原先用裸 StaticFiles (无 Cache-Control), 浏览器启发式缓存会把
+        # 旧版页面钉住, 升级后用户看到的还是黑色旧主题。
         app.mount(
             "/console",
-            StaticFiles(directory=console_dir, html=True),
+            PrecompressedStaticFiles(directory=console_dir, html=True),
             name="gpustack-console",
         )
 
