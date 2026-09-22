@@ -5,55 +5,73 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GPUStack 控制台 — GPU 服务器申请 / 审批 / 组织</title>
 <style>
-  :root { --fg:#1f2328; --muted:#656d76; --border:#d0d7de; --bg:#f6f8fa; --card:#fff; --accent:#0969da; --ok:#1a7f37; --warn:#9a6700; --err:#cf222e; }
+  /* 浅色主题: 与节点凭证页/主应用一致 (antd token) —
+     表头浅灰背景块 #f5f5f5 + #71717a 小字, 主色 #1677ff */
+  :root {
+    --fg: rgba(0,0,0,.88); --muted: rgba(0,0,0,.45); --accent: #1677ff;
+    --border: #ededed; --border-strong: #d9d9d9; --bg: #f4f5f4; --card: #fff;
+    --ok: #52c41a; --ok-text: #389e0d; --warn: #faad14; --warn-text: #d48806;
+    --err: #ff4d4f; --thead-bg: #f5f5f5; --thead-fg: #71717a; --row-split: #f0f0f0;
+  }
   * { box-sizing:border-box; }
-  body { margin:0; font:14px/1.5 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; color:var(--fg); background:var(--bg); }
+  body { margin:0; font:13px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; color:var(--fg); background:var(--bg); }
   header { background:var(--card); border-bottom:1px solid var(--border); padding:12px 24px; display:flex; align-items:center; gap:14px; position:sticky; top:0; z-index:5; }
-  header h1 { font-size:16px; margin:0; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
   header .spacer { flex:1; }
-  .tag { font-size:12px; padding:2px 10px; border-radius:999px; background:#ddf4ff; color:#0969da; }
+  .tag { font-size:12px; padding:2px 10px; border-radius:999px; background:rgba(22,119,255,.08); color:var(--accent); }
   main { max-width:1100px; margin:24px auto; padding:0 16px; display:grid; gap:20px; }
-  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:18px 20px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px 20px; }
   .card h2 { font-size:14px; margin:0 0 12px; color:var(--muted); font-weight:600; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); vertical-align:middle; }
-  th { color:var(--muted); font-weight:600; white-space:nowrap; }
+  /* 表格: 表头浅灰背景块 (同主应用列表表头), 行悬停, 底部分隔线 */
+  table { width:100%; border-collapse:separate; border-spacing:0; font-size:13px; }
+  th, td { text-align:left; padding:10px; vertical-align:middle; }
+  th { background:var(--thead-bg); color:var(--thead-fg); font-weight:500; font-size:12px; height:40px; white-space:nowrap; border-bottom:1px solid var(--border); }
+  thead tr th:first-child { border-radius:6px 0 0 6px; }
+  thead tr th:last-child { border-radius:0 6px 6px 0; }
+  td { border-bottom:1px solid var(--row-split); }
   tr:last-child td { border-bottom:none; }
-  .status { display:inline-block; padding:1px 10px; border-radius:999px; font-size:12px; }
-  .status.pending { background:#fff8c5; color:var(--warn); }
-  .status.approved { background:#dafbe1; color:var(--ok); }
-  .status.rejected { background:#ffebe9; color:var(--err); }
-  .status.cancelled { background:#eaeef2; color:var(--muted); }
-  button { font:inherit; border-radius:6px; border:1px solid var(--border); background:var(--card); color:var(--fg); padding:5px 14px; cursor:pointer; }
+  tr:hover td { background:rgba(0,0,0,.02); }
+  .status { display:inline-block; padding:1px 10px; border-radius:4px; font-size:11px; }
+  .status.pending { background:#fffbe6; color:var(--warn-text); }
+  .status.approved { background:#f6ffed; color:var(--ok-text); }
+  .status.rejected { background:#fff2f0; color:var(--err); }
+  .status.cancelled { background:rgba(0,0,0,.04); color:var(--muted); }
+  button { font:inherit; border-radius:6px; border:1px solid var(--border-strong); background:var(--card); color:var(--fg); padding:5px 14px; cursor:pointer; }
+  button:hover { border-color:var(--accent); color:var(--accent); }
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.primary:hover { background:#4096ff; color:#fff; }
   button.ok { background:var(--ok); border-color:var(--ok); color:#fff; }
+  button.ok:hover { background:#73d13d; color:#fff; }
   button.danger { background:var(--err); border-color:var(--err); color:#fff; }
-  button:disabled { opacity:.5; cursor:not-allowed; }
+  button.danger:hover { background:#ff7875; color:#fff; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
   button.link { border:none; background:none; color:var(--accent); padding:2px 6px; }
-  input, select, textarea { font:inherit; border:1px solid var(--border); border-radius:6px; padding:6px 10px; }
+  button.link:hover { color:#4096ff; }
+  input, select, textarea { font:inherit; border:1px solid var(--border-strong); border-radius:6px; padding:6px 10px; outline:none; background:var(--card); color:var(--fg); }
+  input:focus, select:focus, textarea:focus { border-color:var(--accent); }
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
   .grow { flex:1; }
   .muted { color:var(--muted); }
-  .badge { background:#cf222e; color:#fff; border-radius:999px; font-size:11px; padding:0 7px; margin-left:6px; }
+  .badge { background:var(--err); color:#fff; border-radius:999px; font-size:11px; padding:0 7px; margin-left:6px; }
   .empty { text-align:center; color:var(--muted); padding:26px 0; }
-  .toast { position:fixed; bottom:20px; right:20px; background:#24292f; color:#fff; border-radius:8px; padding:10px 16px; font-size:13px; opacity:.95; z-index:50; }
-  dialog { border:1px solid var(--border); border-radius:10px; padding:0; width:min(560px, 92vw); }
-  dialog::backdrop { background:rgba(0,0,0,.35); }
+  .toast { position:fixed; bottom:20px; right:20px; background:var(--card); color:var(--fg); border:1px solid var(--border); border-radius:8px; padding:10px 16px; font-size:13px; box-shadow:0 6px 24px rgba(0,0,0,.12); opacity:.97; z-index:50; }
+  dialog { border:1px solid var(--border); border-radius:12px; padding:0; width:min(560px, 92vw); box-shadow:0 12px 40px rgba(0,0,0,.12); }
+  dialog::backdrop { background:rgba(0,0,0,.3); }
   dialog .body { padding:18px 20px; }
-  dialog h3 { margin:0 0 12px; font-size:15px; }
-  label { display:block; font-size:12px; color:var(--muted); margin:10px 0 4px; }
+  dialog h3 { margin:0 0 12px; font-size:15px; font-weight:600; }
+  label { display:block; font-size:12px; color:rgba(0,0,0,.65); margin:10px 0 4px; }
   .kv { font-size:12px; color:var(--muted); }
   .tabs { display:flex; gap:4px; border-bottom:1px solid var(--border); margin-bottom:14px; }
   .tabs button { border:none; background:none; border-bottom:2px solid transparent; border-radius:0; padding:8px 14px; color:var(--fg); }
   .tabs button.active { border-bottom-color:var(--accent); color:var(--accent); }
-  .role { display:inline-block; padding:1px 10px; border-radius:999px; font-size:12px; background:#ddf4ff; color:#0969da; }
-  .role.owner { background:#dafbe1; color:var(--ok); }
+  .role { display:inline-block; padding:1px 10px; border-radius:4px; font-size:11px; background:rgba(22,119,255,.08); color:var(--accent); }
+  .role.owner { background:#f6ffed; color:var(--ok-text); }
   .panel { border:1px solid var(--border); border-radius:8px; padding:14px 16px; margin-bottom:12px; background:var(--card); }
-  .panel .head { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+  .panel .head { display:flex; align-items:center; gap:10px; margin-bottom:8px; flex-wrap:wrap; }
   .panel .head b { font-size:14px; }
   .sub { font-size:12px; }
   .chips { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
-  .chip { font-size:12px; border:1px solid var(--border); border-radius:999px; padding:1px 10px; color:var(--muted); }
+  .chip { font-size:12px; border:1px solid var(--border); border-radius:999px; padding:1px 10px; color:var(--muted); background:rgba(0,0,0,.02); }
 </style>
 </head>
 <body>
