@@ -221,13 +221,17 @@ func pickCred(workerID uint, user string) *nodeCred {
 	return &c
 }
 
-// saveCred — 保存凭据: 同 IP+用户名覆盖, 否则追加; 把目标移到首位 (设为默认)。
+// saveCred — 保存凭据: 同用户名覆盖 (IP 跟随最新可达地址, 不因 IP 变化
+// 产生重复条目), 已记录的指纹/轮换时间保留; 保存后移到首位 (设为默认)。
 func saveCred(workerID uint, c nodeCred) {
 	credState.mu.Lock()
 	l := credState.creds[workerID]
 	for i := range l {
-		if l[i].User == c.User && l[i].IP == c.IP {
-			// 覆盖已有同用户凭据, 移到首位 (设为默认)
+		if l[i].User == c.User {
+			// 同用户: 保留旧指纹 (IP 变化不代表重装; 新指纹只在验证时记录)
+			if c.HostKey == "" {
+				c.HostKey = l[i].HostKey
+			}
 			c.RotatedAt = l[i].RotatedAt // 保留轮换时间戳
 			rest := append([]nodeCred{c}, l[:i]...)
 			rest = append(rest, l[i+1:]...)
@@ -401,7 +405,29 @@ func loadState() {
 		}
 		var multi []nodeCred
 		if json.Unmarshal(v, &multi) == nil && len(multi) > 0 {
-			creds[uint(wid)] = multi
+			// 同用户去重 (旧版本 User+IP 匹配可能留下重复条目):
+			// 优先保留带指纹的条目 (实际连接过), 其余丢弃
+			seen := map[string]bool{}
+			dedup := multi[:0]
+			for _, c := range multi {
+				if seen[c.User] {
+					continue
+				}
+				seen[c.User] = true
+				dedup = append(dedup, c)
+			}
+			// 若被丢弃的条目带指纹而保留的没有, 用带指纹的替换
+			for i, c := range dedup {
+				if c.HostKey == "" {
+					for _, o := range multi {
+						if o.User == c.User && o.HostKey != "" {
+							dedup[i] = o
+							break
+						}
+					}
+				}
+			}
+			creds[uint(wid)] = dedup
 			continue
 		}
 		var single nodeCred
