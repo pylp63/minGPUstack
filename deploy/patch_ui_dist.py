@@ -137,6 +137,13 @@ if 'id:"30"' in u:
     if m51 and 'access' not in u[m51.start(1):m51.end(1)]:
         u = u.replace(m51.group(1), m51.group(1) + ',access:"canSeeOrgAdmin"', 1)
         print("C1b: sshCredentials menu -> admin only")
+    # 12: 模型库 -> 开放给普通用户 (catalog 是只读浏览; 用户已见模型广场,
+    # 模型库是部署入口视图。部署/路由/提供商等仍 admin-only: 部署消耗
+    # GPU 资源须走「申请 → admin 审批」流程, 不能绕过)
+    m12 = re.search(r'(12:\{name:"modelCatalog",path:"/models/catalog",key:"modelsCatalog"[^}]*?)access:"canSeeOrgAdmin",?', u)
+    if m12:
+        u = u.replace(m12.group(0), m12.group(1), 1)
+        print("C1b: modelCatalog menu -> all users")
 
 # --- C2: 组件绑定表新增 49/50 (复用 42 组织页的 chunk 加载链)
 # 宽松正则: 官方 UI tarball 更新会改变 chunk id/模块 id, 精确字符串会漂移;
