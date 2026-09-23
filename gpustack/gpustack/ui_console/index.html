@@ -72,6 +72,22 @@
   .sub { font-size:12px; }
   .chips { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
   .chip { font-size:12px; border:1px solid var(--border); border-radius:999px; padding:1px 10px; color:var(--muted); background:rgba(0,0,0,.02); }
+
+  /* 用户组表格 (同「用户」页): 来源徽章 / 状态徽章 / 紧凑操作按钮 */
+  .src-badge { display:inline-block; padding:1px 8px; border-radius:4px; font-size:11px; }
+  .src-badge.local { background:rgba(22,119,255,.08); color:var(--accent); }
+  .src-badge.idp { background:rgba(122,162,247,.12); color:#2f54eb; }
+  .gstatus { display:inline-block; padding:1px 8px; border-radius:4px; font-size:11px; }
+  .gstatus.on { background:#f6ffed; color:var(--ok-text); }
+  .gstatus.off { background:rgba(0,0,0,.04); color:var(--muted); }
+  .ops-td .btn-mini {
+    font-size:12px; padding:2px 10px; border-radius:5px;
+    border:1px solid var(--border-strong); background:var(--card);
+    color:var(--fg); cursor:pointer; margin-right:6px;
+  }
+  .ops-td .btn-mini:hover { border-color:var(--accent); color:var(--accent); }
+  .ops-td .btn-mini.danger { color:var(--err); }
+  .ops-td .btn-mini.danger:hover { border-color:var(--err); background:#fff2f0; }
 </style>
 </head>
 <body>
@@ -139,7 +155,23 @@
       <input id="g-desc" class="grow" placeholder="说明 (可选), 如 算法团队">
       <button class="primary" onclick="createGroup()">创建用户组</button>
     </div>
-    <div id="group-list"></div>
+    <!-- 表格化列表 (同「用户」页规格: 名称/角色/全名/来源/状态/创建时间/操作) -->
+    <table id="t-groups">
+      <thead>
+        <tr>
+          <th>名称</th>
+          <th>角色</th>
+          <th>全名</th>
+          <th>来源</th>
+          <th>状态</th>
+          <th>创建时间</th>
+          <th style="width:210px">操作</th>
+        </tr>
+      </thead>
+      <tbody id="groups-tbody">
+        <tr><td colspan="7" class="empty">加载中…</td></tr>
+      </tbody>
+    </table>
   </section>
 
   <section class="card" id="sec-notifications">
@@ -419,34 +451,46 @@ async function loadGroups() {
 }
 
 /* ---------- 用户组独立视图 (左侧菜单「用户组」) ---------- */
+/* 表格化渲染 — 同「用户」页规格: 名称/角色/全名/来源/状态/创建时间/操作 */
+
+const GROUP_SOURCE_LABEL = { Local: '本地', OIDC: 'OIDC', SAML: 'SAML', CAS: 'CAS' };
 
 async function loadGroupList() {
   const data = await api('/groups?perPage=100');
-  const wrap = $('#group-list');
-  wrap.innerHTML = data.items.length ? '' : '<div class="empty">还没有用户组</div>';
+  const tb = $('#groups-tbody');
+  if (!data.items.length) {
+    tb.innerHTML = '<tr><td colspan="7" class="empty">还没有用户组</td></tr>';
+    return;
+  }
+  // 渲染骨架 (成员数异步补齐, 避免逐组串行等待)
+  tb.innerHTML = data.items.map(g => {
+    const isIdp = g.source && g.source !== 'Local';
+    return `
+    <tr data-gid="${g.id}">
+      <td><b>${esc(g.name)}</b></td>
+      <td><span class="role">用户组</span></td>
+      <td>${esc(g.description || '—')}</td>
+      <td>${isIdp
+        ? `<span class="src-badge idp">${esc(GROUP_SOURCE_LABEL[g.source] || g.source)}</span>`
+        : '<span class="src-badge local">本地</span>'}</td>
+      <td><span class="gstatus on">启用</span></td>
+      <td class="kv">${fmtTime(g.created_at)}</td>
+      <td class="ops-td">
+        <button class="btn-mini" onclick="openGroupMembers(${g.id}, '${esc(g.name)}')">成员管理${g.member_count ? ` (${g.member_count})` : ''}</button>
+        <button class="btn-mini danger" onclick="deleteGroup(${g.id}, '${esc(g.name)}')">删除</button>
+      </td>
+    </tr>`;
+  }).join('');
+  // 成员数: member_count 缺失时回查 (老后端兼容)
   for (const g of data.items) {
-    const panel = document.createElement('div');
-    panel.className = 'panel';
-    panel.innerHTML = `
-      <div class="head">
-        <b>${esc(g.name)}</b>
-        ${g.description ? '<span class="kv">' + esc(g.description) + '</span>' : ''}
-        <span class="chip">${g.member_count || 0} 名成员</span>
-        <span class="spacer" style="flex:1"></span>
-        <button class="link" onclick="openGroupMembers(${g.id}, '${esc(g.name)}')">成员管理</button>
-        <button class="link" onclick="deleteGroup(${g.id}, '${esc(g.name)}')" style="color:var(--err)">删除</button>
-      </div>
-      <div class="kv" id="group-members-${g.id}">加载成员…</div>`;
-    wrap.appendChild(panel);
+    if (typeof g.member_count === 'number' && g.member_count > 0) continue;
     try {
       const members = await api(`/groups/${g.id}/members`);
-      document.getElementById(`group-members-${g.id}`).innerHTML =
-        members.length ? `<div class="chips">${members.map(m =>
-          `<span class="chip" title="${esc(m.full_name || '')}">${esc(m.username || m.user_id)}</span>`).join('')}</div>`
-        : '<span class="muted sub">暂无成员</span>';
-    } catch (e) {
-      document.getElementById(`group-members-${g.id}`).textContent = '成员加载失败';
-    }
+      const btn = document.querySelector(`#groups-tbody tr[data-gid="${g.id}"] .btn-mini`);
+      if (btn && members.length) {
+        btn.textContent = `成员管理 (${members.length})`;
+      }
+    } catch (e) { /* 忽略单个组的成员查询失败 */ }
   }
 }
 
