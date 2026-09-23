@@ -88,6 +88,28 @@
   .ops-td .btn-mini:hover { border-color:var(--accent); color:var(--accent); }
   .ops-td .btn-mini.danger { color:var(--err); }
   .ops-td .btn-mini.danger:hover { border-color:var(--err); background:#fff2f0; }
+
+  /* 展开行 (成员管理): 浅灰底内嵌面板, 箭头列 */
+  .expander {
+    display:inline-block; width:16px; cursor:pointer; color:var(--muted);
+    user-select:none; font-size:10px; transition:transform .15s;
+  }
+  .expander:hover { color:var(--accent); }
+  .grp-row.open td { background:rgba(22,119,255,.04); }
+  .grp-members.hidden-row { display:none; }
+  .grp-members > td { padding:0 10px 10px 26px !important; border-bottom:1px solid var(--row-split); }
+  .members-box .members-inner {
+    background:#fafafa; border:1px solid var(--border); border-radius:8px;
+    padding:12px 14px;
+  }
+  .members-chips { display:flex; gap:8px; flex-wrap:wrap; }
+  .members-chips .chip { background:var(--card); }
+  .members-chips .chip .chip-name { font-style:normal; color:var(--muted); }
+  .chip-x { margin-left:4px; color:var(--muted); cursor:pointer; text-decoration:none; font-weight:600; }
+  .chip-x:hover { color:var(--err); }
+  .err-inline { display:none; margin-top:10px; padding:8px 10px; border-radius:6px; font-size:12px; background:#fff2f0; color:var(--err); }
+  .err-inline.show { display:block; }
+  dialog select[multiple] { width:100%; }
 </style>
 </head>
 <body>
@@ -149,13 +171,12 @@
   </section>
 
   <section class="card" id="sec-groups" style="display:none">
-    <h2>用户组</h2>
-    <div class="row" style="margin-bottom:12px">
-      <input id="g-name" placeholder="用户组标识 (英文), 如 ml-team" style="width:220px">
-      <input id="g-desc" class="grow" placeholder="说明 (可选), 如 算法团队">
-      <button class="primary" onclick="createGroup()">创建用户组</button>
+    <div class="row" style="margin-bottom:14px">
+      <h2 style="margin:0;flex:1">用户组</h2>
+      <button class="primary" onclick="openCreateGroup()">创建用户组</button>
     </div>
-    <!-- 表格化列表 (同「用户」页规格: 名称/角色/全名/来源/状态/创建时间/操作) -->
+    <!-- 表格化列表 (同「用户」页规格: 名称/角色/全名/来源/状态/创建时间/操作);
+         名称列小箭头展开/折叠成员, 成员管理在展开区内联完成 -->
     <table id="t-groups">
       <thead>
         <tr>
@@ -184,6 +205,24 @@
   </section>
 
 </main>
+
+<dialog id="dlg-create-group">
+  <form class="body" method="dialog" onsubmit="return false">
+    <h3>创建用户组</h3>
+    <label>名称 (英文标识, 如 ml-team)</label>
+    <input id="g-name" placeholder="ml-team" autocomplete="off">
+    <label>说明 (可选)</label>
+    <input id="g-desc" placeholder="如: 算法团队" autocomplete="off">
+    <label>添加成员 (可选, 可多选)</label>
+    <select id="g-members" multiple size="5" style="width:100%"></select>
+    <div class="kv" style="margin-top:4px">按住 Ctrl/⌘ 可多选; 创建后也可在列表中展开用户组随时增删成员。</div>
+    <div class="err-inline" id="g-err"></div>
+    <div class="row" style="margin-top:16px;justify-content:flex-end">
+      <button onclick="closeCreateGroup()">取消</button>
+      <button class="primary" id="g-ok" onclick="createGroup()">创建</button>
+    </div>
+  </form>
+</dialog>
 
 <dialog id="dlg-member">
   <form class="body" method="dialog">
@@ -451,9 +490,11 @@ async function loadGroups() {
 }
 
 /* ---------- 用户组独立视图 (左侧菜单「用户组」) ---------- */
-/* 表格化渲染 — 同「用户」页规格: 名称/角色/全名/来源/状态/创建时间/操作 */
+/* 表格化渲染 — 同「用户」页规格: 名称/角色/全名/来源/状态/创建时间/操作;
+   名称列小箭头可展开/折叠该组成员 (成员管理内联在展开行里)。 */
 
 const GROUP_SOURCE_LABEL = { Local: '本地', OIDC: 'OIDC', SAML: 'SAML', CAS: 'CAS' };
+let groupExpanded = {};   // gid -> bool 展开状态 (重渲染保持)
 
 async function loadGroupList() {
   const data = await api('/groups?perPage=100');
@@ -462,12 +503,12 @@ async function loadGroupList() {
     tb.innerHTML = '<tr><td colspan="7" class="empty">还没有用户组</td></tr>';
     return;
   }
-  // 渲染骨架 (成员数异步补齐, 避免逐组串行等待)
   tb.innerHTML = data.items.map(g => {
     const isIdp = g.source && g.source !== 'Local';
+    const open = !!groupExpanded[g.id];
     return `
-    <tr data-gid="${g.id}">
-      <td><b>${esc(g.name)}</b></td>
+    <tr class="grp-row${open ? ' open' : ''}" data-gid="${g.id}">
+      <td><span class="expander" onclick="toggleGroup(${g.id})">${open ? '▾' : '▸'}</span><b>${esc(g.name)}</b></td>
       <td><span class="role">用户组</span></td>
       <td>${esc(g.description || '—')}</td>
       <td>${isIdp
@@ -476,34 +517,140 @@ async function loadGroupList() {
       <td><span class="gstatus on">启用</span></td>
       <td class="kv">${fmtTime(g.created_at)}</td>
       <td class="ops-td">
-        <button class="btn-mini" onclick="openGroupMembers(${g.id}, '${esc(g.name)}')">成员管理${g.member_count ? ` (${g.member_count})` : ''}</button>
+        <button class="btn-mini" onclick="openGroupMembers(${g.id}, '${esc(g.name)}')">成员管理</button>
         <button class="btn-mini danger" onclick="deleteGroup(${g.id}, '${esc(g.name)}')">删除</button>
       </td>
+    </tr>
+    <tr class="grp-members${open ? '' : ' hidden-row'}" data-mid="${g.id}">
+      <td colspan="7"><div class="members-box" id="members-${g.id}">
+        ${open ? '<span class="muted sub">加载成员…</span>' : ''}
+      </div></td>
     </tr>`;
   }).join('');
-  // 成员数: member_count 缺失时回查 (老后端兼容)
+  // 展开的组: 立即加载成员
   for (const g of data.items) {
-    if (typeof g.member_count === 'number' && g.member_count > 0) continue;
-    try {
-      const members = await api(`/groups/${g.id}/members`);
-      const btn = document.querySelector(`#groups-tbody tr[data-gid="${g.id}"] .btn-mini`);
-      if (btn && members.length) {
-        btn.textContent = `成员管理 (${members.length})`;
-      }
-    } catch (e) { /* 忽略单个组的成员查询失败 */ }
+    if (groupExpanded[g.id]) renderGroupMembers(g.id);
   }
 }
+
+/* 展开/折叠: 只重画这一组的箭头和成员行 (不整表重渲染, 避免闪烁) */
+function toggleGroup(gid) {
+  groupExpanded[gid] = !groupExpanded[gid];
+  const open = groupExpanded[gid];
+  const row = document.querySelector(`#groups-tbody tr.grp-row[data-gid="${gid}"]`);
+  const mrow = document.querySelector(`#groups-tbody tr.grp-members[data-mid="${gid}"]`);
+  if (!row || !mrow) { loadGroupList(); return; }
+  row.classList.toggle('open', open);
+  row.querySelector('.expander').textContent = open ? '▾' : '▸';
+  mrow.classList.toggle('hidden-row', !open);
+  if (open) renderGroupMembers(gid);
+}
+
+/* 渲染展开区的成员列表 (含内联移除 + 添加下拉) */
+async function renderGroupMembers(gid) {
+  const box = document.getElementById('members-' + gid);
+  if (!box) return;
+  try {
+    const members = await api(`/groups/${gid}/members`);
+    const chips = members.length
+      ? members.map(m => `
+        <span class="chip">
+          ${esc(m.username || m.user_id)}${m.full_name ? ' <i class="chip-name">' + esc(m.full_name) + '</i>' : ''}
+          <a class="chip-x" onclick="removeMemberInline(${gid}, ${m.user_id})" title="移除">×</a>
+        </span>`).join('')
+      : '<span class="muted sub">暂无成员 — 从右侧添加</span>';
+    const users = window._users || (await api('/users?perPage=500')).items;
+    window._users = users;
+    const memberIds = new Set(members.map(m => m.user_id));
+    const candidates = users.filter(u => !u.is_admin && !memberIds.has(u.id));
+    const addSelect = candidates.length
+      ? `<select id="add-select-${gid}">${candidates.map(u =>
+          `<option value="${u.id}">${esc(u.username)}</option>`).join('')}</select>`
+      : '<span class="muted sub">(没有可添加的用户)</span>';
+    box.innerHTML = `
+      <div class="members-inner">
+        <div class="members-chips">${chips}</div>
+        <div class="row" style="margin-top:8px">
+          ${addSelect}
+          <button class="btn-mini" onclick="addMemberInline(${gid})">添加成员</button>
+        </div>
+      </div>`;
+  } catch (e) {
+    box.innerHTML = `<span class="muted sub">成员加载失败: ${esc(e.message)}</span>`;
+  }
+}
+
+async function addMemberInline(gid) {
+  const sel = document.getElementById('add-select-' + gid);
+  if (!sel || !sel.value) return;
+  try {
+    await api(`/groups/${gid}/members`, {
+      method: 'POST', body: JSON.stringify({ user_ids: [parseInt(sel.value)] })
+    });
+    toast('已添加');
+    renderGroupMembers(gid); loadGroups();
+  } catch (e) { toast('添加失败: ' + e.message); }
+}
+
+async function removeMemberInline(gid, uid) {
+  if (!confirm('从该用户组移除此用户?')) return;
+  try {
+    await api(`/groups/${gid}/members/${uid}`, { method: 'DELETE' });
+    toast('已移除');
+    renderGroupMembers(gid); loadGroups();
+  } catch (e) { toast('移除失败: ' + e.message); }
+}
+
+/* ---------- 创建用户组弹窗 ---------- */
+async function openCreateGroup() {
+  $('#g-name').value = '';
+  $('#g-desc').value = '';
+  $('#g-err').className = 'err-inline';
+  const users = window._users || (await api('/users?perPage=500')).items;
+  window._users = users;
+  $('#g-members').innerHTML = users.filter(u => !u.is_admin)
+    .map(u => `<option value="${u.id}">${esc(u.username)}${u.display_name ? ' — ' + esc(u.display_name) : ''}</option>`)
+    .join('') || '<option value="" disabled>没有普通用户可添加</option>';
+  $('#dlg-create-group').showModal();
+  setTimeout(() => $('#g-name').focus(), 60);
+}
+function closeCreateGroup() { $('#dlg-create-group').close(); }
 
 async function createGroup() {
   const name = $('#g-name').value.trim();
   const desc = $('#g-desc').value.trim();
-  if (!name) { toast('请填写用户组标识'); return; }
+  if (!name) {
+    var err = $('#g-err');
+    err.className = 'err-inline show';
+    err.textContent = '请填写用户组名称';
+    return;
+  }
+  const btn = $('#g-ok');
+  btn.disabled = true; btn.textContent = '创建中…';
   try {
-    await api('/groups', {method: 'POST', body: JSON.stringify({name, description: desc || null})});
-    toast('用户组已创建');
-    $('#g-name').value = ''; $('#g-desc').value = '';
+    await api('/groups', { method: 'POST', body: JSON.stringify({ name, description: desc || null }) });
+    // 弹窗里选了成员: 创建后立即批量加入
+    const picked = Array.from($('#g-members').selectedOptions || [])
+      .map(o => parseInt(o.value)).filter(v => v > 0);
+    let gid = null;
+    if (picked.length) {
+      const data = await api('/groups?perPage=100');
+      gid = (data.items.find(g => g.name === name) || {}).id;
+      if (gid) await api(`/groups/${gid}/members`, {
+        method: 'POST', body: JSON.stringify({ user_ids: picked })
+      }).catch(() => {});
+    }
+    toast('用户组已创建' + (picked.length ? ` (含 ${picked.length} 名成员)` : ''));
+    closeCreateGroup();
+    if (gid) groupExpanded[gid] = true;   // 创建即展开, 成员立即可见
     loadGroupList(); loadGroups();
-  } catch (e) { toast('创建失败: ' + e.message); }
+  } catch (e) {
+    var err = $('#g-err');
+    err.className = 'err-inline show';
+    err.textContent = '创建失败: ' + e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = '创建';
+  }
 }
 
 async function deleteGroup(id, gname) {
