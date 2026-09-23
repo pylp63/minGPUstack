@@ -236,23 +236,6 @@
   </form>
 </dialog>
 
-<dialog id="dlg-member">
-  <form class="body" method="dialog">
-    <h3 id="m-title">用户组成员</h3>
-    <div class="row" style="margin-bottom:12px">
-      <select id="m-user" class="grow"></select>
-      <button class="primary" type="button" onclick="addGroupMember()">添加成员</button>
-    </div>
-    <table id="t-members">
-      <thead><tr><th>成员</th><th>加入时间</th><th></th></tr></thead>
-      <tbody></tbody>
-    </table>
-    <div class="row" style="margin-top:14px;justify-content:flex-end">
-      <button value="cancel">关闭</button>
-    </div>
-  </form>
-</dialog>
-
 <dialog id="dlg-approve">
   <form class="body" method="dialog">
     <h3>批准 GPU 服务器申请</h3>
@@ -529,7 +512,6 @@ async function loadGroupList() {
       <td><span class="gstatus on">启用</span></td>
       <td class="kv">${fmtTime(g.created_at)}</td>
       <td class="ops-td">
-        <button class="btn-mini" onclick="openGroupMembers(${g.id}, '${esc(g.name)}')">成员管理</button>
         <button class="btn-mini danger" onclick="deleteGroup(${g.id}, '${esc(g.name)}')">删除</button>
       </td>
     </tr>
@@ -670,62 +652,6 @@ async function deleteGroup(id, gname) {
   if (!confirm(`删除用户组 ${gname}? 组内成员不受影响, 仅移除分组。`)) return;
   try { await api(`/groups/${id}`, {method: 'DELETE'}); toast('已删除'); loadGroupList(); loadGroups(); }
   catch (e) { toast('删除失败: ' + e.message); }
-}
-
-let membersGroupId = null;
-
-async function openGroupMembers(groupId, groupName) {
-  membersGroupId = groupId;
-  $('#m-title').textContent = `用户组成员 — ${groupName}`;
-  const users = window._users || (await api('/users?perPage=500')).items;
-  $('#m-user').innerHTML = users.map(u => `<option value="${u.id}">${esc(u.username)}</option>`).join('');
-  await loadGroupMembers();
-  $('#dlg-member').showModal();
-}
-
-async function loadGroupMembers() {
-  const members = await api("/groups/" + membersGroupId + "/members");
-  const tb = document.querySelector("#t-members tbody");
-  tb.innerHTML = members.length
-    ? members
-        .map(function (m) {
-          var nm = m.username || m.user_id;
-          var fn = m.full_name ? ' <span class="kv">' + esc(m.full_name) + "</span>" : "";
-          return "<tr><td><b>" + esc(nm) + "</b>" + fn + "</td>"
-            + '<td class="kv">' + fmtTime(m.created_at) + "</td>"
-            + '<td><button class="link" onclick="removeGroupMember(' + m.user_id + ')" style="color:var(--err)">移除</button></td></tr>';
-        })
-        .join("")
-    : '<tr><td colspan="3" class="empty">暂无成员</td></tr>';
-}
-
-async function addGroupMember() {
-  var uid = parseInt(document.getElementById("m-user").value);
-  try {
-    await api("/groups/" + membersGroupId + "/members", {
-      method: "POST",
-      body: JSON.stringify({ user_ids: [uid] }),
-    });
-    toast("已添加");
-    loadGroupMembers();
-    loadGroupList();
-    loadGroups();
-  } catch (e) {
-    toast("添加失败: " + e.message);
-  }
-}
-
-async function removeGroupMember(uid) {
-  if (!confirm("从用户组移除该用户?")) return;
-  try {
-    await api("/groups/" + membersGroupId + "/members/" + uid, { method: "DELETE" });
-    toast("已移除");
-    loadGroupMembers();
-    loadGroupList();
-    loadGroups();
-  } catch (e) {
-    toast("移除失败: " + e.message);
-  }
 }
 
 async function grantWorkerToGroup() {
