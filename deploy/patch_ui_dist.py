@@ -141,6 +141,21 @@ if 'id:"30"' in u:
     # _org_owner_only (org OWNER 角色) 下, 普通用户 (无 org) 一律 403 —
     # 菜单可见但页面报错比隐藏更糟。普通用户的模型使用路径 = 模型广场
     # (对话/嵌入等, 已开放) + 控制台 (GPU 申请, 已开放)。
+    # 二开 v2 (2026-09-23): 后端已把 models/model-files/model-instances/
+    # model-routes 放开到个人空间 (_org_owner_or_personal), 前端同步把
+    # 模型库(12)/部署(13)/路由(14)/模型文件(21) 的 access 移除 (无 access
+    # = 所有登录用户可见; 不能用 canSeeUser — 它是 !is_admin, admin 会反而
+    # 看不到)。提供商(15)/基准测试(16)/推理后端(18)/缓存加速(19) 仍 admin:
+    # 平台级运维配置, 无个人空间资源。
+    for _mid, _name in [("12", "modelCatalog"), ("13", "deployment"),
+                        ("14", "routes"), ("21", "modelfiles")]:
+        _pat = re.compile(
+            r'(%s:\{name:"%s",path:"[^"]*",key:"[^"]*"[^}]*?),?access:"canSeeOrgAdmin"'
+            % (_mid, _name))
+        u2 = _pat.sub(r'\1', u, count=1)
+        if u2 != u:
+            u = u2
+            print(f"C1c: menu {_mid} ({_name}) access removed -> all users")
 
 # --- C2: 组件绑定表新增 49/50 (复用 42 组织页的 chunk 加载链)
 # 宽松正则: 官方 UI tarball 更新会改变 chunk id/模块 id, 精确字符串会漂移;

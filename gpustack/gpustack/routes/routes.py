@@ -70,7 +70,12 @@ from gpustack.api.auth import (
     management_scope,
     inference_scope,
 )
-from gpustack.api.tenant import require_org_role
+from gpustack.api.tenant import (
+    TenantContext,
+    bypass_tenant_filter,
+    get_tenant_context,
+    require_org_role,
+)
 from gpustack.schemas.principals import OrgRole
 from gpustack.websocket_proxy.message_server import router as message_server_router
 from gpustack.routes.ssh_gateway import router as ssh_gateway_router
@@ -85,6 +90,31 @@ versioned_prefix = "/v2"
 # SYSTEM principals (worker / cluster callbacks reaching shared
 # routers) bypass via ``require_org_role`` itself.
 _org_owner_only = [Depends(require_org_role(OrgRole.OWNER))]
+
+
+# 二开: 模型服务管理面 (模型库/部署/路由) 开放给普通用户的「个人空间」。
+# _org_owner_only 要求 org OWNER 角色 — 普通用户 (不在任何 org) 一律 403,
+# 前端菜单也被 canSeeOrgAdmin (=is_admin) 隐藏。开放策略:
+#   平台 admin / SYSTEM        → 全量 (bypass)
+#   org context + OWNER 角色   → 该 org (原有行为)
+#   个人空间 (principal=自己)  → 自己的资源 (owner_principal_id 过滤已存在)
+# 提供商/基准测试/推理后端/缓存加速仍 _org_owner_only: 平台级运维配置,
+# 普通用户无对应资源视图。
+async def _org_owner_or_personal_dep(
+    ctx: Annotated[TenantContext, Depends(get_tenant_context)],
+) -> TenantContext:
+    if bypass_tenant_filter(ctx) or ctx.is_platform_admin:
+        return ctx
+    # org context: 维持 OWNER 门槛
+    if ctx.current_principal_id is not None and not ctx.current_is_personal_scope:
+        ctx.assert_org_role(OrgRole.OWNER)
+        return ctx
+    # 个人空间 / 无 context: 放行 (行级 owner_principal_id 过滤兜底,
+    # 无 context 时非 admin 只能看到自己 id 的行或被 404)
+    return ctx
+
+
+_org_owner_or_personal = [Depends(_org_owner_or_personal_dep)]
 
 # Toggle for surfacing extended API endpoints in the OpenAPI schema
 # and ``/docs``. Endpoints stay mounted regardless — only the public
@@ -212,19 +242,19 @@ model_routers = [
         "router": models.router,
         "prefix": "/models",
         "tags": ["Models"],
-        "dependencies": _org_owner_only,
+        "dependencies": _org_owner_or_personal,
     },
     {
         "router": model_instances.router,
         "prefix": "/model-instances",
         "tags": ["Model Instances"],
-        "dependencies": _org_owner_only,
+        "dependencies": _org_owner_or_personal,
     },
     {
         "router": model_files.router,
         "prefix": "/model-files",
         "tags": ["Model Files"],
-        "dependencies": _org_owner_only,
+        "dependencies": _org_owner_or_personal,
     },
     {
         "router": cache_services.router,
@@ -346,7 +376,7 @@ tenant_routers = model_routers + [
         "router": model_routes.router,
         "prefix": "/model-routes",
         "tags": ["Model Routes"],
-        "dependencies": _org_owner_only,
+        "dependencies": _org_owner_or_personal,
     },
     {
         "router": model_evaluations.router,
