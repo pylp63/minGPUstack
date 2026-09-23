@@ -91,10 +91,13 @@
 
   /* 展开行 (成员管理): 浅灰底内嵌面板, 箭头列 */
   .expander {
-    display:inline-block; width:16px; cursor:pointer; color:var(--muted);
-    user-select:none; font-size:10px; transition:transform .15s;
+    display:inline-flex; align-items:center; justify-content:center;
+    width:22px; height:22px; margin-right:4px; cursor:pointer;
+    color:var(--accent); background:rgba(22,119,255,.08); border-radius:5px;
+    user-select:none; font-size:13px; vertical-align:middle;
+    transition:background .15s;
   }
-  .expander:hover { color:var(--accent); }
+  .expander:hover { background:rgba(22,119,255,.18); }
   .grp-row.open td { background:rgba(22,119,255,.04); }
   .grp-members.hidden-row { display:none; }
   .grp-members > td { padding:0 10px 10px 26px !important; border-bottom:1px solid var(--row-split); }
@@ -102,11 +105,20 @@
     background:#fafafa; border:1px solid var(--border); border-radius:8px;
     padding:12px 14px;
   }
-  .members-chips { display:flex; gap:8px; flex-wrap:wrap; }
-  .members-chips .chip { background:var(--card); }
-  .members-chips .chip .chip-name { font-style:normal; color:var(--muted); }
-  .chip-x { margin-left:4px; color:var(--muted); cursor:pointer; text-decoration:none; font-weight:600; }
-  .chip-x:hover { color:var(--err); }
+  /* 成员竖排列表 (每行: 用户名 + 全名 + 移除按钮) */
+  .member-list { display:flex; flex-direction:column; gap:0; }
+  .member-item {
+    display:flex; align-items:center; gap:10px; padding:6px 4px;
+    border-bottom:1px dashed var(--border); font-size:13px;
+  }
+  .member-item:last-child { border-bottom:none; }
+  .member-item .m-name { font-weight:600; }
+  .member-item .m-full { color:var(--muted); font-size:12px; flex:1; }
+  .member-item .m-remove {
+    border:1px solid var(--border-strong); background:var(--card); color:var(--muted);
+    border-radius:5px; padding:1px 10px; font-size:12px; cursor:pointer;
+  }
+  .member-item .m-remove:hover { color:var(--err); border-color:var(--err); background:#fff2f0; }
   .err-inline { display:none; margin-top:10px; padding:8px 10px; border-radius:6px; font-size:12px; background:#fff2f0; color:var(--err); }
   .err-inline.show { display:block; }
   dialog select[multiple] { width:100%; }
@@ -552,25 +564,26 @@ async function renderGroupMembers(gid) {
   if (!box) return;
   try {
     const members = await api(`/groups/${gid}/members`);
-    const chips = members.length
+    const memberRows = members.length
       ? members.map(m => `
-        <span class="chip">
-          ${esc(m.username || m.user_id)}${m.full_name ? ' <i class="chip-name">' + esc(m.full_name) + '</i>' : ''}
-          <a class="chip-x" onclick="removeMemberInline(${gid}, ${m.user_id})" title="移除">×</a>
-        </span>`).join('')
-      : '<span class="muted sub">暂无成员 — 从右侧添加</span>';
+        <div class="member-item">
+          <span class="m-name">${esc(m.username || m.user_id)}</span>
+          <span class="m-full">${esc(m.full_name || '')}</span>
+          <button class="m-remove" onclick="removeMemberInline(${gid}, ${m.user_id})">移除</button>
+        </div>`).join('')
+      : '<span class="muted sub" style="padding:4px">暂无成员 — 从下方添加</span>';
     const users = window._users || (await api('/users?perPage=500')).items;
     window._users = users;
     const memberIds = new Set(members.map(m => m.user_id));
     const candidates = users.filter(u => !u.is_admin && !memberIds.has(u.id));
     const addSelect = candidates.length
       ? `<select id="add-select-${gid}">${candidates.map(u =>
-          `<option value="${u.id}">${esc(u.username)}</option>`).join('')}</select>`
+          `<option value="${u.id}">${esc(u.username)}${u.display_name ? ' — ' + esc(u.display_name) : ''}</option>`).join('')}</select>`
       : '<span class="muted sub">(没有可添加的用户)</span>';
     box.innerHTML = `
       <div class="members-inner">
-        <div class="members-chips">${chips}</div>
-        <div class="row" style="margin-top:8px">
+        <div class="member-list">${memberRows}</div>
+        <div class="row" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
           ${addSelect}
           <button class="btn-mini" onclick="addMemberInline(${gid})">添加成员</button>
         </div>
