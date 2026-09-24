@@ -2128,6 +2128,10 @@ class InferenceBackendController:
         async with async_session() as session:
             await self._init_built_in_backends(session)
         await self._seed_builtin_source()
+        # 二开修复: seed 发出的 UPDATED 事件在 subscribe 之前丢失 (replay 只
+        # 重放 CREATED, 已存在行不重放) — 升级 YAML 后重启, 社区后端永远不
+        # reconcile。seed 后显式跑一次, 保证物化与 source content 一致。
+        await self._reconcile()
         async for event in InferenceBackendSource.subscribe(
             source="inference_backend_source_controller"
         ):
