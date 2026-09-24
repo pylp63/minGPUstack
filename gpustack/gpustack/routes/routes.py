@@ -273,13 +273,13 @@ model_routers = [
         "router": benchmarks.router,
         "prefix": "/benchmarks",
         "tags": ["Benchmarks"],
-        "dependencies": _org_owner_only,
+        "dependencies": _org_owner_or_personal,
     },
     {
         "router": benchmark_profiles.router,
         "prefix": "/benchmark-profiles",
         "tags": ["Benchmark Profiles"],
-        "dependencies": _org_owner_only,
+        "dependencies": _org_owner_or_personal,
     },
     {
         "router": model_routes.target_router,

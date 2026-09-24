@@ -147,8 +147,12 @@ if 'id:"30"' in u:
     # = 所有登录用户可见; 不能用 canSeeUser — 它是 !is_admin, admin 会反而
     # 看不到)。提供商(15)/基准测试(16)/推理后端(18)/缓存加速(19) 仍 admin:
     # 平台级运维配置, 无个人空间资源。
+    # 二开 v3: 基准测试(16)/推理后端(18) 开放 — benchmarks/benchmark-profiles
+    # 后端同放开 (_org_owner_or_personal); inference-backends API 本就无 org
+    # 门槛 (worker 面挂载)。提供商(15)/缓存加速(19) 仍 admin。
     for _mid, _name in [("12", "modelCatalog"), ("13", "deployment"),
-                        ("14", "routes"), ("21", "modelfiles")]:
+                        ("14", "routes"), ("21", "modelfiles"),
+                        ("16", "benchmark"), ("18", "backendsList")]:
         _pat = re.compile(
             r'(%s:\{name:"%s",path:"[^"]*",key:"[^"]*"[^}]*?),?access:"canSeeOrgAdmin"'
             % (_mid, _name))
