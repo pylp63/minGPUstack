@@ -1013,8 +1013,10 @@ async def create_model_route(
             env=model_in.env,
             # SGLang PD 分离 = 引擎级互连 (mode/端口参数由 deploy_presets
             # 按角色展开自动生成, 不依赖用户参数框里是否带 disaggregation 参数)
+            # sglang-pd (社区后端, 摩尔线程 GLM PD 专用镜像) 同样走 SGLang
+            # 官方 PD 语法 — 首个 sglang 前缀即命中。
             kv_transfer=(
-                "sglang" == (model_in.backend or "").lower()
+                (model_in.backend or "").lower().startswith("sglang")
                 and arch == "pd_disaggregated"
             ),
             cluster_id=model_in.cluster_id,

@@ -267,7 +267,8 @@ def _engine_role_parameters(
     if not kv_transfer:
         return [], []
     b = (backend or "vllm").lower()
-    if b == "sglang":
+    if b.startswith("sglang"):
+        # sglang / sglang-pd (社区后端, 摩尔线程 GLM PD 专用镜像) 同语法
         from gpustack.utils.command import find_parameter
 
         user_params = user_params or []

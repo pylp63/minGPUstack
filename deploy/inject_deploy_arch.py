@@ -159,9 +159,22 @@ ADV_GROUP = (
         # 不暴露给用户)。框里只放真正需要用户感知的: 传输后端 + 服务端口。
         'var bk=(n.getFieldValue("backend")||"").toLowerCase();'
         'var pre=[];'
-        'if(bk==="sglang"){'
+        'if(bk==="sglang"||bk==="sglang-pd"){'
     'pre=["--disaggregation-transfer-backend=mooncake",'
     '"--port=30000"]}'
+    # sglang-pd (摩尔线程 GLM PD 专用): 额外预填官方文档的引擎参数基底。
+    # P/D 角色差异参数 (--disaggregation-mode / dist-init-addr 等) 由后端
+    # _engine_role_parameters 按角色自动注入, 不在此预填。
+    'if(bk==="sglang-pd"){'
+    'pre=["--disaggregation-transfer-backend=mooncake",'
+    '"--port=30000",'
+    '"--attention-backend","dsa",'
+    '"--dsa-prefill-backend","tilelang",'
+    '"--dsa-decode-backend","tilelang",'
+    '"--kv-cache-dtype","fp8_e4m3",'
+    '"--moe-a2a-backend","deepep",'
+    '"--sampling-backend","flashinfer",'
+    '"--trust-remote-code"]}'
     'if(pre.length){n.setFieldValue("backend_parameters",pre)}'
     'if(n.getFieldValue("prefill_groups")===undefined){n.setFieldValue("prefill_groups",1)}'
     'if(n.getFieldValue("decode_groups")===undefined){n.setFieldValue("decode_groups",1)}'
